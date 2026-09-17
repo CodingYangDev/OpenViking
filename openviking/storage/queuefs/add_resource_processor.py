@@ -3,7 +3,6 @@
 """Durable add-resource queue consumer."""
 
 import asyncio
-import concurrent.futures
 import json
 from contextlib import suppress
 from copy import deepcopy
@@ -37,12 +36,10 @@ class AddResourceProcessor(DequeueHandlerBase):
     def __init__(
         self,
         resource_service: Any,
-        service_loop: asyncio.AbstractEventLoop,
         queue_name: str,
         viking_fs: Any,
     ):
         self._resource_service = resource_service
-        self._service_loop = service_loop
         self._queue_name = queue_name
         self._viking_fs = viking_fs
 
@@ -347,20 +344,16 @@ class AddResourceProcessor(DequeueHandlerBase):
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             self.report_error(str(exc), data)
             return None
-        future = asyncio.run_coroutine_threadsafe(
-            self._handle_cancelled(
-                msg,
-                RequestContext(
-                    user=UserIdentifier(msg.account_id, msg.user_id),
-                    role=Role(msg.role),
-                    group_ids=tuple(msg.group_ids),
-                    actor_peer_id=msg.actor_peer_id,
-                    bypass_acl=msg.bypass_acl,
-                ),
+        await self._handle_cancelled(
+            msg,
+            RequestContext(
+                user=UserIdentifier(msg.account_id, msg.user_id),
+                role=Role(msg.role),
+                group_ids=tuple(msg.group_ids),
+                actor_peer_id=msg.actor_peer_id,
+                bypass_acl=msg.bypass_acl,
             ),
-            self._service_loop,
         )
-        await asyncio.wrap_future(future)
         unregister_telemetry(msg.telemetry_id or "")
         self.report_success()
         return None
@@ -379,13 +372,4 @@ class AddResourceProcessor(DequeueHandlerBase):
             self.report_error(str(exc), data)
             return None
 
-        future: concurrent.futures.Future[None] = asyncio.run_coroutine_threadsafe(
-            self._process(msg, data),
-            self._service_loop,
-        )
-        try:
-            await asyncio.wrap_future(future)
-        except asyncio.CancelledError:
-            future.cancel()
-            raise
-        return None
+        return await self._process(msg, data)

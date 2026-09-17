@@ -845,7 +845,6 @@ async def test_add_resource_processor_records_paused_watch_result(
     )
     processor = AddResourceProcessor(
         service,
-        asyncio.get_running_loop(),
         QueueManager.ADD_RESOURCE,
         SimpleNamespace(_async_agfs=SimpleNamespace(pathlock_release=AsyncMock())),
     )

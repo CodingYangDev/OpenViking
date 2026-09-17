@@ -149,228 +149,6 @@ class _ThreadBlockingUpdateTaskStore(_ControllableTaskStore):
 
 
 @pytest.mark.asyncio
-async def test_owner_loop_dispatcher_runs_foreign_loop_work_on_owner_loop():
-    from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher
-
-    dispatcher = OwnerLoopDispatcher()
-    dispatcher.bind_current_loop()
-    owner_loop = asyncio.get_running_loop()
-    work_loop: asyncio.AbstractEventLoop | None = None
-
-    async def work() -> str:
-        nonlocal work_loop
-        work_loop = asyncio.get_running_loop()
-        return "done"
-
-    def run_from_foreign_loop() -> str:
-        return asyncio.run(dispatcher.run(work))
-
-    result = await asyncio.to_thread(run_from_foreign_loop)
-
-    assert result == "done"
-    assert work_loop is owner_loop
-
-
-@pytest.mark.asyncio
-async def test_owner_loop_dispatcher_propagates_foreign_cancellation():
-    from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher
-
-    dispatcher = OwnerLoopDispatcher()
-    dispatcher.bind_current_loop()
-    work_started = asyncio.Event()
-    work_cancelled = asyncio.Event()
-    foreign_ready = threading.Event()
-    cancel_foreign = threading.Event()
-
-    async def work() -> None:
-        work_started.set()
-        try:
-            await asyncio.Future()
-        except asyncio.CancelledError:
-            work_cancelled.set()
-            raise
-
-    def run_from_foreign_loop() -> None:
-        async def invoke() -> None:
-            task = asyncio.create_task(dispatcher.run(work))
-            foreign_ready.set()
-            await asyncio.to_thread(cancel_foreign.wait)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-
-        asyncio.run(invoke())
-
-    foreign_call = asyncio.create_task(asyncio.to_thread(run_from_foreign_loop))
-    await work_started.wait()
-    await asyncio.to_thread(foreign_ready.wait)
-    cancel_foreign.set()
-    await foreign_call
-    await asyncio.wait_for(work_cancelled.wait(), timeout=1)
-
-
-def test_owner_loop_dispatcher_rejects_calls_after_owner_loop_closes():
-    from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher
-
-    dispatcher = OwnerLoopDispatcher()
-
-    async def bind() -> None:
-        dispatcher.bind_current_loop()
-
-    asyncio.run(bind())
-
-    async def invoke() -> None:
-        with pytest.raises(RuntimeError, match="owner event loop is closed"):
-            await dispatcher.run(lambda: asyncio.sleep(0))
-
-    asyncio.run(invoke())
-
-
-def test_owner_loop_dispatcher_rejects_stopped_owner_loop():
-    from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher
-
-    dispatcher = OwnerLoopDispatcher()
-    owner_loop = asyncio.new_event_loop()
-    owner_loop.run_until_complete(asyncio.sleep(0))
-    owner_loop.run_until_complete(_bind_dispatcher(dispatcher))
-
-    async def invoke() -> None:
-        with pytest.raises(RuntimeError, match="owner event loop is not running"):
-            await dispatcher.run(lambda: asyncio.sleep(0))
-
-    try:
-        asyncio.run(invoke())
-    finally:
-        owner_loop.close()
-
-
-async def _bind_dispatcher(dispatcher: Any) -> None:
-    dispatcher.bind_current_loop()
-
-
-def test_owner_loop_dispatcher_concurrent_first_calls_share_winning_loop():
-    from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher
-
-    dispatcher = OwnerLoopDispatcher()
-    calls_started = threading.Barrier(2)
-    work_started = threading.Barrier(2)
-    results: list[int] = []
-    errors: list[BaseException] = []
-
-    async def work() -> int:
-        await asyncio.to_thread(work_started.wait)
-        return id(asyncio.get_running_loop())
-
-    def invoke() -> None:
-        try:
-            calls_started.wait()
-            results.append(asyncio.run(dispatcher.run(work)))
-        except BaseException as exc:
-            errors.append(exc)
-
-    threads = [threading.Thread(target=invoke) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=2)
-
-    assert not errors
-    assert len(results) == 2
-    assert results[0] == results[1]
-
-
-def test_owner_loop_dispatcher_fails_if_loop_stops_during_dispatch():
-    from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher
-
-    dispatcher = OwnerLoopDispatcher()
-    owner_loop = asyncio.new_event_loop()
-    owner_ready = threading.Event()
-    stop_requested = threading.Event()
-    let_stop_callback_return = threading.Event()
-    first_run_stopped = threading.Event()
-    cleanup_queued_callbacks = threading.Event()
-
-    def owner_thread_main() -> None:
-        asyncio.set_event_loop(owner_loop)
-
-        def bind() -> None:
-            dispatcher.bind_current_loop()
-            owner_ready.set()
-
-        owner_loop.call_soon(bind)
-        owner_loop.run_forever()
-        first_run_stopped.set()
-        cleanup_queued_callbacks.wait()
-        owner_loop.call_soon(owner_loop.stop)
-        owner_loop.run_forever()
-        owner_loop.close()
-
-    owner_thread = threading.Thread(target=owner_thread_main)
-    owner_thread.start()
-    assert owner_ready.wait(timeout=1)
-
-    def stop_inside_owner_callback() -> None:
-        owner_loop.stop()
-        stop_requested.set()
-        let_stop_callback_return.wait()
-
-    owner_loop.call_soon_threadsafe(stop_inside_owner_callback)
-    assert stop_requested.wait(timeout=1)
-
-    async def invoke() -> None:
-        async def release_callback() -> None:
-            await asyncio.sleep(0.05)
-            let_stop_callback_return.set()
-
-        release_task = asyncio.create_task(release_callback())
-        with pytest.raises(RuntimeError, match="owner event loop stopped"):
-            await asyncio.wait_for(
-                dispatcher.run(lambda: asyncio.sleep(0)),
-                timeout=1,
-            )
-        await release_task
-
-    asyncio.run(invoke())
-    assert first_run_stopped.wait(timeout=1)
-    cleanup_queued_callbacks.set()
-    owner_thread.join(timeout=2)
-    assert not owner_thread.is_alive()
-
-
-def test_owner_loop_dispatcher_prefers_completed_result_over_simultaneous_stop():
-    from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher
-
-    dispatcher = OwnerLoopDispatcher()
-    owner_loop = asyncio.new_event_loop()
-    owner_ready = threading.Event()
-
-    def owner_thread_main() -> None:
-        asyncio.set_event_loop(owner_loop)
-
-        def bind() -> None:
-            dispatcher.bind_current_loop()
-            owner_ready.set()
-
-        owner_loop.call_soon(bind)
-        owner_loop.run_forever()
-        owner_loop.close()
-
-    owner_thread = threading.Thread(target=owner_thread_main)
-    owner_thread.start()
-    assert owner_ready.wait(timeout=1)
-
-    async def finish_and_stop() -> str:
-        owner_loop.stop()
-        return "committed"
-
-    result = asyncio.run(dispatcher.run(finish_and_stop))
-
-    owner_thread.join(timeout=2)
-    assert result == "committed"
-    assert not owner_thread.is_alive()
-
-
-@pytest.mark.asyncio
 async def test_store_io_limiter_bounds_concurrency():
     from openviking.service.task_tracker_concurrency import StoreIOLimiter
 
@@ -433,38 +211,27 @@ async def test_keyed_lock_serializes_same_key_and_allows_different_keys():
     from openviking.service.task_tracker_concurrency import KeyedAsyncLockPool
 
     pool = KeyedAsyncLockPool[str]()
-    first_entered = asyncio.Event()
-    release_first = asyncio.Event()
-    same_key_entered = asyncio.Event()
-    other_key_entered = asyncio.Event()
-
-    async def hold_first_key() -> None:
-        async with pool.acquire("task-1"):
-            first_entered.set()
-            await release_first.wait()
+    same_key_entered = threading.Event()
+    other_key_entered = threading.Event()
 
     async def wait_for_same_key() -> None:
-        await first_entered.wait()
         async with pool.acquire("task-1"):
             same_key_entered.set()
 
     async def use_other_key() -> None:
-        await first_entered.wait()
         async with pool.acquire("task-2"):
             other_key_entered.set()
 
-    tasks = [
-        asyncio.create_task(hold_first_key()),
-        asyncio.create_task(wait_for_same_key()),
-        asyncio.create_task(use_other_key()),
-    ]
+    async def work() -> None:
+        await asyncio.gather(wait_for_same_key(), use_other_key())
 
-    await asyncio.wait_for(other_key_entered.wait(), timeout=1)
-    assert not same_key_entered.is_set()
+    async with pool.acquire("task-1"):
+        worker = asyncio.create_task(asyncio.to_thread(lambda: asyncio.run(work())))
+        assert await asyncio.to_thread(other_key_entered.wait, 3)
+        assert not same_key_entered.is_set()
 
-    release_first.set()
-    await asyncio.wait_for(same_key_entered.wait(), timeout=1)
-    await asyncio.gather(*tasks)
+    await asyncio.wait_for(worker, timeout=3)
+    assert same_key_entered.is_set()
 
 
 @pytest.mark.asyncio
@@ -501,6 +268,17 @@ async def test_keyed_lock_registry_is_cleaned_after_use_and_cancellation():
 
     release_blocker.set()
     await blocker_task
+    assert pool.entry_count == 0
+
+    # Cancellation can arrive after release hands over the slot, but before
+    # the waiting coroutine resumes. The slot must still become available.
+    async with pool.acquire("cancelled"):
+        granted_waiter = asyncio.create_task(waiter())
+        await asyncio.sleep(0)
+    granted_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await granted_waiter
+    await asyncio.wait_for(waiter(), timeout=1)
     assert pool.entry_count == 0
 
 
@@ -969,12 +747,12 @@ async def test_cancelled_create_waiting_for_task_lock_finishes_before_lock_relea
 
 
 @pytest.mark.asyncio
-async def test_task_tracker_public_mutation_from_foreign_loop_runs_on_owner():
+async def test_task_tracker_public_mutation_stays_on_calling_loop():
     from openviking.service.task_tracker import TaskStatus, TaskTracker
 
     store = _ControllableTaskStore()
     tracker = TaskTracker(store=store)
-    owner_loop = asyncio.get_running_loop()
+    request_loop = asyncio.get_running_loop()
     task = await tracker.create("add_resource", account_id="acme", user_id="alice")
 
     await asyncio.to_thread(lambda: asyncio.run(tracker.start(task.task_id)))
@@ -989,18 +767,17 @@ async def test_task_tracker_public_mutation_from_foreign_loop_runs_on_owner():
     assert loaded is not None
     assert snapshot is not None
     assert snapshot.status == TaskStatus.RUNNING
-    assert all(loop is owner_loop for loop in store.operation_loops)
+    assert store.operation_loops[0] is request_loop
+    assert all(loop is not request_loop for loop in store.operation_loops[1:])
 
 
 @pytest.mark.asyncio
 async def test_cancelling_foreign_mutation_cleans_task_lock_and_store_slot():
     from openviking.service.task_tracker import TaskStatus, TaskTracker
 
-    store = _ControllableTaskStore()
+    store = _ThreadBlockingUpdateTaskStore()
     tracker = TaskTracker(store=store)
     task = await tracker.create("add_resource", account_id="acme", user_id="alice")
-    store.update_started[task.task_id] = asyncio.Event()
-    store.update_release[task.task_id] = asyncio.Event()
     cancel_foreign = threading.Event()
 
     def run_from_foreign_loop() -> None:
@@ -1014,11 +791,11 @@ async def test_cancelling_foreign_mutation_cleans_task_lock_and_store_slot():
         asyncio.run(invoke())
 
     foreign_call = asyncio.create_task(asyncio.to_thread(run_from_foreign_loop))
-    await store.update_started[task.task_id].wait()
+    assert await asyncio.to_thread(store.thread_update_started.wait, 3)
     cancel_foreign.set()
     await asyncio.sleep(0.05)
     returned_before_store_settled = foreign_call.done()
-    store.update_release[task.task_id].set()
+    store.thread_update_release.set()
     await foreign_call
 
     assert not returned_before_store_settled
