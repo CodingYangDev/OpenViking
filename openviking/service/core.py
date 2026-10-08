@@ -21,6 +21,7 @@ from openviking.service.compile_service import CompileService
 from openviking.service.debug_service import DebugService
 from openviking.service.external_task_service import ExternalTaskService
 from openviking.service.fs_service import FSService
+from openviking.service.mcp_service import MCPService
 from openviking.service.mineru_preflight import wait_for_mineru_ready
 from openviking.service.pack_service import PackService
 from openviking.service.resource_memory_link_service import ResourceMemoryLinkService
@@ -124,6 +125,7 @@ class OpenVikingService:
         self._debug_service = DebugService()
         self._agent_evolution_service = AgentEvolutionService()
         self._external_task_service = ExternalTaskService()
+        self._mcp_service = MCPService(self)
         self._compile_service = CompileService(
             config.compile_api,
             self._external_task_service,
@@ -382,6 +384,11 @@ class OpenVikingService:
     def fs(self) -> FSService:
         """Get FSService instance."""
         return self._fs_service
+
+    @property
+    def mcps(self) -> MCPService:
+        """Get MCP server registry service."""
+        return self._mcp_service
 
     @property
     def pack(self) -> PackService:

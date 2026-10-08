@@ -476,6 +476,11 @@ enum Commands {
         #[command(subcommand)]
         action: SkillCommands,
     },
+    /// [Data] Manage remote MCP servers and tools
+    Mcps {
+        #[command(subcommand)]
+        action: McpCommands,
+    },
     /// [Data] List directory contents
     #[command(alias = "list")]
     Ls {
@@ -1836,6 +1841,72 @@ enum SkillCommands {
 }
 
 #[derive(Subcommand)]
+enum McpCommands {
+    /// Register a Streamable HTTP MCP server
+    Add {
+        /// MCP configuration JSON containing an mcpServers object
+        #[arg(value_name = "json")]
+        config: String,
+    },
+    /// Remove a registered MCP server
+    Remove {
+        /// MCP server name
+        #[arg(value_name = "name")]
+        name: String,
+    },
+    /// List registered MCP servers
+    List,
+    /// Find tools from registered MCP catalogs
+    Find {
+        /// Tool name or description query
+        #[arg(value_name = "query")]
+        query: String,
+        /// Maximum number of results
+        #[arg(
+            short = 'n',
+            long = "limit",
+            default_value = "10",
+            value_parser = clap::value_parser!(u8).range(1..=100),
+            value_name = "n"
+        )]
+        limit: u8,
+    },
+    /// Validate connectivity and tool discovery
+    Validate {
+        /// MCP configuration JSON containing an mcpServers object
+        #[arg(value_name = "json")]
+        config: String,
+    },
+    /// Show one MCP server and its tools
+    Show {
+        /// MCP server name
+        #[arg(value_name = "name")]
+        name: String,
+    },
+    /// Refresh a registered MCP server's tool catalog
+    Sync {
+        /// MCP server name
+        #[arg(value_name = "name")]
+        name: String,
+    },
+    /// Check a registered MCP server
+    Status {
+        /// Registered MCP server name
+        #[arg(value_name = "name")]
+        name: String,
+    },
+    /// Invoke a registered MCP tool
+    Invoke {
+        /// Tool URI under viking://agent/tools
+        #[arg(value_name = "uri")]
+        uri: String,
+        /// Tool arguments as a JSON object
+        #[arg(long = "args", default_value = "{}", value_name = "json")]
+        arguments: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum WatchCommands {
     /// List watch tasks (auto-refresh subscriptions)
     Ls {
@@ -2520,7 +2591,15 @@ fn allows_plain_help_as_user_input(command: &str) -> bool {
 fn is_plain_help_group(command: &str) -> bool {
     matches!(
         command,
-        "config" | "task" | "admin" | "system" | "session" | "privacy" | "observer" | "skills"
+        "config"
+            | "task"
+            | "admin"
+            | "system"
+            | "session"
+            | "privacy"
+            | "observer"
+            | "skills"
+            | "mcps"
     )
 }
 
@@ -2561,6 +2640,10 @@ fn pre_parse_requires_cli_config_file(args: &[OsString]) -> bool {
         "skills" => tokens
             .get(1)
             .map(|token| is_skill_subcommand(token))
+            .unwrap_or(false),
+        "mcps" => tokens
+            .get(1)
+            .map(|token| is_mcp_subcommand(token))
             .unwrap_or(false),
         "observer" => tokens
             .get(1)
@@ -2721,6 +2804,13 @@ fn is_skill_subcommand(token: &str) -> bool {
     matches!(
         token,
         "add" | "list" | "ls" | "find" | "show" | "update" | "remove" | "rm" | "delete"
+    )
+}
+
+fn is_mcp_subcommand(token: &str) -> bool {
+    matches!(
+        token,
+        "add" | "remove" | "list" | "find" | "validate" | "show" | "sync" | "status" | "invoke"
     )
 }
 
@@ -3456,6 +3546,52 @@ async fn main() {
                     .await
             }
         },
+        Commands::Mcps { action } => {
+            let client = ctx.get_client();
+            match action {
+                McpCommands::Add { config } => {
+                    commands::mcps::add(
+                        &client,
+                        &config,
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
+                }
+                McpCommands::Remove { name } => {
+                    commands::mcps::remove(&client, &name, ctx.output_format, ctx.compact).await
+                }
+                McpCommands::List => {
+                    commands::mcps::list(&client, ctx.output_format, ctx.compact).await
+                }
+                McpCommands::Find { query, limit } => {
+                    commands::mcps::find(&client, &query, limit, ctx.output_format, ctx.compact)
+                        .await
+                }
+                McpCommands::Validate { config } => {
+                    commands::mcps::validate(&client, &config, ctx.output_format, ctx.compact).await
+                }
+                McpCommands::Show { name } => {
+                    commands::mcps::show(&client, &name, ctx.output_format, ctx.compact).await
+                }
+                McpCommands::Sync { name } => {
+                    commands::mcps::sync(&client, &name, ctx.output_format, ctx.compact).await
+                }
+                McpCommands::Status { name } => {
+                    commands::mcps::status(&client, &name, ctx.output_format, ctx.compact).await
+                }
+                McpCommands::Invoke { uri, arguments } => {
+                    commands::mcps::invoke(
+                        &client,
+                        &uri,
+                        &arguments,
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
+                }
+            }
+        }
         Commands::Export {
             uri,
             to,
@@ -3913,7 +4049,8 @@ async fn main() {
 mod tests {
     use super::{
         Cli, CliContext, Commands, ConfigAddTarget, ConfigCommands, LanguageGateAction,
-        ObserverCommands, PrivacyCommands, SkillCommands, SnapshotCmd, UploadCliOptions,
+        McpCommands, ObserverCommands, PrivacyCommands, SkillCommands, SnapshotCmd,
+        UploadCliOptions,
         find_command_index, first_command_token, is_language_command_request,
         language_command_can_run_picker, language_gate_action, language_required_message,
         legacy_upload_option_error, plain_help_misuse, pre_parse_output_options,
@@ -4593,6 +4730,15 @@ mod tests {
             &["ov", "skills", "remove"],
             &["ov", "skills", "rm"],
             &["ov", "skills", "delete"],
+            &["ov", "mcps", "add"],
+            &["ov", "mcps", "remove"],
+            &["ov", "mcps", "list"],
+            &["ov", "mcps", "find"],
+            &["ov", "mcps", "validate"],
+            &["ov", "mcps", "show"],
+            &["ov", "mcps", "sync"],
+            &["ov", "mcps", "status"],
+            &["ov", "mcps", "invoke"],
         ];
 
         for args in cases {
@@ -6023,5 +6169,61 @@ mod tests {
         ]))
         .expect("-c false should keep its explicit bool value");
         assert!(!explicit_false.compact);
+    }
+
+    #[test]
+    fn mcps_rejects_unimplemented_subcommands() {
+        assert!(Cli::try_parse_from(["ov", "mcps", "mount"]).is_err());
+        assert!(Cli::try_parse_from(["ov", "mcps", "unmount"]).is_err());
+        assert!(Cli::try_parse_from(["ov", "mcps", "mounts"]).is_err());
+        assert!(Cli::try_parse_from(["ov", "mcps", "status"]).is_err());
+
+        let status =
+            Cli::try_parse_from(["ov", "mcps", "status", "demo"]).expect("status should parse");
+        assert!(matches!(
+            status.command,
+            Commands::Mcps {
+                action: McpCommands::Status { name }
+            } if name == "demo"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_mcp_add_and_invoke() {
+        let add = Cli::try_parse_from([
+            "ov",
+            "mcps",
+            "add",
+            r#"{"mcpServers":{"weather":{"url":"https://example.com/mcp","headers":{"Authorization":"Bearer token"}}}}"#,
+        ])
+        .expect("mcps add should parse");
+        match add.command {
+            Commands::Mcps {
+                action: McpCommands::Add { config },
+            } => {
+                assert!(config.contains(r#""weather""#));
+                assert!(config.contains(r#""Authorization""#));
+            }
+            _ => panic!("expected mcps add"),
+        }
+
+        let invoke = Cli::try_parse_from([
+            "ov",
+            "mcps",
+            "invoke",
+            "viking://agent/tools/weather/current.json",
+            "--args",
+            r#"{"city":"Beijing"}"#,
+        ])
+        .expect("mcps invoke should parse");
+        match invoke.command {
+            Commands::Mcps {
+                action: McpCommands::Invoke { uri, arguments },
+            } => {
+                assert_eq!(uri, "viking://agent/tools/weather/current.json");
+                assert_eq!(arguments, r#"{"city":"Beijing"}"#);
+            }
+            _ => panic!("expected mcps invoke"),
+        }
     }
 }
