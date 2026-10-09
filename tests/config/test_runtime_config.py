@@ -189,7 +189,11 @@ def test_real_openviking_config_parses_shared_jev_and_dag_decider():
             },
             "agent_evolution": {
                 "enabled": True,
-                "dag_decider": {"provider": "jev", "noul_true_threshold": 0.8},
+                "dag_decider": {
+                    "provider": "jev",
+                    "noul_true_threshold": 0.8,
+                    "relevance_threshold": 0.65,
+                },
             },
         }
     )
@@ -198,6 +202,10 @@ def test_real_openviking_config_parses_shared_jev_and_dag_decider():
     assert config.jev.max_input_tokens == 28_000
     assert config.agent_evolution.dag_decider.provider == "jev"
     assert config.agent_evolution.dag_decider.noul_true_threshold == 0.8
+    assert config.agent_evolution.dag_decider.relevance_threshold == 0.65
+    validate_patch(
+        OpenVikingConfig, {"agent_evolution": {"dag_decider": {"relevance_threshold": 0.75}}}
+    )
 
 
 def test_cluster_rebuild_preserves_explicit_and_default_field_semantics():

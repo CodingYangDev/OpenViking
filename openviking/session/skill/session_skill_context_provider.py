@@ -13,7 +13,7 @@ from openviking.prompts.manager import PromptManager
 from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
-from openviking.session.memory.tools import add_tool_call_pair_to_messages
+from openviking.session.memory.tools import MemoryEvalFunction, add_tool_call_pair_to_messages
 from openviking.session.memory.utils import add_line_numbers, line_count, slice_content_lines
 from openviking.session.memory.utils.messages import parse_memory_file_with_fields
 from openviking_cli.exceptions import NotFoundError
@@ -88,82 +88,50 @@ class SessionSkillContextProvider(SessionExtractContextProvider):
 
     def instruction(self) -> str:
         return (
-            "You are an extraction agent. Analyze the archived conversation, use read when "
-            "needed, and output only restricted Python memory SDK code that matches the schema descriptions."
+            "You are an extraction agent. Analyze the archived conversation, use eval's "
+            "read-only functions when needed, and output only restricted Python memory SDK "
+            "code that matches the schema descriptions."
         )
 
-    async def prefetch(self) -> List[Dict[str, Any]]:
-        pre_fetch_messages = [self._build_conversation_message()]
-        if not self._ctx or not self._viking_fs:
-            return pre_fetch_messages
+    def _skill_roots(self) -> List[str]:
+        if not self._ctx:
+            return []
+        return [f"{canonical_user_root(self._ctx)}/skills", "viking://agent/skills"]
 
-        user_skill_root = f"{canonical_user_root(self._ctx)}/skills"
-        agent_skill_root = "viking://agent/skills"
-        skill_roots = [user_skill_root, agent_skill_root]
+    def _get_memory_eval_functions(self) -> Dict[str, MemoryEvalFunction]:
+        return {
+            "read": MemoryEvalFunction(
+                name="read",
+                signature="read(uri: str, offset: int = 0, limit: int = -1)",
+                description="Read one SKILL.md URI returned by ls.",
+                allowed_arguments=frozenset({"uri", "offset", "limit"}),
+                required_arguments=frozenset({"uri"}),
+                kind="skill_read",
+                executor=self._eval_read_skill,
+            ),
+            "ls": MemoryEvalFunction(
+                name="ls",
+                signature="ls(uri: str | list[str], limit: int = 100)",
+                description="List skill directories under an allowed skill root.",
+                allowed_arguments=frozenset({"uri", "limit"}),
+                required_arguments=frozenset({"uri"}),
+                kind="skill_ls",
+                executor=self._eval_ls_skills,
+            ),
+        }
 
-        listed_skills: List[Dict[str, Any]] = []
-        seen_names: set[str] = set()
-        errors: Dict[str, str] = {}
-        for skill_root_uri in skill_roots:
-            try:
-                entries = await self._viking_fs.ls(
-                    skill_root_uri,
-                    output="agent",
-                    abs_limit=256,
-                    show_all_hidden=False,
-                    node_limit=1000,
-                    ctx=self._ctx,
-                )
-                for entry in entries:
-                    if not entry.get("isDir", False):
-                        continue
-                    skill_root = (
-                        entry.get("uri") or f"{skill_root_uri.rstrip('/')}/{entry.get('name', '')}"
-                    )
-                    skill_name = entry.get("name") or skill_root.rstrip("/").split("/")[-1]
-                    if skill_name in seen_names:
-                        continue
-                    seen_names.add(skill_name)
-                    listed_skills.append(
-                        {
-                            "skill_name": skill_name,
-                            "uri": f"{skill_root.rstrip('/')}/SKILL.md",
-                            "abstract": entry.get("abstract", ""),
-                        }
-                    )
-            except Exception as exc:
-                errors[skill_root_uri] = str(exc)
-
-        if listed_skills:
-            tool_result: Any = listed_skills
-        elif errors:
-            tool_result = {"error": errors}
-        else:
-            tool_result = (
-                "Directory is empty. You can create a new skill if the conversation "
-                "shows a reusable workflow."
-            )
-
-        add_tool_call_pair_to_messages(
-            messages=pre_fetch_messages,
-            call_id=0,
-            tool_name="ls",
-            params={"uri": skill_roots},
-            result=tool_result,
-        )
-        return pre_fetch_messages
-
-    async def execute_tool(self, tool_call) -> Any:
-        if tool_call.name != "read":
-            return {"error": f"Unknown tool: {tool_call.name}"}
-        arguments = tool_call.arguments or {}
-        uri = arguments.get("uri", "")
+    async def _eval_read_skill(self, ctx, arguments: Dict[str, Any]) -> Any:
+        uri = arguments.get("uri")
         offset = arguments.get("offset", 0)
         limit = arguments.get("limit", -1)
-
-        if not uri.endswith("/SKILL.md"):
-            return await super().execute_tool(tool_call)
-
+        if not isinstance(uri, str) or not uri.endswith("/SKILL.md"):
+            return {"error": "read requires an allowed SKILL.md URI"}
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            return {"error": "offset must be a non-negative integer"}
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < -1:
+            return {"error": "limit must be -1 or a non-negative integer"}
+        if ctx.allowed_memory_read_uris is not None and uri not in ctx.allowed_memory_read_uris:
+            return {"error": f"URI not allowed: {uri}"}
         try:
             raw_content = await self._viking_fs.read_file(uri, ctx=self._ctx)
         except NotFoundError as exc:
@@ -182,8 +150,72 @@ class SessionSkillContextProvider(SessionExtractContextProvider):
         self._read_file_contents[uri] = stored
         return result
 
+    async def _eval_ls_skills(self, ctx, arguments: Dict[str, Any]) -> Any:
+        uri_arg = arguments.get("uri")
+        limit = arguments.get("limit", 100)
+        uris = uri_arg if isinstance(uri_arg, list) else [uri_arg]
+        allowed_roots = set(self._skill_roots())
+        if not uris or any(not isinstance(uri, str) or uri not in allowed_roots for uri in uris):
+            return {"error": f"URI not allowed: {uri_arg}"}
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+            return {"error": "ls limit must be an integer between 1 and 200"}
+        listed_skills = []
+        seen_names: set[str] = set()
+        for uri in uris:
+            try:
+                entries = await self._viking_fs.ls(
+                    uri,
+                    output="agent",
+                    abs_limit=256,
+                    show_all_hidden=False,
+                    node_limit=limit,
+                    ctx=self._ctx,
+                )
+            except Exception as exc:
+                logger.warning("Session skill list failed for %s: %s", uri, exc)
+                return {"error": str(exc)}
+            for entry in entries:
+                if not entry.get("isDir", False):
+                    continue
+                skill_root = entry.get("uri") or f"{uri.rstrip('/')}/{entry.get('name', '')}"
+                skill_name = entry.get("name") or skill_root.rstrip("/").split("/")[-1]
+                if skill_name in seen_names:
+                    continue
+                seen_names.add(skill_name)
+                skill_uri = f"{skill_root.rstrip('/')}/SKILL.md"
+                listed_skills.append(
+                    {
+                        "skill_name": skill_name,
+                        "uri": skill_uri,
+                        "abstract": entry.get("abstract", ""),
+                    }
+                )
+                self._allowed_memory_read_uris.add(skill_uri)
+        return listed_skills
+
+    async def prefetch(self) -> List[Dict[str, Any]]:
+        pre_fetch_messages = [self._build_conversation_message()]
+        if not self._ctx or not self._viking_fs:
+            return pre_fetch_messages
+
+        skill_roots = self._skill_roots()
+        code = f"skills = sdk.ls(uri={skill_roots!r})"
+        tool_result = await self._eval_memory(code)
+
+        add_tool_call_pair_to_messages(
+            messages=pre_fetch_messages,
+            call_id=None,
+            tool_name="eval",
+            params={"code": code},
+            result=tool_result,
+        )
+        return pre_fetch_messages
+
+    async def execute_tool(self, tool_call) -> Any:
+        return await super().execute_tool(tool_call)
+
     def get_tools(self) -> List[str]:
-        return ["read"]
+        return ["eval"]
 
     def _get_registry(self) -> MemoryTypeRegistry:
         if self._registry is None:

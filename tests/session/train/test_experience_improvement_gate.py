@@ -9,14 +9,14 @@ import pytest
 
 from openviking.models.jev import JevPayloadTooLarge
 from openviking.session.memory.dataclass import MemoryFile, StoredLink
-from openviking.session.train.components.experience_improvement_gate import (
+from openviking.session.train.domain import PolicyPlanItem, PolicySet, PolicyUpdatePlan
+from openviking.session.train.engine import PolicyTrainingEngine
+from openviking.session.train.gates.experience import (
     EXPERIENCE_GATE_CONTEXTS_KEY,
     ExperienceImprovementGate,
     _bounded_success_evidence,
     accept_proposals_without_gate,
 )
-from openviking.session.train.domain import PolicyPlanItem, PolicySet, PolicyUpdatePlan
-from openviking.session.train.engine import PolicyTrainingEngine
 from openviking.session.train.gradients import PatchSemanticGradient
 from openviking_cli.utils.config.agent_evolution_config import DagDeciderConfig
 
@@ -128,8 +128,8 @@ def _plan(
 
 
 class StopsAtReportDecider:
-    async def decide(self, instances, *, evidence, context):
-        del evidence, context
+    async def decide(self, instances, *, state):
+        del state
         instance = instances[0]
         if "known" not in instance.slot_values:
             return {instance.experience_uri: {"known": True}}
@@ -137,8 +137,8 @@ class StopsAtReportDecider:
 
 
 class CompletesDecider:
-    async def decide(self, instances, *, evidence, context):
-        del evidence, context
+    async def decide(self, instances, *, state):
+        del state
         instance = instances[0]
         return {instance.experience_uri: {"known": True, "report": True}}
 
@@ -147,8 +147,8 @@ class BatchCompletesDecider:
     def __init__(self):
         self.calls = []
 
-    async def decide(self, instances, *, evidence, context):
-        self.calls.append((list(instances), evidence, context))
+    async def decide(self, instances, *, state):
+        self.calls.append((list(instances), state))
         return {instance.experience_uri: {"known": True, "report": True} for instance in instances}
 
 
@@ -156,8 +156,8 @@ class BatchStopsAtReportDecider:
     def __init__(self):
         self.calls = []
 
-    async def decide(self, instances, *, evidence, context):
-        self.calls.append((list(instances), evidence, context))
+    async def decide(self, instances, *, state):
+        self.calls.append((list(instances), state))
         return {
             instance.experience_uri: {"known": True}
             for instance in instances
@@ -288,7 +288,7 @@ async def test_merged_plan_keeps_independently_passing_candidate():
 
 
 @pytest.mark.asyncio
-async def test_same_context_candidates_and_baselines_share_dag_replay_call():
+async def test_shared_replay_does_not_infer_reminder_ack_from_model_answers():
     second_experience = "viking://user/u/memories/experiences/refund.md"
     second_session = "viking://session/s2/archives/001"
     baseline = _source("State the previous total")
@@ -334,13 +334,13 @@ async def test_same_context_candidates_and_baselines_share_dag_replay_call():
         None,
     )
 
-    assert len(result.items) == 2
-    assert jev.evaluate.await_count == 2
-    assert len(jev.evaluate.await_args_list[0].kwargs["questions"]) == 8
-    assert len(jev.evaluate.await_args_list[1].kwargs["questions"]) == 4
+    assert result.items == []
+    jev.evaluate.assert_awaited_once()
+    assert len(jev.evaluate.await_args.kwargs["questions"]) == 4
     diagnostics = result.metadata["experience_improvement_gate"]["candidates"]
     assert all(
-        item["replays"][0]["baseline_replay"]["state"] == "completed" for item in diagnostics
+        item["replays"][0]["reason"] == "candidate no longer completes for a successful Session"
+        for item in diagnostics
     )
 
 
@@ -536,7 +536,7 @@ async def test_estimated_oversized_candidate_does_not_reject_other_candidate(mon
         return 50
 
     monkeypatch.setattr(
-        "openviking.session.train.components.experience_improvement_gate.estimate_jev_input_tokens",
+        "openviking.session.train.gates.experience.estimate_jev_input_tokens",
         estimate_by_candidate,
     )
     jev = SimpleNamespace(
@@ -629,6 +629,10 @@ async def test_training_engine_runs_gate_before_updater():
     plan = _plan(_source())
 
     class LockablePolicySet:
+        def __init__(self):
+            self.root_uri = "viking://user/u/memories/experiences"
+            self.policies = []
+
         @asynccontextmanager
         async def lock(self):
             yield "lease"
@@ -683,8 +687,8 @@ async def test_case_gate_aggregates_success_and_failed_sessions(
     success_complete, improve, preserve, accepted
 ):
     class EvidenceDecider:
-        async def decide(self, instances, *, evidence, context):
-            success = "successful" in context
+        async def decide(self, instances, *, state):
+            success = "successful" in json.dumps(state)
             return {
                 i.experience_uri: {"known": True, "report": success and success_complete}
                 for i in instances

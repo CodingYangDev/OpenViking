@@ -651,9 +651,7 @@ class HierarchicalRetriever:
                     abstract=abstract,
                     category=c.get("category", ""),
                     score=final_score,
-                    search_tags=normalize_search_tags(
-                        c.get("search_tags"), discard_invalid=True
-                    ),
+                    search_tags=normalize_search_tags(c.get("search_tags"), discard_invalid=True),
                 )
             )
 

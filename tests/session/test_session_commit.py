@@ -121,6 +121,8 @@ class TestCommit:
         monkeypatch,
     ):
         await session_with_messages.update_config(
+            extraction_context="shared routing context",
+            update_extraction_context=True,
             auto_commit_policy={
                 "pending_token_threshold": 0,
                 "message_count_threshold": 1,
@@ -151,8 +153,13 @@ class TestCommit:
         assert all(len(batch) == 1 for batch in working_memory_batches)
         assert extract_long_term.await_count == 4
         assert all(len(call.kwargs["messages"]) == 1 for call in extract_long_term.await_args_list)
+        assert all(
+            call.kwargs["extraction_context"] == "shared routing context"
+            for call in extract_long_term.await_args_list
+        )
         phase1 = await session_with_messages._read_phase1_meta(result["archive_uri"])
         assert phase1["queue_message"]["auto_commit_policy"]["message_count_threshold"] == 1
+        assert phase1["queue_message"]["extraction_context"] == "shared routing context"
 
     async def test_commit_task_reports_intentionally_skipped_memory_operations(
         self,
@@ -403,6 +410,7 @@ class TestCommit:
             return_value={
                 "contexts": [],
                 "session_skills": [{"uri": "viking://user/test/skills/code-review"}],
+                "trajectory_uris": ["viking://user/test/memories/trajectories/case/trajectory.md"],
             }
         )
 
@@ -414,6 +422,9 @@ class TestCommit:
         assert task_result["result"]["session_skills_extracted"] == 1
         assert task_result["result"]["session_skill_uris"] == [
             "viking://user/test/skills/code-review"
+        ]
+        assert task_result["result"]["trajectory_uris"] == [
+            "viking://user/test/memories/trajectories/case/trajectory.md"
         ]
         assert "memory_diff_uri" not in task_result["result"]
         session_with_messages._session_compressor.extract_long_term_memories.assert_awaited_once()

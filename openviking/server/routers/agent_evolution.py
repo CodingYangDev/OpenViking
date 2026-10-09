@@ -3,6 +3,7 @@
 """Agent Evolution endpoints."""
 
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field, model_validator
 
 from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.server.auth import get_request_context
@@ -15,6 +16,48 @@ from openviking.service.agent_evolution_service import (
 )
 
 router = APIRouter(prefix="/api/v1/agent-evolution", tags=["agent-evolution"])
+
+
+class LearnExperiencesRequest(BaseModel):
+    trajectory_uris: list[str] | None = Field(default=None, max_length=10_000)
+    case_names: list[str] | None = Field(default=None, max_length=1_000)
+    max_cases: int = Field(default=100, ge=1, le=1_000)
+    wait: bool = True
+    retry_failed: bool = False
+    lease_seconds: int = Field(default=900, ge=30, le=86_400)
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def reject_empty_explicit_filters(self) -> "LearnExperiencesRequest":
+        if self.trajectory_uris == []:
+            raise ValueError("trajectory_uris must be omitted or non-empty")
+        if self.case_names == []:
+            raise ValueError("case_names must be omitted or non-empty")
+        return self
+
+
+@router.post("/experiences/learn")
+async def learn_experiences(
+    request: LearnExperiencesRequest,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Process pending Trajectories into at most one Experience update per Case."""
+    trajectory_uris = (
+        [validate_request_viking_uri(uri, _ctx) for uri in request.trajectory_uris]
+        if request.trajectory_uris is not None
+        else None
+    )
+    result = await get_service().agent_evolution.learn_experiences(
+        ctx=_ctx,
+        trajectory_uris=trajectory_uris,
+        case_names=request.case_names,
+        max_cases=request.max_cases,
+        retry_failed=request.retry_failed,
+        lease_seconds=request.lease_seconds,
+        wait=request.wait,
+    )
+    return Response(status="ok", result=result)
 
 
 @router.get("/experiences/trajectories")

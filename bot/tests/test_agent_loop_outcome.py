@@ -204,7 +204,14 @@ async def test_agent_loop_keeps_experience_reminder_and_does_not_reinject_it(mak
     provider = _MediaProvider([[_image_call("call-1")]])
     loop = make_loop(provider=provider, max_iterations=2)
     reminder = "[Experience Reminder]\nRemember the complete total."
-    experience_context_provider = AsyncMock(return_value=reminder)
+    provider_calls = []
+
+    async def experience_context_provider(messages, *, before_tools=False):
+        if before_tools:
+            return
+        provider_calls.append(messages)
+        yield reminder
+
     captured_experience_messages = []
 
     final, *_ = await loop._run_agent_loop(
@@ -217,7 +224,7 @@ async def test_agent_loop_keeps_experience_reminder_and_does_not_reinject_it(mak
     )
 
     assert final == "done"
-    assert experience_context_provider.await_count == 2
+    assert len(provider_calls) == 2
     assert [message for message in provider.calls[0] if message.get("content") == reminder] == [
         {"role": "user", "content": reminder}
     ]
@@ -936,3 +943,472 @@ async def test_agent_loop_post_turn_clears_local_session_after_openviking_commit
     )
     assert persisted_session.metadata["openviking"]["last_synced_local_index"] == -1
     assert persisted_session.metadata["openviking"]["last_commit_local_index"] == -1
+
+
+@pytest.mark.asyncio
+async def test_quiet_model_call_uses_chat_not_stream(make_loop):
+    provider = _RecordingProvider()
+
+    async def forbidden_stream(**kwargs):
+        raise AssertionError("Quiet calls must not use streaming")
+        yield
+
+    provider.chat_stream = forbidden_stream
+    loop = make_loop(provider=provider)
+    response, content_streamed, reasoning_streamed = await loop._chat_with_stream_events(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="quiet"),
+        publish_events=False,
+    )
+    assert response.content == "ok"
+    assert len(provider.calls) == 1
+    assert not content_streamed and not reasoning_streamed
+
+
+@pytest.mark.asyncio
+async def test_visible_model_call_keeps_streaming(make_loop):
+    from vikingbot.providers.base import LLMStreamEvent
+
+    provider = _RecordingProvider()
+    provider.chat = AsyncMock(side_effect=AssertionError("Visible call must stream"))
+
+    async def stream(**kwargs):
+        yield LLMStreamEvent(type="content_delta", content="hello")
+        yield LLMStreamEvent(type="response", response=LLMResponse(content="hello"))
+
+    provider.chat_stream = stream
+    loop = make_loop(provider=provider)
+    loop.bus.publish_outbound = AsyncMock()
+    response, streamed, _ = await loop._chat_with_stream_events(
+        messages=[],
+        tools=[],
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="visible"),
+        publish_events=True,
+    )
+    assert response.content == "hello" and streamed
+    provider.chat.assert_not_awaited()
+    assert loop.bus.publish_outbound.await_args.args[0].content == "hello"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publish_events", [False, True])
+@pytest.mark.parametrize("max_iterations", [1, 2])
+async def test_model_error_never_routes_text_or_executes_its_tools(
+    make_loop, publish_events, max_iterations
+):
+    from vikingbot.agent.loop import AgentLLMError
+
+    provider = _MediaProvider([])
+    provider.responses = iter(
+        [
+            LLMResponse(content=None, tool_calls=[_image_call("first")], usage={"total_tokens": 3}),
+            LLMResponse(
+                content="Error calling LLM: failed",
+                finish_reason="error",
+                tool_calls=[_image_call("must-not-run")],
+            ),
+        ]
+    )
+    loop = make_loop(provider=provider, max_iterations=max_iterations)
+    registry = _ImageRegistry()
+    registry.execute_detailed = AsyncMock(wraps=registry.execute_detailed)
+    route = AsyncMock()
+    messages = [{"role": "user", "content": "read"}]
+    with pytest.raises(AgentLLMError) as captured:
+        await loop._run_agent_loop(
+            messages=messages,
+            session_key=SessionKey(type="cli", channel_id="test", chat_id="failure"),
+            publish_events=publish_events,
+            tool_registry=registry,
+            on_plain_text=route,
+        )
+    route.assert_not_awaited()
+    registry.execute_detailed.assert_awaited_once()
+    assert len(captured.value.tools_used) == 1
+    assert captured.value.usage["total_tokens"] == 3
+    assert captured.value.iteration == max_iterations
+    assert not any("Error calling LLM" in str(message) for message in messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_fails", [False, True])
+async def test_tool_receipt_runs_after_result_enters_model_context(make_loop, receipt_fails):
+    from vikingbot.agent.tools.base import Tool
+
+    events = []
+
+    class AdviceTool(Tool):
+        name = "ask_for_advice"
+        description = "Review the current task"
+        parameters = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+
+        async def execute(self, tool_context, query):
+            assert query == "Review eligibility"
+            assert tool_context.messages[0]["content"] == "actual user facts"
+            events.append("execute")
+
+            async def receipt(result):
+                assert result == "applicable advice"
+                assert events[-1] == "appended"
+                events.append("ack")
+                if receipt_fails:
+                    raise RuntimeError("temporary acknowledgement failure")
+
+            tool_context.on_result_added = receipt
+            return "applicable advice"
+
+    provider = _MediaProvider(
+        [
+            [
+                ToolCallRequest(
+                    id="advice-1",
+                    name="ask_for_advice",
+                    arguments={"query": "Review eligibility"},
+                    tokens=0,
+                )
+            ]
+        ]
+    )
+    loop = make_loop(provider=provider)
+    loop.tools.register(AdviceTool())
+    append = loop.context.add_tool_result
+
+    def observed_append(*args, **kwargs):
+        result = append(*args, **kwargs)
+        events.append("appended")
+        return result
+
+    loop.context.add_tool_result = observed_append
+    await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "actual user facts"}],
+        session_key=SessionKey(type="cli", channel_id="default", chat_id="advice-test"),
+        publish_events=False,
+        ov_tools_enable=False,
+        inject_write_experience=False,
+    )
+    assert events == ["execute", "appended", "ack"]
+    assert len(provider.calls) == 2
+    assert any(m.get("content") == "applicable advice" for m in provider.calls[1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_iterations", [0, 1, 2])
+async def test_initial_request_callback_observes_only_first_provider_call(
+    make_loop, max_iterations
+):
+    class Provider(_RecordingProvider):
+        async def chat(self, messages, tools=None, **kwargs):
+            self.calls.append(copy.deepcopy({"messages": messages, "tools": tools}))
+            if len(self.calls) == 1 and tools:
+                return LLMResponse(content=None, tool_calls=[_image_call("first-call")])
+            return LLMResponse(content="done")
+
+    provider = Provider()
+    loop = make_loop(provider=provider, max_iterations=max_iterations)
+    captured = []
+    messages = [{"role": "system", "content": "initial system"}, {"role": "user", "content": "hi"}]
+
+    result = await loop._run_agent_loop(
+        messages=messages,
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="capture"),
+        publish_events=False,
+        tool_registry=_ImageRegistry(),
+        inject_write_experience=False,
+        status_note_provider=AsyncMock(return_value="effective status note"),
+        on_initial_llm_request=lambda messages, tools: captured.append(
+            copy.deepcopy({"messages": messages, "tools": tools})
+        ),
+    )
+
+    assert result[0] == "done"
+    assert captured == [provider.calls[0]]
+    if max_iterations:
+        assert captured[0]["messages"][-1]["content"] == "effective status note"
+        assert captured[0]["tools"][0]["function"]["name"] == "read_image"
+        assert len(provider.calls) == 2
+        assert len(captured[0]["messages"]) < len(messages)
+    else:
+        assert captured[0]["tools"] == []
+    messages[0]["content"] = "later mutation"
+    assert captured[0]["messages"][0]["content"] == "initial system"
+
+
+@pytest.mark.asyncio
+async def test_automatic_advice_ack_failure_does_not_abort_model_call(make_loop):
+    provider = _RecordingProvider()
+    loop = make_loop(provider=provider, max_iterations=1)
+    reminder = "[Experience Reminder] review current facts"
+
+    async def guidance(messages, *, before_tools=False):
+        if before_tools:
+            return
+        yield reminder
+
+    result = await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "request"}],
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="ack-error"),
+        publish_events=False,
+        inject_write_experience=False,
+        experience_context_provider=guidance,
+        experience_context_injected=AsyncMock(
+            side_effect=ValueError("delivery persistence failed")
+        ),
+    )
+    assert result[0] == "ok"
+    assert {"role": "user", "content": reminder} in provider.calls[0][1]["messages"]
+
+
+@pytest.mark.asyncio
+async def test_identity_owning_provider_can_deliver_identical_markdown_for_distinct_advice(
+    make_loop,
+):
+    provider = _MediaProvider([[_image_call("call-1")]])
+    loop = make_loop(provider=provider, max_iterations=2)
+    note = "[Experience Reminder]\n\n### 建议 1\n\n**适用条件**\n- 当前条件\n\n**建议**\n核对范围。"
+    pending = ["experience-a", "experience-b"]
+    delivered = []
+
+    async def reminders(messages, *, before_tools=False):
+        if before_tools:
+            return
+        if pending:
+            yield note
+
+    async def record(text):
+        assert text == note
+        delivered.append(pending.pop(0))
+
+    captured = []
+    final, *_ = await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "read it"}],
+        session_key=SessionKey(type="cli", channel_id="default", chat_id="different-identities"),
+        publish_events=False,
+        tool_registry=_ImageRegistry(),
+        experience_context_provider=reminders,
+        experience_context_injected=record,
+        captured_experience_messages=captured,
+    )
+    assert final == "done"
+    assert delivered == ["experience-a", "experience-b"]
+    assert len(captured) == 2
+    assert sum(message.get("content") == note for message in provider.calls[1]) == 2
+
+
+class _CheckpointRegistry:
+    def __init__(self):
+        self.calls = []
+
+    def get_definitions(self, **kwargs):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in ("read_record", "write_record", "transfer_to_human_agents", "done")
+        ]
+
+    async def execute_detailed(self, name, params, **kwargs):
+        self.calls.append((name, dict(params)))
+        return ToolExecutionResult(result="Success", effective_params=dict(params))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("critical_tool", ["write_record", "transfer_to_human_agents", "done"])
+async def test_new_advice_defers_entire_tool_batch_without_orphan_calls(make_loop, critical_tool):
+    registry = _CheckpointRegistry()
+    provider = _MediaProvider(
+        [
+            [
+                ToolCallRequest("old-read", "read_record", {}, 0),
+                ToolCallRequest("old-action", critical_tool, {"version": "old"}, 0),
+            ],
+            [ToolCallRequest("new-action", critical_tool, {"version": "revised"}, 0)],
+        ]
+    )
+    loop = make_loop(provider=provider, max_iterations=4)
+    delivered = []
+    proposal_states = []
+    note = "[Experience Reminder] Review the latest facts before proceeding."
+
+    async def guidance(messages, *, before_tools=False):
+        if before_tools:
+            proposal_states.append(copy.deepcopy(messages))
+            if not delivered:
+                yield note
+
+    async def acknowledge(value):
+        delivered.append(value)
+
+    captured = []
+    result = await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "Handle this record"}],
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="checkpoint"),
+        publish_events=False,
+        tool_registry=registry,
+        stop_tool_names=["done"],
+        inject_write_experience=False,
+        experience_context_provider=guidance,
+        experience_context_injected=acknowledge,
+        captured_experience_messages=captured,
+    )
+    assert registry.calls == [(critical_tool, {"version": "revised"})]
+    assert delivered == [note] and captured[0]["after_tool_count"] == 0
+    assert proposal_states[0][-1]["tool_calls"][1]["id"] == "old-action"
+    second_request = provider.calls[1]
+    assert any(m.get("content") == note for m in second_request)
+    assert not any(m.get("tool_calls") or m.get("role") == "tool" for m in second_request)
+    assert all(t["tool_call_id"] != "old-action" for t in result[2])
+    # Only the accepted proposal gets tool results and can end the task.
+    assert result[2][0]["tool_call_id"] == "new-action"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_without_new_advice_executes_without_extra_model_round(make_loop):
+    registry = _CheckpointRegistry()
+    provider = _MediaProvider([[ToolCallRequest("write", "write_record", {}, 0)]])
+    loop = make_loop(provider=provider, max_iterations=3)
+    stages = []
+
+    async def no_advice(messages, *, before_tools=False):
+        stages.append(before_tools)
+        yield ""
+
+    await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "Update"}],
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="no-advice"),
+        publish_events=False,
+        tool_registry=registry,
+        inject_write_experience=False,
+        experience_context_provider=no_advice,
+    )
+    assert registry.calls == [("write_record", {})]
+    assert len(provider.calls) == 2
+    assert stages == [False, True, False]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_cancellation_prevents_tools_from_executing(make_loop):
+    import asyncio
+
+    registry = _CheckpointRegistry()
+    provider = _MediaProvider([[ToolCallRequest("write", "write_record", {}, 0)]])
+    loop = make_loop(provider=provider, max_iterations=3)
+
+    async def cancelled(messages, *, before_tools=False):
+        if before_tools:
+            raise asyncio.CancelledError()
+        yield ""
+
+    with pytest.raises(asyncio.CancelledError):
+        await loop._run_agent_loop(
+            messages=[{"role": "user", "content": "Update"}],
+            session_key=SessionKey(type="cli", channel_id="test", chat_id="cancelled-check"),
+            publish_events=False,
+            tool_registry=registry,
+            inject_write_experience=False,
+            experience_context_provider=cancelled,
+        )
+    assert registry.calls == []
+
+
+@pytest.mark.asyncio
+async def test_deferred_write_is_not_executed_when_iteration_budget_is_exhausted(make_loop):
+    registry = _CheckpointRegistry()
+    provider = _MediaProvider([[ToolCallRequest("write", "write_record", {}, 0)]])
+    loop = make_loop(provider=provider, max_iterations=1)
+
+    async def new_advice(messages, *, before_tools=False):
+        if before_tools:
+            yield "[Experience Reminder] Reconsider first"
+
+    await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "Update"}],
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="exhausted-check"),
+        publish_events=False,
+        tool_registry=registry,
+        inject_write_experience=False,
+        experience_context_provider=new_advice,
+    )
+    assert registry.calls == []
+
+
+@pytest.mark.asyncio
+async def test_real_tau2_runtime_checks_user_and_write_boundaries_and_dedups_replan(make_loop):
+    from types import SimpleNamespace
+
+    from benchmark.tau2.train.dag_experience_runtime import Tau2DagExperienceRuntime
+
+    registry = _CheckpointRegistry()
+    provider = _MediaProvider(
+        [
+            [ToolCallRequest("read", "read_record", {}, 0)],
+            [ToolCallRequest("old-write", "write_record", {"version": "old"}, 0)],
+            [ToolCallRequest("new-write", "write_record", {"version": "new"}, 0)],
+            [ToolCallRequest("done", "done", {}, 0)],
+        ]
+    )
+    loop = make_loop(provider=provider, max_iterations=5)
+    runtime = Tau2DagExperienceRuntime(review_tools={"write_record"})
+    key = SessionKey(type="cli", channel_id="test", chat_id="real-checkpoint")
+    runtime.bind_session(loop.sessions, key)
+    runtime.record_user_message("Update the record")
+    instruction = {
+        "experience_uri": "viking://user/default/memories/experiences/review.md",
+        "slot_name": "review",
+        "provider": {"type": "TellAgent", "instruction": "Review the new facts"},
+        "conditions": [],
+    }
+    payload = {
+        "instructions": [instruction],
+        "matched_experience_uris": [instruction["experience_uri"]],
+    }
+    runtime.client = SimpleNamespace(
+        search_advice=AsyncMock(side_effect=[{}, payload, payload, {}]), close=AsyncMock()
+    )
+    captures = []
+    try:
+        await loop._run_agent_loop(
+            messages=[{"role": "user", "content": "Update the record"}],
+            session_key=key,
+            publish_events=False,
+            tool_registry=registry,
+            stop_tool_names=["done"],
+            inject_write_experience=False,
+            experience_context_provider=runtime.recall,
+            experience_context_injected=runtime.record_injected,
+            captured_experience_messages=captures,
+        )
+        assert registry.calls == [
+            ("read_record", {}),
+            ("write_record", {"version": "new"}),
+            ("done", {}),
+        ]
+        assert len(provider.calls) == 4
+        assert [r["trigger"] for r in runtime.recalls] == ["user_message"] + ["before_action"] * 3
+        assert [r["status"] for r in runtime.recalls] == [
+            "no_match",
+            "advice",
+            "no_applicable_advice",
+            "no_match",
+        ]
+        assert len(captures) == 1 and captures[0]["after_tool_count"] == 1
+        checkpoint = runtime.client.search_advice.call_args_list[1].args[0]
+        assert checkpoint[-1]["tool_calls"][0]["id"] == "old-write"
+        assert any(m.get("role") == "tool" and m.get("name") == "read_record" for m in checkpoint)
+        assert not any(
+            call["id"] == "old-write"
+            for message in provider.calls[2]
+            for call in message.get("tool_calls", [])
+        )
+        assert len([e for e in runtime.events if e.get("event") == "reminder_delivered"]) == 1
+    finally:
+        await runtime.close()

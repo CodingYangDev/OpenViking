@@ -559,6 +559,14 @@ class TestPendingTokensClamp:
         assert meta.pending_tokens >= 0
         assert meta.keep_recent_count >= 0
 
+    def test_from_dict_defaults_and_round_trips_extraction_context(self):
+        from openviking.session.session import SessionMeta
+
+        assert SessionMeta.from_dict({}).extraction_context == ""
+        meta = SessionMeta.from_dict({"extraction_context": "trusted context"})
+        assert meta.extraction_context == "trusted context"
+        assert meta.to_dict()["extraction_context"] == "trusted context"
+
 
 # =======================================================================
 # APPEND non-string items handling

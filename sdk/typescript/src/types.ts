@@ -255,6 +255,7 @@ export interface CreateSessionOptions {
   memoryPolicy?: JsonObject;
   autoCommitPolicy?: JsonObject | null;
   memoryExtractionConfig?: MemoryExtractionConfig;
+  extractionContext?: string;
   telemetry?: unknown;
   extra?: JsonObject;
 }
@@ -268,6 +269,7 @@ export interface MemoryExtractionConfig {
 export interface UpdateSessionConfigOptions {
   memoryExtractionConfig?: MemoryExtractionConfig;
   autoCommitPolicy?: JsonObject | null;
+  extractionContext?: string | null;
   telemetry?: unknown;
   extra?: JsonObject;
 }

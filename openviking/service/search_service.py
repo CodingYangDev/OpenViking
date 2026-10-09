@@ -18,8 +18,18 @@ from openviking.utils.image_search import (
 )
 from openviking_cli.exceptions import InvalidArgumentError, NotInitializedError
 from openviking_cli.utils import get_logger
+from openviking_cli.utils.config.agent_evolution_config import (
+    AgentEvolutionConfig,
+    DagDeciderConfig,
+)
+from openviking_cli.utils.config.jev_config import JevConfig
 
 if TYPE_CHECKING:
+    from openviking.config.vlm import VLMResolver
+    from openviking.service.experience_runtime import (
+        SearchExperienceRequest,
+        SearchExperienceResult,
+    )
     from openviking.session import Session
 
 logger = get_logger(__name__)
@@ -49,10 +59,51 @@ class SearchService:
 
     def __init__(self, viking_fs: Optional[VikingFS] = None):
         self._viking_fs = viking_fs
+        self._vlm_resolver: Optional["VLMResolver"] = None
+        self._jev_config: Optional[JevConfig] = None
+        self._runtime_config_manager: Optional[Any] = None
+        self._agent_evolution_default_dag_decider: Optional[DagDeciderConfig] = None
 
     def set_viking_fs(self, viking_fs: VikingFS) -> None:
         """Set VikingFS instance (for deferred initialization)."""
         self._viking_fs = viking_fs
+
+    def set_advice_dependencies(
+        self, *, vlm_resolver: Optional["VLMResolver"], jev_config: Optional[JevConfig]
+    ) -> None:
+        self._vlm_resolver = vlm_resolver
+        self._jev_config = jev_config.model_copy(deep=True) if jev_config is not None else None
+
+    def set_agent_evolution_config(self, config: AgentEvolutionConfig) -> None:
+        self._agent_evolution_default_dag_decider = config.dag_decider
+
+    def set_runtime_config_manager(self, manager: Any) -> None:
+        self._runtime_config_manager = manager
+
+    async def get_dag_decider_config(self, account_id: str) -> Optional[DagDeciderConfig]:
+        """Resolve account decision policy with the cluster policy as field fallback."""
+        if self._runtime_config_manager is not None:
+            setting = await self._runtime_config_manager.get_account(
+                account_id,
+                "agent_evolution",
+            )
+            configured = getattr(setting, "dag_decider", None)
+            if configured is not None:
+                return configured
+        return self._agent_evolution_default_dag_decider
+
+    async def advice(
+        self, request: "SearchExperienceRequest", ctx: RequestContext
+    ) -> "SearchExperienceResult":
+        """Dispatch stateless advice evaluation without loading or creating a Session."""
+        from openviking.service.experience_runtime import ExperienceRuntime
+
+        return await ExperienceRuntime(
+            self._ensure_initialized(),
+            self._vlm_resolver,
+            dag_decider_config=await self.get_dag_decider_config(ctx.account_id),
+            jev_config=self._jev_config,
+        ).search(request, ctx)
 
     def _ensure_initialized(self) -> VikingFS:
         """Ensure VikingFS is initialized."""

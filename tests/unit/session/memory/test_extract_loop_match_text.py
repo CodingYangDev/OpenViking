@@ -16,7 +16,6 @@ from openviking.session.memory.dataclass import (
     ResolvedOperations,
     WikiLink,
 )
-from openviking.session.memory.experience_dag_compiler import compile_dag
 from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.extraction_output_protocol import (
     create_extraction_output_protocol,
@@ -174,6 +173,30 @@ class TestResolveOperations:
         )
         isolation_handler.calculate_memory_uris.assert_not_called()
 
+    def test_memory_type_for_uri_uses_read_file_metadata(self):
+        project_uri = "viking://user/alice/memories/ss/projects/proj_1/project.md"
+        plot_uri = "viking://user/alice/memories/ss/projects/proj_1/plots/plot_1/plot.md"
+        clip_uri = (
+            "viking://user/alice/memories/ss/projects/proj_1/plots/plot_1/clips/clip_1/clip.md"
+        )
+        context_provider = Mock()
+        context_provider.read_file_contents = {
+            project_uri: MemoryFile(uri=project_uri, memory_type="ss_project"),
+            plot_uri: MemoryFile(uri=plot_uri, memory_type="ss_plot"),
+            clip_uri: MemoryFile(uri=clip_uri, memory_type="ss_clip"),
+        }
+        loop = ExtractLoop(
+            vlm=Mock(model="test-model"),
+            viking_fs=Mock(),
+            context_provider=context_provider,
+            isolation_handler=Mock(),
+        )
+
+        assert loop._memory_type_for_uri(project_uri) == "ss_project"
+        assert loop._memory_type_for_uri(plot_uri) == "ss_plot"
+        assert loop._memory_type_for_uri(clip_uri) == "ss_clip"
+        assert loop._memory_type_for_uri("viking://user/alice/memories/missing.md") is None
+
     @pytest.mark.asyncio
     async def test_type_mismatched_page_id_is_rejected_from_links_and_replacements(self):
         entity_schema = MemoryTypeSchema(
@@ -246,7 +269,7 @@ class TestResolveOperations:
         assert operations.resolved_links == []
 
     @pytest.mark.asyncio
-    async def test_existing_page_id_uses_path_when_metadata_is_dirty(self):
+    async def test_existing_page_id_rejects_conflicting_file_metadata(self):
         schema = MemoryTypeSchema(
             memory_type="profile",
             directory="viking://user/{{ user_space }}/memories",
@@ -280,9 +303,47 @@ class TestResolveOperations:
         operations, _ = await loop.resolve_operations(AttrDict(profile=[{"page_id": 1}]))
 
         operation = operations.upsert_operations[0]
-        assert operation.uris == [profile_uri]
-        assert operation.old_memory_file_content is dirty_profile
-        assert operation.resolution_skip is None
+        assert operation.uris == []
+        assert operation.old_memory_file_content is None
+        assert operation.resolution_skip is not None
+        assert (
+            operation.resolution_skip.reason_code == MemoryOperationSkipCode.PAGE_ID_TYPE_MISMATCH
+        )
+        assert "belongs to memory type events, not profile" in operation.resolution_skip.reason
+
+    @pytest.mark.asyncio
+    async def test_existing_page_id_rejects_missing_memory_type_metadata(self):
+        schema = MemoryTypeSchema(
+            memory_type="profile",
+            directory="viking://user/{{ user_space }}/memories",
+            filename_template="profile.md",
+            fields=[],
+        )
+        profile_uri = "viking://user/alice/memories/profile.md"
+        profile = MemoryFile(uri=profile_uri, content="profile")
+        page_id_map = PageIdMap()
+        assert page_id_map.get_page_id(profile_uri) == 1
+        context_provider = Mock()
+        context_provider.get_memory_schemas.return_value = [schema]
+        context_provider.read_file_contents = {profile_uri: profile}
+        isolation_handler = Mock()
+        isolation_handler.get_read_scope.return_value = None
+        isolation_handler.fill_identity_fields.side_effect = lambda item, **kwargs: item
+
+        loop = ExtractLoop(
+            vlm=Mock(model="test-model"),
+            viking_fs=Mock(),
+            context_provider=context_provider,
+            isolation_handler=isolation_handler,
+        )
+        loop._extract_context = SimpleNamespace(page_id_map=page_id_map)
+
+        operations, _ = await loop.resolve_operations(AttrDict(profile=[{"page_id": 1}]))
+
+        operation = operations.upsert_operations[0]
+        assert operation.uris == []
+        assert operation.resolution_skip is not None
+        assert "has no memory_type metadata" in operation.resolution_skip.reason
 
     @pytest.mark.asyncio
     async def test_non_event_add_only_resolution_is_unchanged(self):
@@ -824,6 +885,7 @@ class TestResolutionRepair:
         context_provider.get_tools.return_value = []
         context_provider.get_extract_context.return_value = SimpleNamespace(page_id_map=PageIdMap())
         context_provider.prefetch = AsyncMock(return_value=[])
+        context_provider.format_prefetch_messages.side_effect = lambda messages: messages
         context_provider.read_file_contents = {}
         context_provider.instruction.return_value = "base instruction"
 
@@ -1079,6 +1141,7 @@ class TestResolutionRepair:
         context_provider.get_tools.return_value = []
         context_provider.get_extract_context.return_value = SimpleNamespace(page_id_map=PageIdMap())
         context_provider.prefetch = AsyncMock(return_value=[])
+        context_provider.format_prefetch_messages.side_effect = lambda messages: messages
         context_provider.read_file_contents = {}
         context_provider.instruction.return_value = "base instruction"
 
@@ -1160,6 +1223,7 @@ class TestPageIdInstruction:
         extract_context.page_id_map = PageIdMap()
         context_provider.get_extract_context.return_value = extract_context
         context_provider.prefetch = AsyncMock(return_value=[])
+        context_provider.format_prefetch_messages.side_effect = lambda messages: messages
         context_provider.read_file_contents = {}
         context_provider.instruction.return_value = "base instruction"
         context_provider._get_registry.return_value = Mock()
@@ -1236,6 +1300,7 @@ class TestPageIdInstruction:
         extract_context.page_id_map = PageIdMap()
         context_provider.get_extract_context.return_value = extract_context
         context_provider.prefetch = AsyncMock(return_value=[])
+        context_provider.format_prefetch_messages.side_effect = lambda messages: messages
         context_provider.read_file_contents = {}
         context_provider.instruction.return_value = "base instruction"
         context_provider._get_registry.return_value = Mock()
@@ -1311,6 +1376,7 @@ class TestFinalOperationsHydration:
         extract_context.page_id_map.get_page_id(old_file.uri)
         context_provider.get_extract_context.return_value = extract_context
         context_provider.prefetch = AsyncMock(return_value=[])
+        context_provider.format_prefetch_messages.side_effect = lambda messages: messages
         context_provider.read_file_contents = {old_file.uri: old_file}
         context_provider.instruction.return_value = "test instruction"
         context_provider._get_registry.return_value = Mock()

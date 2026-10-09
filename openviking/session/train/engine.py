@@ -5,11 +5,14 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import dataclass
 
+from openviking.session.train.components.policy_updater import _normalize_guard_content, _target_uri
 from openviking.session.train.context import PipelineContext
 from openviking.session.train.domain import (
     ExperienceSet,
+    Policy,
     PolicyApplyResult,
     PolicyUpdatePlan,
     Rollout,
@@ -23,6 +26,9 @@ from openviking.session.train.interfaces import (
     RolloutAnalyzer,
     SemanticGradient,
 )
+from openviking.storage.errors import ResourceBusyError
+
+_MAX_PLAN_ATTEMPTS = 3
 
 
 @dataclass(slots=True)
@@ -86,24 +92,77 @@ class PolicyTrainingEngine:
         policy_set: ExperienceSet,
         ctx: PipelineContext,
     ) -> tuple[PolicyUpdatePlan, PolicyApplyResult]:
-        async with policy_set.lock() as transaction_handle:
-            latest_policy_set = await policy_set.reload()
+        for _ in range(_MAX_PLAN_ATTEMPTS):
+            async with policy_set.lock():
+                planning_policy_set = await policy_set.reload()
+                expected = deepcopy({policy.uri: policy for policy in planning_policy_set.policies})
+
             plan = await self.policy_optimizer.plan(
                 gradients,
-                latest_policy_set,
+                planning_policy_set,
                 ctx.optimization_context,
             )
             if self.policy_update_gate is not None:
                 plan = await self.policy_update_gate.validate(
                     plan,
                     gradients,
-                    latest_policy_set,
+                    planning_policy_set,
                     ctx.gradient_context,
                 )
-            apply_result = await self.policy_updater.apply(
-                plan,
-                latest_policy_set,
-                ctx.apply_context or latest_policy_set.request_context,
-                transaction_handle=transaction_handle,
-            )
-        return plan, apply_result
+            async with policy_set.lock() as transaction_handle:
+                latest_policy_set = await policy_set.reload()
+                conflicts = _conflicting_policy_uris(
+                    plan,
+                    expected,
+                    latest_policy_set,
+                    check_all=self.policy_update_gate is not None,
+                )
+                if conflicts:
+                    # Leaving the context releases the lock before any replanning.
+                    continue
+                apply_result = await self.policy_updater.apply(
+                    plan,
+                    latest_policy_set,
+                    ctx.apply_context or latest_policy_set.request_context,
+                    transaction_handle=transaction_handle,
+                )
+                return plan, apply_result
+        raise ResourceBusyError(
+            f"Policies changed or plan became stale during planning after {_MAX_PLAN_ATTEMPTS} "
+            f"attempts: {', '.join(conflicts)}",
+            uri=policy_set.root_uri,
+            conflict_type="policy_plan_stale",
+        )
+
+
+def _conflicting_policy_uris(
+    plan: PolicyUpdatePlan,
+    expected: dict[str, Policy],
+    current: ExperienceSet,
+    *,
+    check_all: bool,
+) -> list[str]:
+    actual = {policy.uri: policy for policy in current.policies}
+    # A generic optimizer or gate may inspect the whole snapshot. Fixed-Case
+    # optimizers declare their complete read set so unrelated Cases can progress.
+    watched = (
+        set(expected) | set(actual)
+        if check_all or plan.read_policy_uris is None
+        else set(plan.read_policy_uris)
+    )
+    watched.update(_target_uri(item, current.root_uri) for item in plan.items)
+    conflicts = {uri for uri in watched if expected.get(uri) != actual.get(uri)}
+    for item in plan.items:
+        uri = _target_uri(item, current.root_uri)
+        policy = actual.get(uri)
+        if item.base_version is not None and (
+            policy is None or policy.version != item.base_version
+        ):
+            conflicts.add(uri)
+        if item.before_content is not None and (
+            policy is None
+            or _normalize_guard_content(policy.content)
+            != _normalize_guard_content(item.before_content)
+        ):
+            conflicts.add(uri)
+    return sorted(conflicts)

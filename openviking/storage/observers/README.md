@@ -13,6 +13,7 @@ All observers inherit from `BaseObserver`, which defines the common interface:
 ```python
 from openviking.storage.observers import BaseObserver
 
+
 class MyObserver(BaseObserver):
     def get_status_table(self) -> str:
         """Format status information as a string."""

@@ -33,6 +33,8 @@ from openviking.session.train import (
     Rollout,
     RubricEvaluation,
 )
+from openviking.session.train.components.dataset_service import redact_sensitive
+from openviking.utils.multimodal import redact_image_data_urls
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -106,6 +108,7 @@ def _vikingbot_imports() -> dict[str, Any]:
     try:
         from vikingbot.agent.context import ContextBuilder
         from vikingbot.agent.loop import (
+            AgentLLMError,
             AgentLoop,
             _PlainTextContext,
             _PlainTextDelivered,
@@ -126,6 +129,7 @@ def _vikingbot_imports() -> dict[str, Any]:
 
     return {
         "AgentLoop": AgentLoop,
+        "AgentLLMError": AgentLLMError,
         "ContextBuilder": ContextBuilder,
         "_PlainTextContext": _PlainTextContext,
         "_PlainTextDelivered": _PlainTextDelivered,
@@ -149,6 +153,7 @@ def _make_tau2_tool(
     tool_lock: "_AsyncRWLock | None" = None,
     is_write_tool: bool = False,
     record_tool_timing: Callable[[str, float], None] | None = None,
+    record_user_message: Callable[[str, str], None] | None = None,
 ):
     Tool = _vikingbot_imports()["Tool"]
 
@@ -176,7 +181,14 @@ def _make_tau2_tool(
             return self._parameters
 
         async def execute(self, tool_context: Any, **kwargs: Any) -> str:
-            del tool_context
+            if self._name == "communicate_with_user" and record_user_message is not None:
+
+                async def record_reply(result: str) -> None:
+                    if _is_real_tau2_user_reply(result):
+                        record_user_message(result, str(kwargs.get("content") or ""))
+
+                # Record only the actual result delivered to the model, after tool hooks.
+                tool_context.on_result_added = record_reply
             started_at = time.perf_counter()
 
             try:
@@ -362,13 +374,18 @@ class VikingBotTau2RolloutExecutor:
         SessionKey = _vikingbot_imports()["SessionKey"]
         trial_suffix = "" if trial is None else f"_r{int(trial)}"
         stage = _safe_session_fragment(str(context.metadata.get("stage") or "rollout"))
+        runtime = getattr(agent, "_tau2_dag_runtime", None)
+        # Each rollout is a new conversation, even when task/trial numbers repeat
+        # in another experiment. Never reuse its persisted client delivery facts.
+        conversation_suffix = f"_{runtime.runtime_id}" if runtime else ""
         session_key = SessionKey(
             type="cli",
             channel_id="tau2",
-            chat_id=f"tau2_{stage}_{data_split}_{task_no}{trial_suffix}",
+            chat_id=f"tau2_{stage}_{data_split}_{task_no}{trial_suffix}{conversation_suffix}",
         )
         timings.record("prepare_prompt", stage_started_at)
 
+        initial_llm_request: dict[str, Any] = {}
         (
             final_content,
             final_reasoning_content,
@@ -377,6 +394,7 @@ class VikingBotTau2RolloutExecutor:
             iteration,
             memory_content,
             experience_messages,
+            execution_error,
         ) = await _run_agent(
             agent=agent,
             system_prompt=system_prompt,
@@ -385,13 +403,19 @@ class VikingBotTau2RolloutExecutor:
             sender_id="tau2_user",
             keep_default_tools=self.keep_default_tools,
             timings=timings,
+            initial_llm_request=initial_llm_request,
             case_lookup=_tau2_case_lookup(case),
         )
 
         reward = None
         evaluation_result = None
         stage_started_at = time.perf_counter()
-        if provider.env is not None:
+        if execution_error is not None:
+            # Return one failed Rollout, not a failed remote execution that would
+            # make asyncio.gather abort the entire training/evaluation batch.
+            reward = 0.0
+            evaluation_result = dict(execution_error)
+        elif provider.env is not None:
             try:
                 # Customer-facing content should be sent before `done`; do not append
                 # the post-done final response to tau2's simulator/evaluator.
@@ -406,6 +430,12 @@ class VikingBotTau2RolloutExecutor:
                     task_id,
                 )
                 evaluation_result = {"error": str(exc), "type": type(exc).__name__}
+                execution_error = {
+                    "source": "tau2_evaluation",
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+            execution_error = provider.env.execution_error or execution_error
         timings.record("reward", stage_started_at)
 
         stage_started_at = time.perf_counter()
@@ -435,11 +465,18 @@ class VikingBotTau2RolloutExecutor:
                 "original_case_name": case.input.get("original_case_name"),
                 "reward": reward,
                 "evaluation_result": evaluation_result,
+                "execution_error": execution_error,
                 "tools_used": tools_used,
                 "token_usage": token_usage,
                 "iterations": iteration,
                 "memory": memory_content,
+                "advice_recalls": (
+                    agent._tau2_dag_runtime.recalls
+                    if getattr(agent, "_tau2_dag_runtime", None)
+                    else []
+                ),
                 "system_prompt": system_prompt,
+                "initial_llm_request": initial_llm_request or None,
                 "business_current_time": _tau2_policy_current_time_iso(system_prompt),
                 "user_prompt": user_prompt,
                 "final_content": final_content,
@@ -448,7 +485,8 @@ class VikingBotTau2RolloutExecutor:
                 "ov_tools_enable": False,
                 "experience_recall_enable": self.keep_default_tools,
                 "dag_runtime": {
-                    "session_id": agent._tau2_dag_runtime.session_id,
+                    "runtime_id": agent._tau2_dag_runtime.runtime_id,
+                    "client_session_key": session_key.model_dump(mode="json"),
                     "events": agent._tau2_dag_runtime.events,
                 }
                 if getattr(agent, "_tau2_dag_runtime", None)
@@ -532,12 +570,23 @@ def _tau2_user_reply_terminates(reply: Any) -> bool:
     return any(tok in text for tok in _TAU2_USER_STOP_TOKENS + _TAU2_USER_TRANSFER_TOKENS)
 
 
+def _is_real_tau2_user_reply(reply: Any) -> bool:
+    text = str(reply or "").strip()
+    return bool(
+        text
+        and not _tau2_user_reply_terminates(text)
+        and text != "###OUT-OF-SCOPE###"
+        and not text.startswith(("Error:", "Error executing ", "Error calling "))
+    )
+
+
 def _make_tau2_plain_text_router(
     *,
     publish_events: bool,
     bus: Any,
     session_key: Any,
     record_delivered_assistant_message: Callable[[str], None] | None = None,
+    record_user_message: Callable[[str, str], None] | None = None,
 ):
     """Build an `on_plain_text` callback that forwards assistant text via communicate_with_user.
 
@@ -620,6 +669,12 @@ def _make_tau2_plain_text_router(
             }
         ]
         messages.append({"role": "user", "content": str(user_reply)})
+        if (
+            execute_success
+            and record_user_message is not None
+            and _is_real_tau2_user_reply(user_reply)
+        ):
+            record_user_message(str(user_reply), text)
         terminates = _tau2_user_reply_terminates(user_reply)
         return PlainTextDelivered(
             messages=messages,
@@ -670,17 +725,19 @@ def _configure_tools(
     task_no: int | None = None,
     data_split: str | None = None,
 ) -> None:
-    # Tau2 rollout may keep generic VikingBot tools, but OpenViking access is
-    # restricted to automatic experience recall during prompt construction.
-    # No openviking_* tool should be callable by the agent.
+    # Tau2's provider is the complete tool allowlist for every rollout stage.
+    # Advice is runtime-managed and independent of the model's tool registry.
     from benchmark.tau2.train.dag_experience_runtime import Tau2DagExperienceRuntime
 
     for tool_name in list(agent.tools.tool_names):
-        if str(tool_name).startswith("openviking_"):
-            agent.tools.unregister(tool_name)
-    agent._tau2_dag_runtime = Tau2DagExperienceRuntime() if keep_default_tools else None
+        agent.tools.unregister(tool_name)
     tool_lock = _AsyncRWLock()
     write_tool_names = _classify_write_tools(provider)
+    agent._tau2_dag_runtime = (
+        Tau2DagExperienceRuntime(review_tools=write_tool_names - {"communicate_with_user"})
+        if keep_default_tools
+        else None
+    )
     for schema in provider.list_openai_tools():
         fn_name = str((schema.get("function") or {}).get("name") or "")
         agent.tools.register(
@@ -690,6 +747,9 @@ def _configure_tools(
                 tool_lock=tool_lock,
                 is_write_tool=fn_name in write_tool_names,
                 record_tool_timing=record_tool_timing,
+                record_user_message=(
+                    agent._tau2_dag_runtime.record_user_message if agent._tau2_dag_runtime else None
+                ),
             )
         )
 
@@ -772,17 +832,16 @@ def _classify_write_tools(provider: Any) -> set[str]:
 
 
 def _build_system_prompt(policy: str, *, keep_default_tools: bool, rollout_language: str) -> str:
-    del keep_default_tools
     instructions = []
     if policy:
         instructions.append(policy)
     instructions.append("Use the provided tools to interact with the environment.")
-    instructions.append(
-        "Relevant experience instructions may be inserted automatically before each decision. "
-        "Use them only when their situation and applicability boundaries match the current "
-        "task; current policy, current tool results, and current user facts override prior "
-        "experience."
-    )
+    if keep_default_tools:
+        instructions.append(
+            "Relevant past-experience advice may be supplied automatically after user messages "
+            "as [Experience Reminder]. Use it as a review aid only when applicable; task "
+            "requirements, constraints, and current facts remain authoritative."
+        )
     if rollout_language == "zh":
         instructions.append(
             "Communicate with the user and write the final response in Chinese. "
@@ -805,6 +864,19 @@ def _build_system_prompt(policy: str, *, keep_default_tools: bool, rollout_langu
     return "\n".join(instructions)
 
 
+def _capture_initial_llm_request(
+    output: dict[str, Any], messages: list[dict], tools: list[dict]
+) -> None:
+    """Keep an independent, credential-redacted snapshot, never affecting the model call."""
+    try:
+        snapshot = redact_sensitive(redact_image_data_urls({"messages": messages, "tools": tools}))
+        output.update({"capture_boundary": "agent_provider", **snapshot})
+    except Exception as exc:
+        # Do not persist exception text: it may contain the input being sanitized.
+        output.clear()
+        output["capture_error"] = type(exc).__name__
+
+
 async def _run_agent(
     *,
     agent: Any,
@@ -815,6 +887,7 @@ async def _run_agent(
     keep_default_tools: bool,
     timings: "_RolloutTiming | None" = None,
     case_lookup: dict[str, Any] | None = None,
+    initial_llm_request: dict[str, Any] | None = None,
 ):
     stage_started_at = time.perf_counter()
     message_context = agent.context
@@ -825,6 +898,7 @@ async def _run_agent(
         session_key=session_key,
         ov_tools_enable=False,
         experience_recall_enable=False,
+        only_skills=[],
         media=None,
         profile_user_list=[],
     )
@@ -839,6 +913,24 @@ async def _run_agent(
     memory_content = None
     stage_started_at = time.perf_counter()
     runtime = getattr(agent, "_tau2_dag_runtime", None)
+    experience_messages: list[dict[str, Any]] = []
+    if runtime:
+        try:
+            runtime.bind_session(agent.sessions, session_key)
+        except Exception as exc:
+            runtime.events.append(
+                {
+                    "state": "search_failed",
+                    "stage": "load_delivery_state",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            # Unknown delivery state must not turn a storage error into duplicate
+            # advice. Continue this rollout without advice, leaving the file intact.
+            runtime = None
+        else:
+            runtime.record_user_message(user_prompt)
     plain_text_router = _make_tau2_plain_text_router(
         publish_events=False,
         bus=getattr(agent, "bus", None),
@@ -846,15 +938,9 @@ async def _run_agent(
         record_delivered_assistant_message=(
             runtime.record_delivered_assistant_message if runtime else None
         ),
+        record_user_message=runtime.record_user_message if runtime else None,
     )
-    runtime_kwargs = (
-        {
-            "experience_context_provider": runtime.search_exp,
-            "captured_experience_messages": runtime.reminder_messages,
-        }
-        if runtime
-        else {}
-    )
+    execution_error = None
     try:
         result = await agent._run_agent_loop(
             messages=messages,
@@ -865,22 +951,32 @@ async def _run_agent(
             stop_tool_names=["done"],
             on_plain_text=plain_text_router,
             inject_write_experience=False,
-            **runtime_kwargs,
+            experience_context_provider=runtime.recall if runtime else None,
+            experience_context_injected=runtime.record_injected if runtime else None,
+            captured_experience_messages=experience_messages,
+            on_initial_llm_request=(
+                lambda messages, tools: _capture_initial_llm_request(
+                    initial_llm_request, messages, tools
+                )
+            )
+            if initial_llm_request is not None
+            else None,
         )
+    except _vikingbot_imports()["AgentLLMError"] as exc:
+        result = (None, None, exc.tools_used, exc.usage, exc.iteration)
+        execution_error = {
+            "source": "vikingbot_llm",
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+        logger.exception("tau2 model call failed session=%s", session_key)
     finally:
         if runtime:
             await runtime.close()
     if timings is not None:
         timings.record("agent_loop", stage_started_at)
     final_content, final_reasoning_content, tools_used, token_usage, iteration = result
-    if runtime and runtime.events:
-        from openviking.session.train.components.session_analyzer import (
-            experience_execution_from_runtime,
-        )
-
-        execution = experience_execution_from_runtime({"events": runtime.events})
-        if execution:
-            memory_content = "[Experience Execution]\n" + json.dumps(execution, ensure_ascii=False)
+    memory_content = "\n\n".join(message["content"] for message in experience_messages) or None
     if _last_tool_name(tools_used) == "done":
         final_content = None
         final_reasoning_content = None
@@ -891,7 +987,8 @@ async def _run_agent(
         token_usage,
         iteration,
         memory_content,
-        list(runtime.reminder_messages) if runtime else [],
+        experience_messages,
+        execution_error,
     )
 
 

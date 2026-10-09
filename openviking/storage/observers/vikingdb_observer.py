@@ -33,14 +33,13 @@ class VikingDBObserver(BaseObserver):
 
         backend = (
             await self._vikingdb_manager.get_account_backend(ctx.account_id)
-            if ctx is not None else self._vikingdb_manager
+            if ctx is not None
+            else self._vikingdb_manager
         )
         if not await backend.collection_exists():
             return "No collections found."
 
-        statuses = await self._get_collection_statuses(
-            [backend.collection_name], ctx=ctx
-        )
+        statuses = await self._get_collection_statuses([backend.collection_name], ctx=ctx)
         return self._format_status_as_table(statuses)
 
     async def get_status_json_async(self, ctx: Optional[RequestContext] = None) -> dict:
@@ -107,7 +106,8 @@ class VikingDBObserver(BaseObserver):
         statuses = {}
         backend = (
             await self._vikingdb_manager.get_account_backend(ctx.account_id)
-            if ctx is not None else self._vikingdb_manager
+            if ctx is not None
+            else self._vikingdb_manager
         )
 
         for name in collection_names:

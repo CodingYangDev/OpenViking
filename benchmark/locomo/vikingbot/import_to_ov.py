@@ -26,12 +26,12 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVa
 
 import httpx
 from progress_utils import (
-    AsyncProgressTracker,
-    make_three_state_progress,
+    ProgressTracker,
     should_show_progress,
 )
 
 import openviking as ov
+from openviking.utils.progress import make_three_state_progress
 
 TRACE_ID_RE = re.compile(r"\btrace_?id[=:\s]+([^,\s:)\]]+)")
 
@@ -891,7 +891,7 @@ async def run_import(args: argparse.Namespace) -> None:
     failed_sessions: list[dict[str, str]] = []
     success_trace_ids: list[str] = []
     tasks = []
-    progress_tracker: AsyncProgressTracker | None = None
+    progress_tracker: ProgressTracker | None = None
     progress = None
     show_progress = should_show_progress(args.no_progress)
     args._show_progress = show_progress
@@ -983,7 +983,7 @@ async def run_import(args: argparse.Namespace) -> None:
         )
         if show_progress:
             progress, task_id = make_three_state_progress(description="Import")
-            progress_tracker = AsyncProgressTracker(progress, task_id, total=import_task_count)
+            progress_tracker = ProgressTracker(progress, task_id, total=import_task_count)
 
         if session_semaphore is not None:
             # --- Round-robin 扁平调度：跨 sample 均衡分配并发槽位 ---
@@ -1204,7 +1204,7 @@ async def run_import(args: argparse.Namespace) -> None:
         )
         if show_progress:
             progress, task_id = make_three_state_progress(description="Import")
-            progress_tracker = AsyncProgressTracker(progress, task_id, total=import_task_count)
+            progress_tracker = ProgressTracker(progress, task_id, total=import_task_count)
 
         for idx, session in enumerate(sessions, start=1):
             session_key = text_session_keys[idx - 1]

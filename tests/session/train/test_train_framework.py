@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from test_fakes import fake_request_context
@@ -16,6 +17,7 @@ from test_fakes import fake_request_context
 from openviking.message import Message, TextPart
 from openviking.session.memory.dataclass import StoredLink
 from openviking.session.train import (
+    BatchPolicyTrainer,
     Case,
     Experience,
     ExperienceSet,
@@ -34,6 +36,7 @@ from openviking.session.train import (
     RubricEvaluation,
 )
 from openviking.session.train.components.reporter import ConsolePipelineReporter
+from openviking.session.train.utils import call_hook
 
 
 def _case() -> Case:
@@ -313,10 +316,12 @@ async def test_default_policy_optimization_pipeline_runs_one_batch():
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=snapshotter,
         rollout_executor=DummyExecutor(),
-        rollout_analyzer=DummyAnalyzer(),
-        gradient_estimator=DummyEstimator(),
-        policy_optimizer=DummyOptimizer(),
-        policy_updater=DummyUpdater(),
+        policy_trainer=BatchPolicyTrainer(
+            rollout_analyzer=DummyAnalyzer(),
+            gradient_estimator=DummyEstimator(),
+            policy_optimizer=DummyOptimizer(),
+            policy_updater=DummyUpdater(),
+        ),
     )
 
     initial_policy_set = _policy_set()
@@ -336,7 +341,7 @@ async def test_default_policy_optimization_pipeline_runs_one_batch():
     assert DummyUpdater.last_instance is not None
     assert len(DummyUpdater.last_instance.transaction_handles) == 1
     assert DummyUpdater.last_instance.transaction_handles[0] is not None
-    assert initial_policy_set.viking_fs.reloads == 1
+    assert initial_policy_set.viking_fs.reloads == 2
     assert len(result.epochs) == 1
     assert result.epochs[0].epoch == 0
     assert result.epochs[0].policy_snapshot_ids == ["snapshot-1"]
@@ -348,10 +353,12 @@ async def test_policy_optimization_pipeline_allows_zero_epochs_without_training(
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=snapshotter,
         rollout_executor=DummyExecutor(),
-        rollout_analyzer=DummyAnalyzer(),
-        gradient_estimator=DummyEstimator(),
-        policy_optimizer=DummyOptimizer(),
-        policy_updater=DummyUpdater(),
+        policy_trainer=BatchPolicyTrainer(
+            rollout_analyzer=DummyAnalyzer(),
+            gradient_estimator=DummyEstimator(),
+            policy_optimizer=DummyOptimizer(),
+            policy_updater=DummyUpdater(),
+        ),
     )
 
     initial_policy_set = _policy_set()
@@ -376,10 +383,12 @@ async def test_offline_policy_optimization_pipeline_supports_train_and_eval():
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=snapshotter,
         rollout_executor=DummyExecutor(),
-        rollout_analyzer=DummyAnalyzer(),
-        gradient_estimator=DummyEstimator(),
-        policy_optimizer=DummyOptimizer(),
-        policy_updater=DummyUpdater(),
+        policy_trainer=BatchPolicyTrainer(
+            rollout_analyzer=DummyAnalyzer(),
+            gradient_estimator=DummyEstimator(),
+            policy_optimizer=DummyOptimizer(),
+            policy_updater=DummyUpdater(),
+        ),
     )
     policy_set = _policy_set()
 
@@ -428,10 +437,12 @@ async def test_train_trials_expands_training_cases_per_epoch():
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=DummySnapshotter(),
         rollout_executor=executor,
-        rollout_analyzer=DummyAnalyzer(),
-        gradient_estimator=DummyEstimator(),
-        policy_optimizer=DummyOptimizer(),
-        policy_updater=DummyUpdater(),
+        policy_trainer=BatchPolicyTrainer(
+            rollout_analyzer=DummyAnalyzer(),
+            gradient_estimator=DummyEstimator(),
+            policy_optimizer=DummyOptimizer(),
+            policy_updater=DummyUpdater(),
+        ),
     )
 
     result = await pipeline.train(
@@ -449,10 +460,12 @@ async def test_training_updates_execution_metadata_epoch_each_epoch():
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=DummySnapshotter(),
         rollout_executor=DummyExecutor(),
-        rollout_analyzer=DummyAnalyzer(),
-        gradient_estimator=DummyEstimator(),
-        policy_optimizer=DummyOptimizer(),
-        policy_updater=DummyUpdater(),
+        policy_trainer=BatchPolicyTrainer(
+            rollout_analyzer=DummyAnalyzer(),
+            gradient_estimator=DummyEstimator(),
+            policy_optimizer=DummyOptimizer(),
+            policy_updater=DummyUpdater(),
+        ),
     )
     context = PipelineContext(
         max_epochs=2, execution_metadata={"rollout_stage": "eval_train_rollout"}
@@ -474,10 +487,12 @@ async def test_train_runs_test_eval_after_each_epoch_when_configured():
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=DummySnapshotter(),
         rollout_executor=DummyExecutor(),
-        rollout_analyzer=DummyAnalyzer(),
-        gradient_estimator=DummyEstimator(),
-        policy_optimizer=DummyOptimizer(),
-        policy_updater=DummyUpdater(),
+        policy_trainer=BatchPolicyTrainer(
+            rollout_analyzer=DummyAnalyzer(),
+            gradient_estimator=DummyEstimator(),
+            policy_optimizer=DummyOptimizer(),
+            policy_updater=DummyUpdater(),
+        ),
     )
 
     result = await pipeline.train(
@@ -510,10 +525,12 @@ async def test_train_epoch_eval_uses_configured_split_metadata():
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=DummySnapshotter(),
         rollout_executor=DummyExecutor(),
-        rollout_analyzer=DummyAnalyzer(),
-        gradient_estimator=DummyEstimator(),
-        policy_optimizer=DummyOptimizer(),
-        policy_updater=DummyUpdater(),
+        policy_trainer=BatchPolicyTrainer(
+            rollout_analyzer=DummyAnalyzer(),
+            gradient_estimator=DummyEstimator(),
+            policy_optimizer=DummyOptimizer(),
+            policy_updater=DummyUpdater(),
+        ),
     )
 
     result = await pipeline.train(
@@ -541,10 +558,12 @@ async def test_offline_policy_optimization_pipeline_epoch_hook_can_stop_training
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=DummySnapshotter(),
         rollout_executor=DummyExecutor(),
-        rollout_analyzer=DummyAnalyzer(),
-        gradient_estimator=DummyEstimator(),
-        policy_optimizer=DummyOptimizer(),
-        policy_updater=DummyUpdater(),
+        policy_trainer=BatchPolicyTrainer(
+            rollout_analyzer=DummyAnalyzer(),
+            gradient_estimator=DummyEstimator(),
+            policy_optimizer=DummyOptimizer(),
+            policy_updater=DummyUpdater(),
+        ),
     )
 
     class StopTrainingHook(NoopPipelineLifecycleHook):
@@ -589,10 +608,12 @@ async def test_pipeline_lifecycle_hooks_receive_report_events():
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=DummySnapshotter(),
         rollout_executor=DummyExecutor(),
-        rollout_analyzer=DummyAnalyzer(),
-        gradient_estimator=DummyEstimator(),
-        policy_optimizer=DummyOptimizer(),
-        policy_updater=DummyUpdater(),
+        policy_trainer=BatchPolicyTrainer(
+            rollout_analyzer=DummyAnalyzer(),
+            gradient_estimator=DummyEstimator(),
+            policy_optimizer=DummyOptimizer(),
+            policy_updater=DummyUpdater(),
+        ),
     )
 
     policy_set = _policy_set()
@@ -629,10 +650,12 @@ async def test_policy_optimization_pipeline_trains_from_external_rollouts_withou
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=snapshotter,
         rollout_executor=executor,
-        rollout_analyzer=analyzer,
-        gradient_estimator=DummyEstimator(),
-        policy_optimizer=DummyOptimizer(),
-        policy_updater=DummyUpdater(),
+        policy_trainer=BatchPolicyTrainer(
+            rollout_analyzer=analyzer,
+            gradient_estimator=DummyEstimator(),
+            policy_optimizer=DummyOptimizer(),
+            policy_updater=DummyUpdater(),
+        ),
     )
     rollout = Rollout(
         case=_case(),
@@ -671,10 +694,12 @@ async def test_policy_optimization_pipeline_realtime_rollouts_require_case():
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=DummySnapshotter(),
         rollout_executor=DummyExecutor(),
-        rollout_analyzer=DummyAnalyzer(),
-        gradient_estimator=DummyEstimator(),
-        policy_optimizer=DummyOptimizer(),
-        policy_updater=DummyUpdater(),
+        policy_trainer=BatchPolicyTrainer(
+            rollout_analyzer=DummyAnalyzer(),
+            gradient_estimator=DummyEstimator(),
+            policy_optimizer=DummyOptimizer(),
+            policy_updater=DummyUpdater(),
+        ),
     )
     rollout = Rollout(
         case=None,
@@ -1198,6 +1223,7 @@ class FakeSessionCommitClient:
         self.messages = {}
         self.committed_sessions = []
         self.task_poll_counts = {}
+        self.learn_requests = []
 
     async def create_session(self, session_id=None, options=None):
         self.created_sessions.append((session_id, options))
@@ -1217,6 +1243,23 @@ class FakeSessionCommitClient:
         self.task_poll_counts[task_id] = self.task_poll_counts.get(task_id, 0) + 1
         return {"task_id": task_id, "status": "completed", "result": {}}
 
+    async def learn_experiences(self, **kwargs):
+        self.learn_requests.append(kwargs)
+        trajectory_count = len(kwargs.get("trajectory_uris") or [])
+        return {
+            "case_count": int(bool(trajectory_count)),
+            "trajectory_count": trajectory_count,
+            "applied_count": int(bool(trajectory_count)),
+            "no_op_count": 0,
+            "failed_count": 0,
+            "written_experience_uris": (
+                ["viking://user/default/memories/experiences/duplicate_booking.md"]
+                if trajectory_count
+                else []
+            ),
+            "results": [],
+        }
+
 
 @pytest.mark.asyncio
 async def test_session_commit_policy_trainer_records_commit_trace_id():
@@ -1235,7 +1278,24 @@ async def test_session_commit_policy_trainer_records_commit_trace_id():
         messages=[Message(id="m1", role="user", parts=[TextPart(text="hello")])],
         policy_snapshot_id="snapshot-1",
         evaluation=RubricEvaluation(passed=True, score=1.0, criterion_results=[], feedback=[]),
-        metadata={"data_split": "unit", "task_no": 7, "execution_metadata": {"epoch": 3}},
+        metadata={
+            "data_split": "unit",
+            "task_no": 7,
+            "execution_metadata": {"epoch": 3},
+            "dag_runtime": {
+                "events": [
+                    {
+                        "experience_uri": "viking://user/default/memories/experiences/case.md",
+                        "state": "completed",
+                        "revision": 2,
+                        "slot_values": {"remind": True},
+                        "node_slots": {1: "remind"},
+                        "executed_nodes": [1],
+                        "current_nodes": [],
+                    }
+                ]
+            },
+        },
     )
 
     result = await trainer.train_rollouts([rollout], _policy_set())
@@ -1251,12 +1311,53 @@ async def test_session_commit_policy_trainer_records_commit_trace_id():
             commit_result["session_id"],
             {
                 "memory_policy": {
-                    "memory_types": ["cases", "experiences"],
+                    "memory_types": ["cases", "trajectories"],
                     "working_memory": {"enabled": False},
                 }
             },
         )
     ]
+    submitted_messages = client.messages[commit_result["session_id"]]
+    assert "experience_execution" not in submitted_messages[0]["parts"][0]["text"]
+    assert "experience_execution" in submitted_messages[-1]["parts"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_session_commit_trainer_only_returns_trajectories_after_all_commits():
+    from openviking.session.train import SessionCommitPolicyTrainer
+
+    class Client(FakeSessionCommitClient):
+        async def get_task(self, task_id):
+            self.task_poll_counts[task_id] = self.task_poll_counts.get(task_id, 0) + 1
+            session_id = task_id.removeprefix("task-")
+            return {
+                "task_id": task_id,
+                "status": "completed",
+                "result": {
+                    "trajectory_uris": [
+                        f"viking://user/default/memories/trajectories/case/{session_id}.md"
+                    ]
+                },
+            }
+
+    client = Client()
+    trainer = SessionCommitPolicyTrainer(client=client, run_id="run1", poll_interval_seconds=0.01)
+    rollouts = [
+        Rollout(
+            case=_case(),
+            messages=[Message(id=f"m{i}", role="user", parts=[TextPart(text="hello")])],
+            policy_snapshot_id="snapshot-1",
+            metadata={"task_no": i},
+        )
+        for i in range(2)
+    ]
+
+    result = await trainer.train_rollouts(rollouts, _policy_set())
+
+    assert client.learn_requests == []
+    assert len(result.metadata["trajectory_uris"]) == 2
+    assert result.apply_result.written_uris == []
+    assert "experience_learning" not in result.metadata
 
 
 @pytest.mark.asyncio
@@ -1321,7 +1422,10 @@ async def test_session_commit_policy_trainer_streams_commit_trace_events(tmp_pat
     result = await trainer.train_rollouts([rollout], _policy_set())
 
     lines = [json.loads(line) for line in events_path.read_text().splitlines()]
-    assert [line["event"] for line in lines] == ["train_commit_submitted", "train_commit_done"]
+    assert [line["event"] for line in lines] == [
+        "train_commit_submitted",
+        "train_commit_done",
+    ]
     commit_result = result.apply_result.metadata["commit_results"][0]
     assert lines[0]["trace_id"] == commit_result["trace_id"]
     assert lines[1]["trace_id"] == commit_result["trace_id"]
@@ -1329,6 +1433,113 @@ async def test_session_commit_policy_trainer_streams_commit_trace_events(tmp_pat
     assert lines[1]["session_id"] == commit_result["session_id"]
     assert lines[1]["task_no"] == 7
     assert lines[1]["dataset"] == "unit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "stage"),
+    [
+        ("create_session", "create_session"),
+        ("batch_add_messages", "batch_add_messages"),
+        ("commit_session", "commit_session"),
+        ("get_task", "wait_task"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("exception_type", "message", "expected_error"),
+    [
+        (TimeoutError, "", "TimeoutError: "),
+        (RuntimeError, "unavailable", "RuntimeError: unavailable"),
+    ],
+)
+async def test_session_commit_policy_trainer_retains_exception_type(
+    tmp_path, capsys, method, stage, exception_type, message, expected_error
+):
+    from openviking.session.train import JsonlEventRecorder, SessionCommitPolicyTrainer
+
+    client = FakeSessionCommitClient()
+    failed_call = AsyncMock(side_effect=exception_type(message))
+    setattr(client, method, failed_call)
+    events_path = tmp_path / "events.jsonl"
+    trainer = SessionCommitPolicyTrainer(
+        client=client,
+        run_id="run1",
+        event_recorder=JsonlEventRecorder(events_path),
+    )
+    rollout = Rollout(
+        case=_case(),
+        messages=[Message(id="m1", role="user", parts=[TextPart(text="hello")])],
+        policy_snapshot_id="snapshot-1",
+        metadata={"task_no": 7, "execution_metadata": {"epoch": 3}},
+    )
+
+    result = await trainer.train_rollouts([rollout], _policy_set())
+
+    assert result.apply_result.errors == [expected_error]
+    commit_result = result.apply_result.metadata["commit_results"][0]
+    assert commit_result["error"] == expected_error
+    assert commit_result["task_status"] == "failed"
+    assert commit_result["stage"] == stage
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    failure = next(event for event in events if event["event"] == "train_commit_failed")
+    assert failure["error"] == expected_error
+    assert failure["stage"] == stage
+    assert failure["session_id"] == commit_result["session_id"]
+    assert failure["case_name"] == rollout.case.name
+    assert failure["task_no"] == 7
+    assert failure["epoch"] == 3
+    assert f"error={expected_error}" in capsys.readouterr().out
+    failed_call.assert_awaited_once()
+    assert client.learn_requests == []
+    assert not any(event["event"].startswith("experience_learn") for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exception_type", "message", "expected_error"),
+    [
+        (TimeoutError, "", "TimeoutError: "),
+        (RuntimeError, "unavailable", "RuntimeError: unavailable"),
+    ],
+)
+async def test_session_commit_policy_trainer_retains_learning_exception_type(
+    tmp_path, exception_type, message, expected_error
+):
+    from openviking.session.train import (
+        JsonlEventRecorder,
+        RemoteExperienceLearner,
+        SessionCommitPolicyTrainer,
+    )
+
+    client = FakeSessionCommitClient()
+    client.learn_experiences = AsyncMock(side_effect=exception_type(message))
+    trajectory_uri = "viking://user/default/memories/trajectories/trajectory-1.md"
+    client.get_task = AsyncMock(
+        return_value={"status": "completed", "result": {"trajectory_uris": [trajectory_uri]}}
+    )
+    events_path = tmp_path / "events.jsonl"
+    trainer = SessionCommitPolicyTrainer(
+        client=client,
+        run_id="run1",
+        event_recorder=JsonlEventRecorder(events_path),
+    )
+    rollout = Rollout(case=_case(), messages=[], policy_snapshot_id="snapshot-1")
+
+    collected = await trainer.train_rollouts([rollout], _policy_set())
+    learner = RemoteExperienceLearner(client=client, event_recorder=trainer.event_recorder)
+    result = await learner.learn([collected], _policy_set())
+
+    assert result.apply_result.errors == []
+    learning = result.apply_result.metadata["experience_learning"]
+    assert learning["error"] == expected_error
+    assert learning["failed_count"] == 0
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    failure = next(event for event in events if event["event"] == "experience_learn_done")
+    assert failure["error"] == expected_error
+    assert failure["failed_count"] == 0
+    client.learn_experiences.assert_awaited_once_with(
+        trajectory_uris=[trajectory_uri], max_cases=1000, wait=False
+    )
 
 
 @pytest.mark.asyncio
@@ -1865,3 +2076,31 @@ def test_tau2_service_filter_parses_task_indices():
         _task_indices_from_filters({"task_indices": 2})
     with pytest.raises(ValueError, match="task index must be >= 0"):
         _task_indices_from_filters({"task_indices": [-1]})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_call_hook_preserves_arguments_results_and_errors(is_async, fails):
+    seen = []
+    result = object()
+    error = ValueError("hook failed")
+
+    def sync_hook(value, *, flag):
+        seen.append((value, flag))
+        if fails:
+            raise error
+        return result
+
+    async def async_hook(*args, **kwargs):
+        await asyncio.sleep(0)
+        return sync_hook(*args, **kwargs)
+
+    hook = async_hook if is_async else sync_hook
+    if fails:
+        with pytest.raises(ValueError) as caught:
+            await call_hook(hook, 42, flag=True)
+        assert caught.value is error
+    else:
+        assert await call_hook(hook, 42, flag=True) is result
+    assert seen == [(42, True)]

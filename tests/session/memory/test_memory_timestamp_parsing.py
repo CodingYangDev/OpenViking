@@ -90,6 +90,9 @@ def test_extraction_context_chunks_long_text_and_preserves_decimal_numbers(stub_
                 role="user",
                 parts=[TextPart(text=text)],
                 created_at="2026-06-01T08:56:37.382Z",
+                turn_id="turn-1",
+                message_kind="user_query",
+                source_message_ids=["source-1"],
             )
         ]
     )
@@ -100,6 +103,9 @@ def test_extraction_context_chunks_long_text_and_preserves_decimal_numbers(stub_
     assert len(extraction_messages) > 1
     assert merged == text
     assert all(message.id.startswith("msg-long#chunk_") for message in extraction_messages)
+    assert all(message.turn_id == "turn-1" for message in extraction_messages)
+    assert all(message.message_kind == "user_query" for message in extraction_messages)
+    assert all(message.source_message_ids == ["source-1"] for message in extraction_messages)
     assert "21.9K" in merged
     assert "110.2k" in merged
     assert "501.0k" in merged

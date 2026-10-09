@@ -36,10 +36,79 @@ What the launcher does:
 6. runs `benchmark/tau2/train/run_batch_train_eval.sh` with the matching
    `--config`, `--server-url`, `--benchmark-service-url`, and result directory.
 
-Experience recall is automatic. Before each model decision, the runtime sends the current
-conversation and tool evidence to OpenViking `search_exp`; OpenViking selects matching
-Experience DAGs and returns only their current instructions for prompt injection. Recall is
-not exposed through agent tools.
+Every fresh VikingBot rollout (baseline, train, per-epoch evaluation, and final evaluation)
+uses exactly the tools from `Tau2BenchToolProvider.list_openai_tools()`. The setup removes
+all inherited VikingBot tools before registering that allowlist, so removed tools are neither
+shown to the model nor executable through its registry. Tau2 business tools, `calculate`,
+`communicate_with_user`, and `done` remain available when supplied by the environment; generic
+web/file/shell/messaging/subagent/image tools do not. Other VikingBot uses are unchanged.
+The existing `keep_default_tools` option controls automatic advice in this executor, not whether
+to retain generic tools. Both values use the same Tau2-only tool boundary.
+
+When comparing this boundary with older runs, start a fresh Tau2 rollout service and use
+`--no-reuse-train-rollout-cache --force-baseline-recompute`. Existing cached rollouts and baseline
+scores do not retroactively adopt the new tool list. No cache is deleted by this change.
+
+With advice enabled (`keep_default_tools=true`), train and test automatically recall advice
+once for the initial user request and each subsequent real user reply, before the next model
+decision. No Skills are loaded and no `ask_for_advice` tool is exposed to the agent. Internal
+clock/reflection prompts, other tool results, injected advice, and simulator termination/error
+markers do not trigger recall. Before a proposed tool batch containing a write operation,
+`transfer_to_human_agents`, or `done`, it checks advice again using the latest state and proposed
+calls. If new advice is inserted, the entire batch is left unexecuted and the model replans.
+Without new advice, execution proceeds normally. Read-only batches do not make this extra request.
+
+The runtime uses the latest user message, preceding customer-facing assistant message, and
+original request as query context (bounded to 16,384 characters); it makes no query-rewriting
+LLM call. Both splits use semantic lookup, not fixed Case-name targeting. The real conversation
+and tool messages are sent as one `state` list for DAG decisions, without a duplicate
+`context`/`evidence` pair. Message roles, order, tool names, arguments and results are retained;
+policy and historical advice are retained; internal reflection prompts and private reasoning are excluded.
+Historical advice is not authoritative policy or evidence that a condition/action has completed.
+The state has a serialized-character budget rather than a 256-evidence-record cap. Only nonempty advice is injected;
+empty results or unavailable retrieval do not block the rollout. After actual insertion, the
+client persists delivery facts in its existing SessionManager JSONL metadata before processing
+the next queued user turn. There is no server delivery ACK or `delivery_id`.
+
+The server reevaluates only the current request's retrieved templates. It neither stores nor
+accepts advice-deduplication state, and it does not retain historical active candidates. Client
+advice identity uses `(experience_uri, slot_name, instruction)` rather than a mutable numeric
+node ID; reordering a DAG does not repeat advice, while changed advice remains eligible.
+Each rollout uses an independent client conversation key, preventing delivery facts from one
+experiment or trial from suppressing another. `dag_runtime.client_session_key` locates that
+local session. Runtime events retain server condition evaluations separately from client
+`delivered_advice` records. Inserting an Ask or Call suggestion never marks the underlying
+information request or tool step as completed. These delivery facts and evaluated slots flow
+through Trajectory metadata into Experience learning without a client-side shadow DAG state.
+
+
+The former ACK endpoint is removed. Restart OpenViking and Tau2 together before new rollouts;
+old server `.experience_instances` files are no longer read or written. Old server-side delivery
+history is not migrated to client sessions.
+
+Experience recall defaults to `score_threshold=0.15` and `limit=3`. This only relaxes candidate
+retrieval: DAG applicability checks and delivered-advice deduplication still apply. Explicit
+threshold overrides and other search interfaces are unchanged.
+Context selection uses graded Score questions, normalized to [0, 1]. Its cutoff is
+`agent_evolution.dag_decider.relevance_threshold` (default `0.7`), independent of both the vector
+cutoff and DAG node truth thresholds. Fractional priorities are retained; true ties preserve
+vector order. Changing the cutoff cannot rescue an Experience ranked below the final Top3.
+
+`rollout.json` records each automatic attempt in `metadata.advice_recalls` (user-message index,
+trigger (`user_message` or `before_action`), query, status, matched experiences, advice count,
+and duration). Actual injected reminders are
+preserved in the trajectory and `memory_context.md`. Reports count automatic recalls separately
+from model tool calls. With advice disabled, neither automatic recall nor Skill loading runs.
+
+Each newly executed VikingBot rollout records `initial_llm_request.json`: a credential-redacted
+snapshot of the first `messages` and `tools` passed from the Agent to its model provider, after
+context assembly and tool filtering. It includes any initial automatic advice and the visible tool descriptions;
+it is not an HTTP request dump and contains no provider configuration or authentication headers.
+Later model calls do not overwrite it. `prompt_for_llm.md` remains the analysis guide. Old cached
+rollouts without a captured request do not get a reconstructed snapshot.
+
+When comparing this automatic path with older runs, use `--no-reuse-train-rollout-cache` and
+`--force-baseline-recompute` so rollouts from an older advice/Skill setup are not reused.
 
 Default train/eval arguments, when no custom train/eval args are passed, are:
 
@@ -82,9 +151,11 @@ bash benchmark/tau2/train/restart_vikingbot_train_eval.sh \
   --reuse-train-rollout-cache
 ```
 
-`--reuse-train-rollout-cache` is off by default and only affects training
-rollouts for epoch `0`, before memory training has changed the policy. Later
-training epochs and eval rollouts are always executed normally.
+Train rollout cache reuse is enabled by default and only affects training
+rollouts for epoch `0`, before memory training has changed the policy. Use
+`--no-reuse-train-rollout-cache` to disable cache reads and writes and recompute
+the epoch-0 train rollouts. The explicit `--reuse-train-rollout-cache` flag is
+still supported. Later training epochs and eval rollouts are always executed normally.
 
 ## 2. Evaluation modes from the restart launcher
 
@@ -207,7 +278,7 @@ override this mapping for one run.
 | `--skip-baseline-eval` | off | Skip pre-training baseline eval/cache entirely |
 | `--eval-each-epoch` | on in Tau2 wrapper | Run eval after every training epoch using `--eval-split` |
 | `--skip-final-eval` | off; restart default on | Skip the extra final eval pass |
-| `--reuse-train-rollout-cache` | off | Reuse cached epoch-0/no-memory train rollouts when present; write cache on miss |
+| `--reuse-train-rollout-cache` / `--no-reuse-train-rollout-cache` | on | Reuse cached epoch-0/no-memory train rollouts when present; write cache on miss; disable to recompute |
 | `--clean-result` / `--no-clean-result` | clean | Whether to prune previous result artifacts |
 | `--keep-recent-results` | `5` | Number of recent default `run_` directories to keep when cleaning; cache and non-`run_` directories are preserved |
 | `--output` | auto | JSON report output path |
@@ -292,3 +363,38 @@ Streaming JSONL events are written to
 `result/tau2/<result-dir-name>/run_<domain>_<timestamp>/events.jsonl`; train
 commit events include `trace_id` for live `tail -f` debugging. Use
 `--events-output` to override the path.
+
+### Stateless advice search
+
+Automatic advice uses `POST /api/v1/search/search` with `mode: "advice"`, `query`, and the native
+conversation `state`. It does not create or load an OpenViking session. The client-local
+`dag_runtime.runtime_id` is used only for rollout isolation/correlation; delivered-advice
+deduplication remains in the local bot session. `tau2_train_*` commits for trajectory learning
+are unaffected. Reload OpenViking and the Tau2 service together; old session-scoped advice
+endpoints are removed. Previously cached rollouts and existing empty sessions are left intact.
+
+
+## Native user simulation and rollout deadlines
+
+The `vikingbot` rollout executor uses Tau2's native `UserSimulator` and its original
+LiteLLM generation path for the user role. Only the customer-service agent uses
+VikingBot. The experimental VikingBot-backed user provider and its 60/180-second
+request/reply budgets have been removed; native user model selection and retry
+behavior are restored.
+
+The independent generic rollout deadline/cancellation changes remain:
+`POST /v1/rollouts/execute` accepts `execution_timeout_seconds` (default 3600),
+including queue time. Client timeout/cancellation also sends
+`POST /v1/rollouts/executions/{execution_id}/cancel`. The service targets the actual
+inline or worker event-loop coroutine, and records `failed` with `TimeoutError` or
+`CancelledError` after coroutine cleanup. Cancelling terminal executions is idempotent.
+
+Important: cancelling a coroutine cannot forcibly stop a synchronous native-user
+SDK call already running in another thread. Restoring the native simulator also
+restores that limitation and its original request timeout/retry behavior; do not
+interpret a failed execution record as proof that native model I/O was interrupted.
+
+Reload the Tau2 rollout service for the rollback to take effect. Existing running
+processes and cached rollouts are not modified. For a comparison run, pass
+`--no-reuse-train-rollout-cache --force-baseline-recompute` to avoid reusing results
+produced by the experimental user provider.

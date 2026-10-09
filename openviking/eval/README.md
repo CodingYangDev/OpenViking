@@ -40,12 +40,7 @@ openviking/eval/
 
 ```python
 # 评估样本
-EvalSample(
-    query="问题",
-    context=["检索上下文"],
-    response="生成答案",
-    ground_truth="标准答案"
-)
+EvalSample(query="问题", context=["检索上下文"], response="生成答案", ground_truth="标准答案")
 
 # 评估数据集
 EvalDataset(name="dataset", samples=[...])
@@ -80,6 +75,7 @@ pip install ragas datasets
 import asyncio
 from openviking.eval import EvalSample, EvalDataset, RagasEvaluator
 
+
 async def main():
     # 准备评估数据
     samples = [
@@ -87,23 +83,24 @@ async def main():
             query="OpenViking 是什么？",
             context=["OpenViking 是上下文数据库..."],
             response="OpenViking 是 AI Agent 数据库",
-            ground_truth="OpenViking 是开源上下文数据库"
+            ground_truth="OpenViking 是开源上下文数据库",
         ),
     ]
     dataset = EvalDataset(name="eval", samples=samples)
-    
+
     # 运行评估（可配置性能参数）
     evaluator = RagasEvaluator(
-        max_workers=8,      # 并发数
-        batch_size=5,       # 批处理大小
-        timeout=120,        # 超时时间（秒）
-        max_retries=2,      # 最大重试次数
+        max_workers=8,  # 并发数
+        batch_size=5,  # 批处理大小
+        timeout=120,  # 超时时间（秒）
+        max_retries=2,  # 最大重试次数
     )
     summary = await evaluator.evaluate_dataset(dataset)
-    
+
     # 输出结果
     for metric, score in summary.mean_scores.items():
         print(f"{metric}: {score:.2f}")
+
 
 asyncio.run(main())
 ```

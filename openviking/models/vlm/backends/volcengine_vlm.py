@@ -3,7 +3,6 @@
 """VolcEngine VLM backend implementation."""
 
 import base64
-import json
 import time
 import uuid
 from pathlib import Path
@@ -13,13 +12,13 @@ from openviking.models.network import (
     create_optional_async_httpx_client,
     create_optional_sync_httpx_client,
 )
-from openviking.telemetry import tracer
+from openviking.telemetry import get_current_telemetry_stage, tracer
 from openviking.utils.message_format import format_messages, sanitize_openai_messages
 from openviking.utils.model_retry import retry_async
 from openviking.utils.multimodal import redact_image_data_urls
 from openviking_cli.utils import get_logger
 
-from ..base import ToolCall, VLMResponse
+from ..base import VLMResponse
 from .openai_vlm import OpenAIVLM
 
 logger = get_logger(__name__)
@@ -67,20 +66,6 @@ class VolcEngineVLM(OpenAIVLM):
         if not self.model:
             self.model = "doubao-seed-2-0-lite-260428"
 
-    def _parse_tool_calls(self, message) -> List[ToolCall]:
-        """Parse tool calls from VolcEngine response message."""
-        tool_calls = []
-        if hasattr(message, "tool_calls") and message.tool_calls:
-            for tc in message.tool_calls:
-                args = tc.function.arguments
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {"raw": args}
-                tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
-        return tool_calls
-
     def _build_vlm_response(self, response, has_tools: bool) -> Union[str, VLMResponse]:
         """Build response from Chat Completions response. Returns str or VLMResponse based on has_tools."""
         if isinstance(response, str):
@@ -88,23 +73,21 @@ class VolcEngineVLM(OpenAIVLM):
 
         choice = response.choices[0]
         message = choice.message
-        if hasattr(message, "tool_calls") and message.tool_calls:
+        if (
+            hasattr(message, "tool_calls")
+            and message.tool_calls
+            and get_current_telemetry_stage() != "memory_extract"
+        ):
             tracer.info(f"message.tool_calls={message.tool_calls}")
         if has_tools:
-            usage = {}
-            if hasattr(response, "usage") and response.usage:
-                usage = {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                    "prompt_tokens_details": getattr(response.usage, "prompt_tokens_details", None),
-                }
+            usage = self._response_usage(response)
 
             return VLMResponse(
                 content=message.content,
                 tool_calls=self._parse_tool_calls(message),
                 finish_reason=choice.finish_reason or "stop",
                 usage=usage,
+                client_request_id=getattr(response, "_request_id", None),
             )
         return message.content or ""
 
@@ -117,12 +100,12 @@ class VolcEngineVLM(OpenAIVLM):
                 raise ImportError(
                     "Please install volcenginesdkarkruntime: pip install volcenginesdkarkruntime"
                 )
-            kwargs = dict(
-                api_key=self.api_key,
-                base_url=self.api_base,
-                timeout=self.timeout,
-                max_retries=0,
-            )
+            kwargs = {
+                "api_key": self.api_key,
+                "base_url": self.api_base,
+                "timeout": self.timeout,
+                "max_retries": 0,
+            }
             http_client = create_optional_sync_httpx_client(
                 self.api_base,
                 timeout=self.timeout,
@@ -140,12 +123,12 @@ class VolcEngineVLM(OpenAIVLM):
             raise ImportError(
                 "Please install volcenginesdkarkruntime: pip install volcenginesdkarkruntime"
             )
-        kwargs = dict(
-            api_key=self.api_key,
-            base_url=self.api_base,
-            timeout=self.timeout,
-            max_retries=0,
-        )
+        kwargs = {
+            "api_key": self.api_key,
+            "base_url": self.api_base,
+            "timeout": self.timeout,
+            "max_retries": 0,
+        }
         http_client = create_optional_async_httpx_client(
             self.api_base,
             timeout=self.timeout,
@@ -259,24 +242,31 @@ class VolcEngineVLM(OpenAIVLM):
         tracer.info(
             "llm_input_messages=" + format_messages(redact_image_data_urls(kwargs_messages))
         )
-        if tools:
-            tracer.info(
-                f"tools: {json.dumps([t['function']['name'] for t in tools], ensure_ascii=False)}"
-            )
 
         client = self.get_async_client()
 
         async def _call() -> Union[str, VLMResponse]:
             t0 = time.perf_counter()
             try:
-                response = await client.chat.completions.create(**kwargs)
+                raw_response = await client.chat.completions.with_raw_response.create(**kwargs)
+                response = await raw_response.parse()
             except Exception as error:
                 self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
                 raise
             elapsed = time.perf_counter() - t0
             self._update_token_usage_from_response(response, duration_seconds=elapsed)
-            result = self._build_vlm_response(response, has_tools=bool(tools))
-            if tools:
+            result = self._build_vlm_response(response, has_tools=tools is not None)
+            if isinstance(result, VLMResponse):
+                # An explicit [] requests structured usage without exposing model tools.
+                # Preserve the previous text cleanup for that no-tool path.
+                if not tools:
+                    result.content = self._clean_response(result.content or "")
+                result.client_request_id = next(
+                    value
+                    for key, value in kwargs["extra_headers"].items()
+                    if key.lower() == VOLCENGINE_CLIENT_REQUEST_ID_HEADER.lower()
+                )
+                result.server_request_id = raw_response.headers.get("x-request-id")
                 return result
             content = self._clean_response(str(result))
             if content:

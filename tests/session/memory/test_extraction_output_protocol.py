@@ -2,12 +2,16 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Tests for JSON and restricted-Python memory extraction output protocols."""
 
+import ast
+import copy
 import json
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from openviking.models.vlm.base import ToolCall, VLMResponse
 from openviking.session.memory.dataclass import (
     MemoryField,
     MemoryFile,
@@ -19,14 +23,59 @@ from openviking.session.memory.extraction_output_protocol import (
     ExtractionOutputContext,
     create_extraction_output_protocol,
 )
+from openviking.session.memory.extraction_output_protocol.python_protocol import _identifier_alias
 from openviking.session.memory.memory_isolation_handler import RoleScope
 from openviking.session.memory.memory_type_registry import (
     MemoryTypeRegistry,
     resolve_memory_templates_dir,
 )
 from openviking.session.memory.merge_op import FieldType, MergeOp
+from openviking.session.memory.merge_policy import MEMORY_MERGE_POLICY
 from openviking.session.memory.page_id_map import PageIdMap
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
+from openviking.session.memory.tools import add_tool_call_pair_to_messages
+
+
+def _assert_native_pair(messages, *, call_id, tool_name, params, result, python_result=False):
+    assert messages[0]["role"] == "assistant"
+    call = messages[0]["tool_calls"][0]
+    assert call == {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "arguments": json.dumps(params, ensure_ascii=False, default=str),
+        },
+    }
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == call_id
+    if python_result:
+        assert _literal_tool_result(messages[1]["content"], tool_name) == result
+    else:
+        assert json.loads(messages[1]["content"]) == result
+
+
+def _literal_tool_result(code, tool_name="eval"):
+    def decode(node):
+        if isinstance(node, ast.Call):
+            assert isinstance(node.func, ast.Attribute) and node.func.attr == "error"
+            assert isinstance(node.func.value, ast.Name) and node.func.value.id == "sdk"
+            assert len(node.args) == 1 and not node.keywords
+            return {"error": ast.literal_eval(node.args[0])}
+        if isinstance(node, ast.List):
+            return [decode(item) for item in node.elts]
+        if isinstance(node, ast.Dict):
+            return {
+                ast.literal_eval(key): decode(value)
+                for key, value in zip(node.keys, node.values, strict=True)
+            }
+        return ast.literal_eval(node)
+
+    statements = ast.parse(code).body
+    if len(statements) == 1 and isinstance(statements[0], ast.Expr):
+        return decode(statements[0].value)
+    values = {node.targets[0].id: decode(node.value) for node in statements}
+    return values if tool_name == "eval" else values[tool_name]
 
 
 def _preference_schema(*, operation_mode: str = "upsert") -> MemoryTypeSchema:
@@ -140,7 +189,26 @@ def _existing_preference(uri: str, topic: str, content: str, score: int = 0) -> 
 
 def _bind(protocol, context: ExtractionOutputContext) -> str:
     protocol.render_contract(context)
-    return protocol.render_new_bindings(context, source="test read")
+    counts, result, requests = {}, {}, []
+    for uri, memory in context.read_file_contents.items():
+        kind = memory.memory_type
+        counts[kind] = counts.get(kind, 0) + 1
+        name = f"{_identifier_alias(kind)}_{counts[kind]}"
+        requests.append(f"{name} = sdk.read(uri={uri!r})")
+        result[name] = {
+            **memory.extra_fields,
+            "memory_type": kind,
+            "content": memory.plain_content(),
+            "page_id": context.page_id_map.get_page_id(uri),
+        }
+    return protocol.render_tool_result_messages(
+        context,
+        call_id="bind",
+        tool_name="eval",
+        params={"code": "\n".join(requests)},
+        result=result,
+        source="test read",
+    )[1]["content"]
 
 
 def test_json_protocol_preserves_stable_parser_and_empty_contract():
@@ -157,6 +225,40 @@ def test_json_protocol_preserves_stable_parser_and_empty_contract():
     assert '"delete_ids": []' in protocol.render_final_instruction(context)
 
 
+@pytest.mark.parametrize(
+    ("raw_content", "expected_content"),
+    [
+        ("1\t- Use Vim\n2\t- Avoid tabs\n", "- Use Vim\n- Avoid tabs\n"),
+        ("1\t- Use Vim\n- Avoid tabs", "- Use Vim\n- Avoid tabs"),
+        ("2026\tbudget", "2026\tbudget"),
+    ],
+)
+def test_json_protocol_strips_read_line_numbers_from_complete_content(
+    raw_content: str, expected_content: str
+):
+    context = _context([_preference_schema()])
+    protocol = create_extraction_output_protocol("json")
+
+    operations, error = protocol.parse(
+        json.dumps(
+            {
+                "preferences": [
+                    {
+                        "page_id": 1,
+                        "topic": "editor",
+                        "content": raw_content,
+                    }
+                ],
+                "delete_ids": [],
+            }
+        ),
+        context,
+    )
+
+    assert error is None
+    assert operations.preferences[0].content == expected_content
+
+
 def test_python_contract_and_bindings_expose_only_selected_schema_fields():
     uri = "viking://user/alice/memories/preferences/editor.md"
     context = _context(
@@ -166,16 +268,16 @@ def test_python_contract_and_bindings_expose_only_selected_schema_fields():
     protocol = create_extraction_output_protocol("python")
 
     contract = protocol.render_contract(context)
-    bindings = protocol.render_new_bindings(context, source="search then read")
+    bindings = _bind(protocol, context)
 
     assert "sdk.create_preferences" in contract
     assert "sdk.create_projects" not in contract
     assert "preferences_1 = sdk.existing" in bindings
     assert "topic='editor'" in bindings
     assert "content='Use Vim'" in bindings
-    assert "version" not in bindings
+    assert "version" not in bindings.split("\n# Metadata", 1)[0]
     assert uri not in bindings
-    assert protocol.render_new_bindings(context, source="duplicate read") == ""
+    assert _bind(protocol, context) == bindings
 
 
 def test_python_contract_includes_link_rules_when_enabled():
@@ -229,7 +331,9 @@ def test_python_field_description_keeps_dsl_patch_instructions():
 
     contract = create_extraction_output_protocol("python").render_contract(context)
 
-    assert "content [editable string: obj.field.edit/drop/update]: Write content in EN." in contract
+    assert (
+        "content [editable string: obj.field.edit/drop/overwrite]: Write content in EN." in contract
+    )
     assert "obj.content.edit(search=..., replace=...)" in contract
     assert "PATCH operation for" not in contract
     assert "Use a DELETE block" not in contract
@@ -242,6 +346,7 @@ async def test_default_python_extract_loop_passes_language_to_field_descriptions
     schema.description = "Preferences in {{ language }}."
     schema.fields[1].description = "Write content in {{ language }}."
     provider = MagicMock()
+    provider.format_prefetch_messages.side_effect = lambda messages: messages
     provider.get_memory_schemas.return_value = [schema]
     provider.get_output_language.return_value = language
     provider.get_tools.return_value = []
@@ -270,6 +375,333 @@ async def test_default_python_extract_loop_passes_language_to_field_descriptions
     assert f"Preferences in {language}." in prompt
     assert f"Write content in {language}." in prompt
     assert "{{ language }}" not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_format", ["python", "json"])
+@pytest.mark.parametrize("provider_kind", ["session", "patch_merge"])
+async def test_shared_write_decision_reaches_model_once_without_extra_calls(
+    output_format, provider_kind
+):
+    from openviking.session.memory.patch_merge_context_provider import PatchMergeContextProvider
+    from openviking.session.memory.session_extract_context_provider import (
+        SessionExtractContextProvider,
+    )
+
+    real_provider = (
+        SessionExtractContextProvider(messages=[])
+        if provider_kind == "session"
+        else PatchMergeContextProvider(memory_type="preferences", patches=[])
+    )
+    real_provider.get_tools = lambda: []
+    provider = MagicMock()
+    provider.instruction.side_effect = real_provider.instruction
+    provider.format_prefetch_messages.side_effect = lambda messages: messages
+    provider.get_memory_schemas.return_value = [_preference_schema()]
+    provider.get_output_language.return_value = "en"
+    provider.get_tools.return_value = []
+    provider.get_extract_context.return_value = SimpleNamespace(page_id_map=PageIdMap())
+    provider.read_file_contents = {}
+    provider.prefetch = AsyncMock(return_value=[])
+    response = "sdk.commit()" if output_format == "python" else '{"preferences": []}'
+    completion = AsyncMock(return_value=response)
+    loop = ExtractLoop(
+        vlm=SimpleNamespace(model="test", get_completion_async=completion),
+        viking_fs=MagicMock(),
+        context_provider=provider,
+        max_iterations=1,
+    )
+    empty = ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[])
+    loop.resolve_operations = AsyncMock(return_value=(empty, []))
+    loop._check_unread_existing_files = AsyncMock(return_value={})
+    config = SimpleNamespace(
+        memory=SimpleNamespace(link_enabled=False, extraction_output_format=output_format)
+    )
+    with (
+        patch("openviking.session.memory.extract_loop.get_openviking_config", return_value=config),
+        patch("openviking_cli.utils.config.get_openviking_config", return_value=config),
+    ):
+        operations, _ = await loop.run()
+
+    assert operations is empty
+    completion.assert_awaited_once()
+    prompt = completion.call_args.kwargs["messages"][0]["content"]
+    assert prompt.count(MEMORY_MERGE_POLICY) == 1
+    assert prompt.count("## Memory Write Decision") == 1
+    assert prompt.count("## Memory Reorganization Safety") == 1
+    assert len(MEMORY_MERGE_POLICY) < 1000  # Bound prompt size without tying it to a tokenizer.
+    policy = " ".join(MEMORY_MERGE_POLICY.split())
+    assert "Per target, write only for schema-admissible additions, corrections" in policy
+    assert "explicit revocations, or schema-required cleanup; otherwise no-op" in policy
+    assert "Mentions or action requests alone do not justify writes" in policy
+    assert "Merge only the same schema-defined identity" in policy
+    assert "same entity/event" in policy
+    assert "same owner and behavioral choice dimension" in policy
+    assert "Similarity or shared topics are insufficient" in policy
+    assert "preserve each still-valid distinct fact exactly once" in policy
+    assert "surviving schema-valid destination" in policy
+    assert "If identity, validity, or destination is uncertain, keep the source" in policy
+    assert "Split only into distinct schema-valid identities" in policy
+    assert "never invent identities to meet length targets" in policy
+    assert "Keep one identity in one object, using sections when needed" in policy
+    assert "Compact duplicate wording only" in policy
+    assert "never drop, weaken, or generalize valid facts to shorten content" in policy
+    assert "When a memory is too large" not in policy
+    assert all(term not in policy for term in ("ss_project", "project_id", "plot_id", "clip_id"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_count", [1, 2])
+async def test_python_loop_preserves_native_eval_calls_and_aggregate_results(call_count):
+    code = 'editor = sdk.read_preferences(topic="editor")\nformatting = sdk.read_preferences(topic="formatting")'
+    result = {
+        "editor": {"error": "File not found: editor.md"},
+        "formatting": {"error": "File not found: formatting.md"},
+    }
+    calls = [
+        ToolCall(id=f"eval-{i}", name="eval", arguments={"code": code}) for i in range(call_count)
+    ]
+    requests = []
+
+    async def complete(**kwargs):
+        requests.append(copy.deepcopy(kwargs))
+        return VLMResponse(tool_calls=calls) if len(requests) == 1 else "sdk.commit()"
+
+    provider = MagicMock()
+    provider.format_prefetch_messages.side_effect = lambda messages: messages
+    provider.get_memory_schemas.return_value = [_preference_schema()]
+    provider.get_output_language.return_value = "en"
+    provider.get_tools.return_value = ["eval"]
+    provider.get_extract_context.return_value = SimpleNamespace(page_id_map=PageIdMap())
+    provider.read_file_contents = {}
+    provider.instruction.return_value = "Extract memory operations."
+    provider.prefetch = AsyncMock(return_value=[])
+    provider.customize_tool_schema.side_effect = lambda name, schema: schema
+    provider.execute_tool = AsyncMock(return_value=result)
+    loop = ExtractLoop(
+        vlm=SimpleNamespace(model="test", get_completion_async=complete),
+        viking_fs=MagicMock(),
+        context_provider=provider,
+        max_iterations=3,
+    )
+    empty = ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[])
+    loop.resolve_operations = AsyncMock(return_value=(empty, []))
+    loop._check_unread_existing_files = AsyncMock(return_value={})
+    config = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
+    with (
+        patch("openviking.session.memory.extract_loop.get_openviking_config", return_value=config),
+        patch("openviking_cli.utils.config.get_openviking_config", return_value=config),
+    ):
+        operations, tools_used = await loop.run()
+
+    assert operations is empty
+    assert provider.execute_tool.await_count == call_count
+    assert len(tools_used) == call_count
+    assert len(requests) == 2
+    assert [tool["function"]["name"] for tool in requests[1]["tools"]] == ["eval"]
+    assert all("ONLY via: (none)." in request["messages"][-1]["content"] for request in requests)
+    history_before = requests[0]["messages"][:-1]
+    history_after = requests[1]["messages"][:-1]
+    added = history_after[len(history_before) :]
+    assert [m["role"] for m in added] == ["assistant"] + ["tool"] * call_count
+    assert len(added[0]["tool_calls"]) == call_count
+    for call, request_call, response in zip(calls, added[0]["tool_calls"], added[1:], strict=True):
+        assert request_call["id"] == response["tool_call_id"] == call.id
+        assert json.loads(request_call["function"]["arguments"]) == {"code": code}
+        assert _literal_tool_result(response["content"]) == result
+    assert "eval_result" not in json.dumps(added)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefetch", [False, True])
+async def test_python_loop_edits_objects_bound_in_tool_code_without_user_bindings(prefetch):
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    memory_file = _existing_preference(uri, "editor", "Use Vim")
+    page_ids = PageIdMap()
+    requests = []
+    raw_result = {
+        "memory_type": "preferences",
+        "page_id": page_ids.get_page_id(uri),
+        "content": "1\tUse Vim",
+    }
+    code = (
+        "matches = sdk.search_by_session(limit=5)"
+        if prefetch
+        else f"memory = sdk.read(uri={uri!r})"
+    )
+    result = {"matches": [raw_result]} if prefetch else {"memory": raw_result}
+    final = (
+        "matches[0].content.overwrite('Use Emacs')"
+        if prefetch
+        else "memory.content.overwrite('Use Emacs')"
+    )
+    call = ToolCall(id="eval-read", name="eval", arguments={"code": code})
+    provider = MagicMock()
+    provider.format_prefetch_messages.side_effect = lambda messages: messages
+    provider.get_memory_schemas.return_value = [_preference_schema()]
+    provider.get_output_language.return_value = "en"
+    provider.get_tools.return_value = ["eval"]
+    provider.get_extract_context.return_value = SimpleNamespace(page_id_map=page_ids)
+    provider.read_file_contents = {}
+    provider.instruction.return_value = "Extract memory operations."
+    provider.customize_tool_schema.side_effect = lambda name, schema: schema
+
+    async def load_prefetch():
+        messages = [{"role": "user", "content": "Prefer Emacs instead."}]
+        if prefetch:
+            provider.read_file_contents[uri] = memory_file
+            add_tool_call_pair_to_messages(messages, "prefetch", "eval", {"code": code}, result)
+        return messages
+
+    async def execute(_call):
+        provider.read_file_contents[uri] = memory_file
+        return result
+
+    async def complete(**kwargs):
+        requests.append(copy.deepcopy(kwargs))
+        if not prefetch and len(requests) == 1:
+            return VLMResponse(tool_calls=[call])
+        return final
+
+    provider.prefetch = load_prefetch
+    provider.execute_tool = execute
+    loop = ExtractLoop(
+        vlm=SimpleNamespace(model="test", get_completion_async=complete),
+        viking_fs=MagicMock(),
+        context_provider=provider,
+        max_iterations=3,
+    )
+    empty = ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[])
+    loop.resolve_operations = AsyncMock(return_value=(empty, []))
+    loop._check_unread_existing_files = AsyncMock(return_value={})
+    config = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
+    with (
+        patch("openviking.session.memory.extract_loop.get_openviking_config", return_value=config),
+        patch("openviking_cli.utils.config.get_openviking_config", return_value=config),
+    ):
+        operations, _ = await loop.run()
+    assert operations is empty
+    assert len(requests) == (1 if prefetch else 2)
+    messages = requests[-1]["messages"]
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "tool", "user"]
+    assert "sdk.existing(" in messages[-2]["content"]
+    assert messages[-2]["tool_call_id"] == messages[-3]["tool_calls"][0]["id"]
+    expression = "matches[0]" if prefetch else "memory"
+    assert f"ONLY via: {expression}." in messages[-1]["content"]
+    assert "sdk.existing(" not in messages[-1]["content"]
+    if not prefetch:
+        assert "ONLY via: (none)." in requests[0]["messages"][-1]["content"]
+    compiled = loop.resolve_operations.call_args.args[0]
+    assert len(compiled.preferences) == 1
+    assert compiled.preferences[0].page_id == 1
+    assert compiled.preferences[0].content == "Use Emacs"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_format", ["python", "json"])
+async def test_eval_loop_pairs_invalid_arguments_without_extra_user_context(output_format):
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()],
+        files=[_existing_preference(uri, "editor", "Use Vim")],
+        available_tools=("eval",),
+    )
+    # A valid eval variable may itself be named error; it is not a tool failure.
+    result = {"error": {"memory_type": "preferences", "content": "1\tUse Vim", "page_id": 1}}
+    invalid = {"error": "Invalid tool arguments for eval: expected an object"}
+    calls = [
+        ToolCall(
+            id="valid",
+            name="eval",
+            arguments={"code": 'error = sdk.read_preferences(topic="editor")'},
+        ),
+        ToolCall(id="invalid", name="eval", arguments=None),
+    ]
+    provider = SimpleNamespace(execute_tool=AsyncMock(side_effect=[result, invalid]))
+    loop = ExtractLoop(
+        vlm=SimpleNamespace(model="test"), viking_fs=MagicMock(), context_provider=provider
+    )
+    loop._output_context = context
+    loop._output_protocol = create_extraction_output_protocol(output_format)
+    loop._output_protocol.render_contract(context)
+    messages, tools_used = [], []
+
+    assert await loop._execute_tool_calls(messages, calls, tools_used) is False
+
+    roles = ["assistant", "tool", "tool"]
+    assert [m["role"] for m in messages] == roles
+    assert [c["id"] for c in messages[0]["tool_calls"]] == ["valid", "invalid"]
+    assert [m["tool_call_id"] for m in messages[1:3]] == ["valid", "invalid"]
+    assert json.loads(messages[0]["tool_calls"][1]["function"]["arguments"]) is None
+    assert len(tools_used) == provider.execute_tool.await_count == 2
+    if output_format == "python":
+        assert _literal_tool_result(messages[2]["content"]) == invalid
+        assert messages[1]["content"].startswith("error = sdk.existing(")
+        assert messages[1]["content"].count("Use Vim") == 1
+    else:
+        assert json.loads(messages[2]["content"]) == invalid
+        assert json.loads(messages[1]["content"]) == result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", ["Unknown tool: missing", "Tool not allowed: missing"])
+async def test_eval_loop_preserves_unknown_tool_json_reply(error):
+    provider = SimpleNamespace(execute_tool=AsyncMock(return_value={"error": error}))
+    loop = ExtractLoop(
+        vlm=SimpleNamespace(model="test"), viking_fs=MagicMock(), context_provider=provider
+    )
+    loop._output_context = _context([_preference_schema()])
+    loop._output_protocol = create_extraction_output_protocol("python")
+    messages = []
+
+    assert (
+        await loop._execute_tool_calls(
+            messages, [ToolCall(id="missing", name="missing", arguments={})], []
+        )
+        is True
+    )
+    _assert_native_pair(
+        messages,
+        python_result=True,
+        call_id="missing",
+        tool_name="missing",
+        params={},
+        result={"error": error},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_format", ["python", "json"])
+async def test_automatic_refetch_uses_unique_native_eval_pairs(output_format):
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context([_preference_schema()])
+    loop = ExtractLoop(vlm=SimpleNamespace(model="test"), viking_fs=MagicMock())
+    loop._output_context = context
+    loop._output_protocol = create_extraction_output_protocol(output_format)
+    loop._output_protocol.render_contract(context)
+    loop._last_operations_content = "original draft"
+    result = {"error": "File not found"}
+    messages = []
+    for _ in range(2):
+        await loop._add_refetch_results_to_messages(messages, {uri: result})
+    assert [m["role"] for m in messages] == ["assistant", "assistant", "tool", "user"] * 2
+    ids = []
+    for index, start in enumerate((0, 4), start=1):
+        variable = f"refetched_memory_{index}"
+        assert messages[start]["content"] == "original draft"
+        pair = messages[start + 1 : start + 3]
+        call_id = pair[0]["tool_calls"][0]["id"]
+        ids.append(call_id)
+        _assert_native_pair(
+            pair,
+            python_result=output_format == "python",
+            call_id=call_id,
+            tool_name="eval",
+            params={"code": f"{variable} = sdk.read(uri={uri!r})"},
+            result={variable: result},
+        )
+    assert ids[0] != ids[1]
+    assert "eval_result" not in json.dumps(messages)
 
 
 def test_python_contract_omits_link_rules_when_disabled():
@@ -330,7 +762,125 @@ def test_python_create_uses_fixed_case_experience_schema():
     ]
 
 
-def test_experience_schema_defines_conditional_reminders_not_action_paths():
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case_name", ["case_a", '案例_"fixed"'])
+@pytest.mark.parametrize(
+    ("existing", "template_index"), [(False, 0), (True, 1), (False, 2), (True, 2)]
+)
+async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
+    case_name, existing, template_index
+):
+    from openviking.session.memory.experience.compiler import compile_dag
+    from openviking.session.memory.experience.experience_context import (
+        AgentExperienceContextProvider,
+    )
+    from openviking.session.train import Case, Rubric, Trajectory
+
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_yaml(str(resolve_memory_templates_dir() / "experiences.yaml"))
+    schema = registry.get("experiences")
+    uri = f"viking://user/u/memories/experiences/{case_name}.md"
+    old = MemoryFile(
+        uri=uri,
+        memory_type="experiences",
+        content='dag = workflow("old")\nremind = tell("old reminder")',
+        extra_fields={"experience_name": case_name},
+    )
+    context = _context(
+        [schema],
+        files=[old] if existing else [],
+        available_tools=(),
+        template_context={"language": "en"},
+    )
+    protocol = create_extraction_output_protocol("python")
+    provider = AgentExperienceContextProvider(
+        messages=[],
+        case=Case(case_name, "signature", {}, Rubric("reward", "", [])),
+        target_uri=uri,
+        source_session_uri="viking://session/s/archives/1",
+        trajectories=[
+            Trajectory(
+                name="sample",
+                uri="viking://user/u/memories/trajectories/sample.md",
+                outcome="failure",
+                content="# Session Context\n\n# Trajectory\n\n1. `user` Requests the total\n",
+                metadata={
+                    "case_name": case_name,
+                    "source_session_uri": "viking://session/s/archives/1",
+                },
+            )
+        ],
+    )
+    provider._eval_memory = AsyncMock(
+        return_value={
+            "experience": (
+                {
+                    "uri": uri,
+                    "memory_type": "experiences",
+                    "experience_name": case_name,
+                    "content": old.content,
+                }
+                if existing
+                else {"error": f"File not found: {uri}"}
+            )
+        }
+    )
+    instruction = provider.instruction()
+    messages = protocol.render_prefetch_messages(await provider.prefetch(), context)
+    tool_reply = next(message["content"] for message in messages if message["role"] == "tool")
+    assert ("experience = sdk.existing(" if existing else "experience = sdk.error(") in tool_reply
+    messages = provider.format_prefetch_messages(messages)
+    assert all(message["role"] == "user" for message in messages)
+    assert not any("tool_calls" in message or "tool_call_id" in message for message in messages)
+    experience_message = next(
+        message["content"]
+        for message in messages
+        if message["content"].startswith("# Existing Experience")
+    )
+    assert (old.content if existing else "File not found:") in experience_message
+    examples = re.findall(r"```python\n(.*?)\n```", instruction, re.DOTALL)
+    assert len(examples) == 3
+    program = examples[template_index]
+    outer = ast.parse(program)
+    assert all(isinstance(statement, ast.Expr) for statement in outer.body)
+    assert ast.unparse(outer.body[-1].value) == "sdk.commit()"
+    assert "sdk.read(" not in program and "sdk.existing(" not in program
+    assert "sdk.error(" not in program
+    operations, error = protocol.parse(program, context)
+    assert error is None
+    assert operations is not None
+    changes = operations.model_dump()["experiences"]
+    if template_index == 2:
+        assert changes == []
+    else:
+        assert len(changes) == 1
+        assert changes[0]["experience_name"] == case_name
+        dag_source = changes[0]["content"]
+        assert dag_source.startswith("dag = workflow(")
+        assert "total_requested.then(remind_total_scope)" in dag_source
+        assert "reservations_known.then(remind_total_scope)" not in dag_source
+        assert len(json.loads(compile_dag(dag_source))["nodes"]) == 2
+        assert "re-check which reservations" in dag_source
+        assert "before or after proposed changes" in dag_source
+        assert "current rules and evidence before deciding" in dag_source
+        assert "Before any mutation, retrieve every reservation" not in dag_source
+        assert "include reservations that the user also plans to modify" not in dag_source
+    assert (
+        "Ground information requests, tool-step suggestions and reminders in that evidence"
+        in instruction
+    )
+    assert "using check/ask/call/choose/tell nodes" in instruction
+    assert "as separate check -> tell subgraphs" not in instruction
+    assert "workflow/check/ask/call/choose/tell" in instruction
+    assert "Do not assign its result to" in instruction
+    assert "even when it is an error" in instruction
+    assert "permission, network or other read error" in instruction
+    assert "Do not return a bare DAG" in messages[-1]["content"]
+    assert "experience.content.overwrite(...)" in messages[-1]["content"]
+    assert "sdk.create_experiences(...)" in messages[-1]["content"]
+
+
+def test_experience_schema_allows_focused_node_types_and_tell_successors():
     registry = MemoryTypeRegistry(load_schemas=False)
     registry.load_from_yaml(str(resolve_memory_templates_dir() / "experiences.yaml"))
     schema = registry.get("experiences")
@@ -338,23 +888,118 @@ def test_experience_schema_defines_conditional_reminders_not_action_paths():
 
     contract = create_extraction_output_protocol("python").render_contract(context)
 
-    assert "conditional reminders, not a task plan" in contract
-    assert "Full-replacement SDK syntax is mandatory for this field" in contract
-    assert "Never call or assign `sdk.existing(...)` yourself" in contract
-    assert 'existing_experience.content.update("""<complete DAG source>""")' in contract
-    assert "Never pass a complete DAG to `content.edit(...)`" in contract
-    assert "Do not map every Case requirement or every observed tool call into a node" in contract
+    assert "focused conditional guidance, not a full task plan" in contract
     assert (
-        "generated Experiences must not use `ask(...)`, `call(...)`, or `choose(...)`" in contract
+        next(field for field in schema.fields if field.name == "content").merge_op == MergeOp.PATCH
     )
+    assert "SDK content editing rules" in contract
+    assert "Full-replacement SDK syntax is mandatory" not in contract
+    assert "Never call or assign `sdk.existing(...)` yourself" in contract
+    assert "Copy its exact left-hand variable name" in contract
+    assert "existing_experience" not in contract
+    assert "`.content.edit(search=..., replace=...)` or `.content.drop(text=...)`" in contract
+    assert "ensure it matches uniquely" in contract
+    assert "the stored result must still be a complete valid DAG" in contract
+    assert "Do not map every Case requirement or every observed tool call into a node" in contract
+    assert 'ask("one specific question for information needed from the user")' in contract
+    assert 'call("tool_name", "guidance for arguments using the current context")' in contract
+    assert 'choose("one classification question about the current context")' in contract
+    assert "Generated Experiences must not use `choose(...)`" not in contract
+    assert 'selector.case("label", target)' in contract
+    assert "selector.default(target)" in contract
+    assert "mutually exclusive cases" in contract
+    assert "independent needs that can coexist" in contract
+    assert "never for missing or uncertain evidence" in contract
+    assert "not use `ask(...)`, `call(...)`" not in contract
+    assert "do not turn that action into a DAG step" not in contract
+    assert "replace obsolete action nodes" not in contract
+    assert "Preserve supported `ask(...)` and `call(...)` nodes" in contract
     assert "Every root-to-leaf path must end in a `tell(...)` reminder" in contract
-    assert "reminder nodes must not have outgoing edges" in contract
-    assert "total_requested.then(remind_total_scope)" in contract
-    assert "reservations_known.then(remind_total_scope)" in contract
+    assert "A `tell(...)` may have successors" in contract
+    assert "without waiting for the advice to be followed" in contract
+    assert "reminder nodes must not have outgoing edges" not in contract
+    assert "does not establish user confirmation or successful tool execution" in contract
+    assert "Trigger the reminder as soon as its situation is recognizable" in contract
+    assert '"all records have been retrieved"' in contract
+    assert "DAG source belongs only inside the content string" in contract
+    assert "real bindings for create/update/no-change" in contract
+    assert "Example content:" not in contract
+    assert "reservations_known.then(remind_total_scope)" not in contract
     assert "confirm_cancel.then(cancel)" not in contract
 
 
-def test_python_create_populates_hidden_trajectory_execution_from_schema_default():
+@pytest.mark.parametrize("phase", ["synthesis", "merge"])
+def test_experience_rule_review_contract_is_shared_by_synthesis_and_merge(phase):
+    from openviking.session.memory.experience.experience_context import (
+        AgentExperienceContextProvider,
+    )
+    from openviking.session.memory.patch_merge_context_provider import (
+        PatchMergeContextProvider,
+        PatchMergePatch,
+    )
+    from openviking.session.train import Case, Rubric
+
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_yaml(str(resolve_memory_templates_dir() / "experiences.yaml"))
+    uri = "viking://user/u/memories/experiences/case_a.md"
+    if phase == "synthesis":
+        provider = AgentExperienceContextProvider(
+            messages=[],
+            case=Case("case_a", "signature", {}, Rubric("reward", "", [])),
+            target_uri=uri,
+            source_session_uri="viking://session/s/archives/1",
+            memory_registry=registry,
+        )
+    else:
+        provider = PatchMergeContextProvider(
+            memory_type="experiences",
+            fixed_target=True,
+            patches=[
+                PatchMergePatch(
+                    before_file=None,
+                    after_file=MemoryFile(
+                        uri=uri,
+                        memory_type="experiences",
+                        content='dag = workflow("review")\nr = tell("Check the requested scope")',
+                        extra_fields={"experience_name": "case_a"},
+                    ),
+                )
+            ],
+            memory_registry=registry,
+        )
+    context = _context(provider.get_memory_schemas(None), template_context={"language": "en"})
+
+    contract = create_extraction_output_protocol("python").render_contract(context)
+
+    assert "focuses attention on concrete rules, facts, or decision distinctions" in contract
+    assert "rather than prescribing the final action" in contract
+    assert "applicability conditions, exceptions, scope, or timing to review" in contract
+    assert "Current authoritative policy and current user/tool evidence" in contract
+    assert "review aid, not a new business rule" in contract
+    assert "Leave the final choice to the agent after review" in contract
+    assert "Do not expand a restriction on one operation to the whole goal" in contract
+    assert "check the restriction's scope and other allowed approaches" in contract
+    assert "task requirements and constraints" in contract
+    assert "do not decide the plan for it" in contract
+    assert 'not just "be careful" or "review the policy"' in contract
+    assert "Do not request a full policy recap, lengthy reasoning" in contract
+    assert "when creating or updating reminders" in contract
+    assert "not a previous reminder's unexamined action prescription" in contract
+    assert "Make the reminder actionable and testable" not in contract
+    assert 'ask("one specific question for information needed from the user")' in contract
+    assert 'call("tool_name", "guidance for arguments using the current context")' in contract
+    assert "A `tell(...)` may have successors" in contract
+    assert "without waiting for the advice to be followed" in contract
+    assert 'choose("one classification question about the current context")' in contract
+    assert "Generated Experiences must not use `choose(...)`" not in contract
+    assert 'selector.case("label", target)' in contract
+    assert "selector.default(target)" in contract
+    assert "mutually exclusive cases" in contract
+    assert "independent needs that can coexist" in contract
+    assert "never for missing or uncertain evidence" in contract
+
+
+def test_python_create_populates_hidden_trajectory_fields_from_schema_defaults():
     registry = MemoryTypeRegistry(load_schemas=False)
     registry.load_from_yaml(str(resolve_memory_templates_dir() / "trajectories.yaml"))
     schema = registry.get("trajectories")
@@ -364,208 +1009,589 @@ def test_python_create_populates_hidden_trajectory_execution_from_schema_default
     contract = protocol.render_contract(context)
     operations, error = protocol.parse(
         "sdk.create_trajectories("
-        "trajectory_name='cancel_booking', outcome='success', task_query='Cancel it', "
-        "retrieval_anchor='Stage: final', content='# cancel_booking')\n"
+        "trajectory_name='cancel_booking', outcome='success', "
+        "case_name='cancel_booking', content='{}')\n"
         "sdk.commit()",
         context,
     )
 
     assert error is None
     assert operations is not None
-    assert "experience_execution" not in contract
+    assert "trajectory_format: str" not in contract
+    assert "experience_execution: str" not in contract
+    assert "experience_update: str" not in contract
+    assert operations.model_dump()["trajectories"][0]["trajectory_format"] == "ordered_markdown_v2"
     assert operations.model_dump()["trajectories"][0]["experience_execution"] == "{}"
+    assert operations.model_dump()["trajectories"][0]["experience_update"] == "{}"
 
 
-def test_json_protocol_preserves_tool_result_context_shape():
+def test_json_protocol_uses_native_tool_messages():
     context = _context([_preference_schema()])
     protocol = create_extraction_output_protocol("json")
     result = {"memory_type": "preferences", "content": "1\tUse Vim"}
-
+    params = {"uri": "viking://user/alice/memories/preferences/editor.md"}
     messages = protocol.render_tool_result_messages(
         context,
         call_id="call-1",
         tool_name="read",
-        params={"uri": "viking://user/alice/memories/preferences/editor.md"},
+        params=params,
         result=result,
         source="tool call",
     )
-
-    assert messages == [
-        {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "tool_call_name": "read",
-                    "args": {"uri": "viking://user/alice/memories/preferences/editor.md"},
-                    "result": result,
-                },
-                ensure_ascii=False,
-            ),
-        }
-    ]
+    assert len(messages) == 2
+    _assert_native_pair(messages, call_id="call-1", tool_name="read", params=params, result=result)
 
 
-def test_python_protocol_renders_search_result_as_read_tool_comment():
-    uri_a = "viking://user/alice/memories/entities/person/tim.md"
-    uri_b = "viking://user/alice/memories/entities/person/maria.md"
-    context = _context([_preference_schema()])
+@pytest.mark.parametrize("available_tools", [("read",), ()])
+@pytest.mark.parametrize(
+    "result", [[], [{"uri": "viking://user/alice/memories/preferences/editor.md", "score": 0.9}]]
+)
+def test_python_protocol_renders_search_as_native_python_result(available_tools, result):
+    context = _context([_preference_schema()], available_tools=available_tools)
     protocol = create_extraction_output_protocol("python")
-
+    params = {"query": "editor"}
     messages = protocol.render_tool_result_messages(
         context,
         call_id="call-1",
         tool_name="search",
-        params={"query": "tim maria"},
-        result=[{"uri": uri_a, "score": 0.9}, {"uri": uri_b, "score": 0.8}],
-        source="tool call",
-    )
-
-    assert len(messages) == 1
-    content = messages[0]["content"]
-    assert content.startswith("# Search")
-    assert "query='tim maria'" in content
-    assert "read them with the read tool" in content
-    assert f"# - {uri_a}" in content
-    assert f"# - {uri_b}" in content
-    # Search yields no content, so it must not fabricate an sdk.existing() binding.
-    assert "sdk.existing(" not in content
-    assert "search_results" not in content
-    assert "0.9" not in content
-
-
-def test_python_protocol_renders_empty_search_result_as_comment():
-    context = _context([_preference_schema()])
-    protocol = create_extraction_output_protocol("python")
-
-    messages = protocol.render_tool_result_messages(
-        context,
-        call_id="call-1",
-        tool_name="search",
-        params={"query": "nobody"},
-        result=[],
-        source="tool call",
-    )
-
-    assert messages[0]["content"] == "# Search query='nobody' found no memory files."
-
-
-def test_python_protocol_search_comment_omits_read_tool_when_unavailable():
-    uri = "viking://user/alice/memories/entities/person/tim.md"
-    # eager_prefetch preloads everything and exposes no tools to the model.
-    context = _context([_preference_schema()], available_tools=())
-    protocol = create_extraction_output_protocol("python")
-
-    messages = protocol.render_tool_result_messages(
-        context,
-        call_id="call-1",
-        tool_name="search",
-        params={"query": "tim"},
-        result=[{"uri": uri, "score": 0.9}],
+        params=params,
+        result=result,
         source="prefetch",
     )
+    assert len(messages) == 2
+    _assert_native_pair(
+        messages,
+        python_result=True,
+        call_id="call-1",
+        tool_name="search",
+        params=params,
+        result=result,
+    )
+    assert "sdk.existing(" not in json.dumps(messages)
 
-    content = messages[0]["content"]
-    assert "read them with the read tool" not in content
-    assert "there is no read tool" in content
-    assert "treat anything not shown above as new" in content
-    assert f"# - {uri}" in content
 
-
-def test_python_protocol_renders_read_result_directly_as_existing_binding():
+def test_python_read_reply_is_binding_code_with_partial_content_and_metadata():
     uri = "viking://user/alice/memories/preferences/editor.md"
     context = _context(
         [_preference_schema()],
         files=[_existing_preference(uri, "editor", "Use Vim\nKeep plugins small", 2)],
     )
     protocol = create_extraction_output_protocol("python")
-    protocol.render_contract(context)
-
+    result = {
+        "memory_type": "preferences",
+        "topic": "editor",
+        "score": 2,
+        "content": "2\tKeep plugins small",
+        "page_id": 1,
+        "memory_maintenance_notice": {
+            "maintenance_required": True,
+            "guidance": "choose split or compact",
+        },
+    }
+    original = copy.deepcopy(result)
     messages = protocol.render_tool_result_messages(
         context,
         call_id="call-1",
         tool_name="read",
         params={"uri": uri, "offset": 1, "limit": 1},
-        result={
+        result=result,
+        source="tool call",
+    )
+    assert result == original
+    assert [m["role"] for m in messages] == ["assistant", "tool"]
+    assert messages[1]["tool_call_id"] == messages[0]["tool_calls"][0]["id"]
+    code = messages[1]["content"]
+    assert code.startswith("read = sdk.existing(")
+    assert "content='Keep plugins small'" in code
+    assert "Use Vim" not in code and "2\\tKeep plugins small" not in code
+    assert "choose split or compact" in code and "'maintenance_required': True" in code
+    assert "page_id" not in code
+    assert "content_loaded_as_existing_memory" not in code
+    ast.parse(code)
+    operations, error = protocol.parse(
+        "read.content.edit(search='Keep plugins small', replace='Keep plugins minimal')", context
+    )
+    assert error is None
+    assert operations.preferences[0].page_id == 1
+
+
+def test_python_eval_reply_uses_requested_variable_for_existing_memory():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim", 2)]
+    )
+    protocol = create_extraction_output_protocol("python")
+    result = {
+        "memory": {
             "memory_type": "preferences",
             "topic": "editor",
             "score": 2,
-            "content": "2\tKeep plugins small",
+            "content": "1\tUse Vim",
             "page_id": 1,
-            "memory_maintenance_notice": {
-                "maintenance_required": True,
-                "guidance": "choose split or compact",
-            },
-        },
+        }
+    }
+    messages = protocol.render_tool_result_messages(
+        context,
+        call_id="call-1",
+        tool_name="eval",
+        params={"code": f"memory = sdk.read(uri={uri!r})"},
+        result=result,
         source="tool call",
     )
-
-    assert len(messages) == 1
-    content = messages[0]["content"]
-    assert content.startswith("# Existing memory loaded by tool call")
-    assert "preferences_1 = sdk.existing(" in content
-    assert "content='Keep plugins small'" in content
-    assert "2\\tKeep plugins small" not in content
-    assert "Use Vim" not in content
-    assert "tool_call_name" not in content
-    assert "page_id" not in content
-    assert uri not in content
-    assert "# Memory maintenance notice:" in content
-    assert '"maintenance_required": true' in content
-    assert "estimated_tokens" not in content
-    assert "content_characters" not in content
-    assert "choose split or compact" in content
+    assert [m["role"] for m in messages] == ["assistant", "tool"]
+    code = messages[1]["content"]
+    assert code.startswith("memory = sdk.existing(")
+    assert "content='Use Vim'" in code
+    assert code.count("Use Vim") == 1
+    assert "preferences_1" not in code and "eval_result" not in code
+    assert "content_loaded_as_existing_memory" not in code
+    operations, error = protocol.parse("memory.content.overwrite('Use Emacs')", context)
+    assert error is None
+    assert operations.preferences[0].page_id == 1
 
 
-def test_python_protocol_converts_prefetch_tool_messages_without_duplicating_read_content():
+@pytest.mark.parametrize("source", ["prefetch", "tool call", "automatic read"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_python_eval_context_uses_native_request_and_python_result(source, failed):
+    context = _context([_preference_schema()], available_tools=("eval",))
+    protocol = create_extraction_output_protocol("python")
+    code = '\nfirst = sdk.read_preferences(topic="editor")\nsecond = sdk.read_preferences(topic="formatting")\n'
+    result = (
+        {"error": "invalid program"}
+        if failed
+        else {"first": {"error": "File not found"}, "second": {"error": "File not found"}}
+    )
+    messages = protocol.render_tool_result_messages(
+        context,
+        call_id="call-1",
+        tool_name="eval",
+        params={"code": code},
+        result=result,
+        source=source,
+    )
+    assert len(messages) == 2
+    _assert_native_pair(
+        messages,
+        python_result=True,
+        call_id="call-1",
+        tool_name="eval",
+        params={"code": code},
+        result=result,
+    )
+    assert "eval_result" not in json.dumps(messages) and "eval_error" not in json.dumps(messages)
+
+
+@pytest.mark.parametrize("params", [None, {}, {"code": None}, {"code": 123}])
+def test_python_eval_context_preserves_invalid_request_arguments(params):
+    context = _context([_preference_schema()], available_tools=("eval",))
+    protocol = create_extraction_output_protocol("python")
+    result = {"error": "code must be a non-empty string"}
+    messages = protocol.render_tool_result_messages(
+        context,
+        call_id="call-1",
+        tool_name="eval",
+        params=params,
+        result=result,
+        source="tool call",
+    )
+    _assert_native_pair(
+        messages,
+        python_result=True,
+        call_id="call-1",
+        tool_name="eval",
+        params=params,
+        result=result,
+    )
+
+
+@pytest.mark.parametrize("source", ["prefetch", "tool call", "automatic read"])
+def test_python_eval_code_preserves_full_unbound_nested_results_without_compaction(source):
+    context = _context([_preference_schema()], available_tools=("eval",))
+    protocol = create_extraction_output_protocol("python")
+    result = {
+        "search": [
+            {"memory_type": "preferences", "content": "1\tUse Vim", "page_id": 1},
+            {"memory_type": "preferences", "content": "", "page_id": 2},
+        ],
+        "read": {"memory_type": "preferences", "content": None},
+        "missing": {"error": "File not found"},
+        "enabled": True,
+    }
+    original = copy.deepcopy(result)
+    params = {"code": "search = sdk.search_by_session(limit=5)"}
+    messages = protocol.render_tool_result_messages(
+        context, call_id="full-json", tool_name="eval", params=params, result=result, source=source
+    )
+    assert result == original
+    _assert_native_pair(
+        messages,
+        python_result=True,
+        call_id="full-json",
+        tool_name="eval",
+        params=params,
+        result=original,
+    )
+    assert "content_loaded_as_existing_memory" not in json.dumps(messages)
+
+
+def test_python_prefetch_keeps_short_native_eval_request_without_repeating_query():
+    context = _context([_preference_schema()], available_tools=("eval",))
+    protocol = create_extraction_output_protocol("python")
+    conversation = "SESSION_QUERY_MARKER " + "detail " * 1000
+    code = "prefetched_search = sdk.search_by_session(limit=5)"
+    result = {"prefetched_search": []}
+    prefetched = [{"role": "user", "content": conversation}]
+    add_tool_call_pair_to_messages(prefetched, "prefetch-1", "eval", {"code": code}, result)
+    messages = protocol.render_prefetch_messages(prefetched, context)
+    assert len(messages) == 3 and messages[0]["content"] == conversation
+    _assert_native_pair(
+        messages[1:],
+        python_result=True,
+        call_id="prefetch-1",
+        tool_name="eval",
+        params={"code": code},
+        result=result,
+    )
+    assert "SESSION_QUERY_MARKER" not in json.dumps(messages[1:])
+    assert "query=" not in json.dumps(messages[1:])
+
+
+def test_python_prefetch_keeps_all_result_code_inside_tool_replies():
     uri = "viking://user/alice/memories/preferences/editor.md"
     context = _context(
-        [_preference_schema()],
-        files=[_existing_preference(uri, "editor", "Use Vim", 2)],
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim", 2)]
     )
     protocol = create_extraction_output_protocol("python")
     protocol.render_contract(context)
-    prefetched = [
-        {"role": "user", "content": "Conversation History"},
-        {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "tool_call_name": "search",
-                    "args": {"query": "editor"},
-                    "result": [{"uri": uri, "score": 0.9}],
-                }
-            ),
-        },
-        {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "tool_call_name": "read",
-                    "args": {"uri": uri},
-                    "result": {
-                        "memory_type": "preferences",
-                        "topic": "editor",
-                        "score": 2,
-                        "content": "1\tUse Vim",
-                    },
-                }
-            ),
-        },
-    ]
-
+    prefetched = [{"role": "user", "content": "Conversation History"}]
+    add_tool_call_pair_to_messages(
+        prefetched, "search-1", "search", {"query": "editor"}, [{"uri": uri, "score": 0.9}]
+    )
+    add_tool_call_pair_to_messages(
+        prefetched,
+        "read-1",
+        "read",
+        {"uri": uri},
+        {"memory_type": "preferences", "topic": "editor", "score": 2, "content": "1\tUse Vim"},
+    )
     messages = protocol.render_prefetch_messages(prefetched, context)
-    combined = "\n".join(message["content"] for message in messages)
-
-    assert messages[0]["content"] == "Conversation History"
-    # Search only yields URIs, so it renders as a read-tool comment, not a binding.
-    assert "read them with the read tool" in combined
-    assert f"# - {uri}" in combined
-    assert "search_results = [" not in combined
-    # The file that was actually read becomes a system-provided existing binding.
-    assert "preferences_1 = sdk.existing(" in combined
+    assert [m["role"] for m in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+    ]
+    assert messages[1] == prefetched[1] and messages[3] == prefetched[3]
+    assert messages[2]["tool_call_id"] == "search-1" and messages[4]["tool_call_id"] == "read-1"
+    combined = "\n".join(m.get("content") or "" for m in messages)
+    assert _literal_tool_result(messages[2]["content"], "search") == [{"uri": uri, "score": 0.9}]
+    assert messages[4]["content"].startswith("read = sdk.existing(")
     assert combined.count("Use Vim") == 1
-    assert "tool_call_name" not in combined
-    assert '"result"' not in combined
+    assert "eval_result" not in combined and "read_result" not in combined
+
+
+@pytest.mark.parametrize(
+    ("order", "error"),
+    [
+        ([1], "no matching request"),
+        ([0], "missing results"),
+        ([0, 2], "interrupted pending"),
+        ([0, 0], "before answering prior calls"),
+        ([0, 1, 0, 1], "Duplicate prefetch tool call ID"),
+        ([0, 1, 1], "no matching request"),
+    ],
+)
+def test_python_prefetch_rejects_unbalanced_native_pairs(order, error):
+    protocol = create_extraction_output_protocol("python")
+    pair = []
+    add_tool_call_pair_to_messages(pair, "prefetch-1", "eval", {"code": "x = sdk.read()"}, {})
+    pair.append({"role": "user", "content": "interruption"})
+    with pytest.raises(ValueError, match=error):
+        protocol.render_prefetch_messages(
+            [pair[i] for i in order], _context([_preference_schema()])
+        )
+
+
+def test_python_prefetch_preserves_parallel_calls_and_reply_order():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim")]
+    )
+    protocol = create_extraction_output_protocol("python")
+    protocol.render_contract(context)
+    pairs = []
+    for i in range(2):
+        add_tool_call_pair_to_messages(
+            pairs,
+            f"prefetch-{i}",
+            "eval",
+            {"code": 'editor = sdk.read_preferences(topic="editor")'},
+            {"editor": {"memory_type": "preferences", "content": "1\tUse Vim", "page_id": 1}},
+        )
+    request = {**pairs[0], "tool_calls": pairs[0]["tool_calls"] + pairs[2]["tool_calls"]}
+    messages = protocol.render_prefetch_messages([request, pairs[3], pairs[1]], context)
+    assert [m["role"] for m in messages] == ["assistant", "tool", "tool"]
+    assert messages[0] == request
+    assert [m["tool_call_id"] for m in messages[1:3]] == ["prefetch-1", "prefetch-0"]
+    assert messages[1]["content"].startswith("editor = sdk.existing(")
+    assert messages[2]["content"] == messages[1]["content"]
+    operations, error = protocol.parse("editor.content.overwrite('Use Emacs')", context)
+    assert error is None
+    assert len(operations.preferences) == 1
+
+
+def _render_eval_results(protocol, context, result, *, call_id="result"):
+    code = "\n".join(f"{name} = sdk.search_by_session(limit=5)" for name in result)
+    return protocol.render_tool_result_messages(
+        context,
+        call_id=call_id,
+        tool_name="eval",
+        params={"code": code},
+        result=result,
+        source="tool call",
+    )
+
+
+def test_python_search_results_bind_nested_objects_for_edit_delete_and_replacement():
+    first = "viking://user/alice/memories/preferences/editor.md"
+    second = "viking://user/alice/memories/preferences/duplicate.md"
+    context = _context(
+        [_preference_schema()],
+        files=[
+            _existing_preference(first, "editor", "Use Vim"),
+            _existing_preference(second, "duplicate", "Duplicate Vim preference"),
+        ],
+    )
+    protocol = create_extraction_output_protocol("python")
+    result = {
+        "matches": [
+            {"memory_type": "preferences", "page_id": 1, "content": "1\tUse Vim"},
+            {"memory_type": "preferences", "page_id": 2, "content": "1\tDuplicate Vim preference"},
+        ]
+    }
+    original = copy.deepcopy(result)
+    messages = _render_eval_results(protocol, context, result)
+    assert [m["role"] for m in messages] == ["assistant", "tool"]
+    code = messages[1]["content"]
+    assert code.startswith("matches = [sdk.existing(")
+    assert code.count("sdk.existing(") == 2
+    assert code.count("content='Use Vim'") == 1
+    ast.parse(code)
+    assert result == original
+    operations, error = protocol.parse(
+        "matches[0].content.edit(search='Use Vim', replace='Use Emacs')\n"
+        "matches[1].delete(replacement=matches[0])",
+        context,
+    )
+    assert error is None, error
+    assert len(operations.preferences) == 1
+    assert operations.preferences[0].page_id == 1
+    assert len(operations.delete_ids) == 1
+    assert operations.delete_ids[0].delete_page_id == 2
+    assert operations.delete_ids[0].replacement_page_id == 1
+
+
+def test_python_eval_aliases_share_one_object_and_reset_for_each_parse():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim")]
+    )
+    protocol = create_extraction_output_protocol("python")
+    value = {"memory_type": "preferences", "page_id": 1, "content": "1\tUse Vim"}
+    _render_eval_results(protocol, context, {"first": value}, call_id="one")
+    _render_eval_results(protocol, context, {"second": value}, call_id="two")
+    operations, error = protocol.parse(
+        "first.content.overwrite('Use Emacs')\nsecond.content.overwrite('Use Neovim')", context
+    )
+    assert error is None, error
+    assert len(operations.preferences) == 1
+    assert operations.preferences[0].content == "Use Neovim"
+    unchanged, error = protocol.parse("sdk.commit()", context)
+    assert error is None
+    assert unchanged.preferences == []
+    assert context.read_file_contents[uri].plain_content() == "Use Vim"
+
+
+def test_python_eval_reassignment_uses_latest_result_and_invalidates_failed_reference():
+    first = "viking://user/alice/memories/preferences/editor.md"
+    second = "viking://user/alice/memories/preferences/formatting.md"
+    context = _context(
+        [_preference_schema()],
+        files=[
+            _existing_preference(first, "editor", "Use Vim"),
+            _existing_preference(second, "formatting", "Use spaces"),
+        ],
+    )
+    protocol = create_extraction_output_protocol("python")
+    _render_eval_results(
+        protocol, context, {"memory": {"memory_type": "preferences", "page_id": 1}}
+    )
+    _render_eval_results(
+        protocol, context, {"memory": {"memory_type": "preferences", "page_id": 2}}
+    )
+    operations, error = protocol.parse("memory.content.overwrite('Use tabs')", context)
+    assert error is None
+    assert [op.page_id for op in operations.preferences] == [2]
+    _render_eval_results(protocol, context, {"memory": {"error": "File not found"}})
+    operations, error = protocol.parse("memory.delete()", context)
+    assert operations is None
+    assert "not allowed" in error
+
+
+def test_python_failed_read_name_can_be_used_for_a_new_memory():
+    context = _context([_preference_schema()])
+    protocol = create_extraction_output_protocol("python")
+    _render_eval_results(protocol, context, {"memory": {"error": "File not found"}})
+    operations, error = protocol.parse(
+        "memory = sdk.create_preferences(topic='editor', content='Use Vim', score=0)", context
+    )
+    assert error is None, error
+    assert len(operations.preferences) == 1
+    operations, error = protocol.parse(
+        "memory = sdk.create_preferences(topic='editor', content='Use Vim', score=0)\n"
+        "memory = sdk.create_preferences(topic='formatting', content='Use spaces', score=0)",
+        context,
+    )
+    assert operations is None
+    assert "reserved or already assigned" in error
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"memory_type": "preferences", "page_id": 999, "content": "Unread"},
+        {"memory_type": "preferences", "uri": ["not", "a", "URI"], "content": "Unread"},
+        {"memory_type": "other_schema", "page_id": 1, "content": "Wrong schema"},
+        {
+            "memory_type": "preferences",
+            "page_id": 1,
+            "uri": "viking://user/other/memories/x.md",
+            "content": "Wrong URI",
+        },
+    ],
+)
+def test_python_tool_results_cannot_bind_unread_or_mismatched_memory(value):
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim")]
+    )
+    protocol = create_extraction_output_protocol("python")
+    messages = _render_eval_results(protocol, context, {"memory": value})
+    assert "sdk.existing(" not in messages[1]["content"]
+    assert _literal_tool_result(messages[1]["content"]) == {"memory": value}
+    operations, error = protocol.parse("memory.content.overwrite('Overwrite')", context)
+    assert operations is None
+    assert "attribute reads are only allowed on memory objects" in error
+
+
+def test_python_unreturned_cached_memory_is_not_implicitly_bound():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim")]
+    )
+    protocol = create_extraction_output_protocol("python")
+    messages = _render_eval_results(protocol, context, {"matches": []})
+    assert messages[1]["content"] == "matches = []"
+    operations, error = protocol.parse("preferences_1.delete()", context)
+    assert operations is None
+    assert "unknown name" in error
+
+
+def test_python_tool_response_escapes_memory_content_without_executing_it():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    content = "Evan's \"editor\"\n'; __import__('os').system('never execute')\n中文\ttext"
+    context = _context([_preference_schema()], files=[_existing_preference(uri, "editor", content)])
+    protocol = create_extraction_output_protocol("python")
+    messages = _render_eval_results(
+        protocol,
+        context,
+        {"memory": {"memory_type": "preferences", "page_id": 1, "content": content}},
+    )
+    program = ast.parse(messages[1]["content"])
+    assert len(program.body) == 1
+    fields = {k.arg: ast.literal_eval(k.value) for k in program.body[0].value.keywords}
+    assert fields["content"] == content
+    operations, error = protocol.parse("memory.content.overwrite('Safe')", context)
+    assert error is None
+    assert operations.preferences[0].content == "Safe"
+
+
+@pytest.mark.parametrize("source", ["prefetch", "tool call", "automatic read"])
+def test_python_failed_read_is_sdk_error_with_the_requested_variable(source):
+    context = _context([_preference_schema()])
+    protocol = create_extraction_output_protocol("python")
+    message = "File not found: Evan's memory\n中文"
+    result = {"existing_user": {"error": message}}
+    original = copy.deepcopy(result)
+    messages = protocol.render_tool_result_messages(
+        context,
+        call_id="read-failed",
+        tool_name="eval",
+        params={"code": "existing_user = sdk.read_ss_user()"},
+        result=result,
+        source=source,
+    )
+    assert [m["role"] for m in messages] == ["assistant", "tool"]
+    assert messages[1]["content"] == f"existing_user = sdk.error({message!r})"
+    assert messages[1]["tool_call_id"] == "read-failed"
+    tree = ast.parse(messages[1]["content"])
+    assert ast.literal_eval(tree.body[0].value.args[0]) == message
+    assert result == original
+
+
+def test_python_eval_level_error_has_no_invented_result_variable():
+    context = _context([_preference_schema()])
+    protocol = create_extraction_output_protocol("python")
+    messages = protocol.render_tool_result_messages(
+        context,
+        call_id="bad-eval",
+        tool_name="eval",
+        params={"code": "invalid("},
+        result={"error": "invalid program"},
+        source="tool call",
+    )
+    assert messages[1]["content"] == "sdk.error('invalid program')"
+    assert "eval_error" not in messages[1]["content"]
+
+
+def test_python_error_hides_internal_page_id_but_keeps_diagnostics():
+    context = _context([_preference_schema()])
+    protocol = create_extraction_output_protocol("python")
+    result = {"memory": {"error": "Permission denied", "page_id": 7, "retryable": False}}
+    messages = _render_eval_results(protocol, context, result)
+    code = messages[1]["content"]
+    assert code.startswith("memory = sdk.error('Permission denied')")
+    assert "page_id" not in code
+    assert "'retryable': False" in code
+    assert result["memory"]["page_id"] == 7
+
+
+def test_python_existing_result_hides_page_id_and_preserves_internal_mapping():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim")]
+    )
+    protocol = create_extraction_output_protocol("python")
+    result = {"memory": {"memory_type": "preferences", "page_id": 1, "content": "1\tUse Vim"}}
+    messages = _render_eval_results(protocol, context, result)
+    code = messages[1]["content"]
+    assert code.startswith("memory = sdk.existing(")
+    assert "page_id" not in code and "# Metadata" not in code
+    assert context.page_id_map.resolve(1) == uri
+    operations, error = protocol.parse("memory.content.overwrite('Use Emacs')", context)
+    assert error is None
+    assert operations.preferences[0].page_id == 1
+
+
+@pytest.mark.parametrize("program", ["sdk.error('failed')", "failed = sdk.error('failed')"])
+def test_python_sdk_error_is_not_a_final_write_operation(program):
+    context = _context([_preference_schema()])
+    protocol = create_extraction_output_protocol("python")
+    operations, error = protocol.parse(program, context)
+    assert operations is None
+    assert "sdk.error() is reserved for system-provided tool results" in error
+    assert "sdk.commit()" in error
 
 
 def test_python_contract_uses_set_for_single_file_schema_and_create_for_collection():
@@ -1049,7 +2075,7 @@ def test_python_existing_binding_exposes_but_does_not_update_dynamic_peer_id():
 
     bindings = _bind(protocol, context)
     operations, error = protocol.parse(
-        "preferences_1.update(peer_id='carol')\npreferences_1.content.update('Use Emacs')\nsdk.commit()",
+        "preferences_1.update(peer_id='carol')\npreferences_1.content.overwrite('Use Emacs')\nsdk.commit()",
         context,
     )
 
@@ -1145,7 +2171,7 @@ sdk.commit()
     ]
 
 
-def test_python_field_update_replaces_whole_field():
+def test_python_field_overwrite_replaces_whole_field():
     uri = "viking://user/alice/memories/preferences/editor.md"
     context = _context(
         [_preference_schema()],
@@ -1156,7 +2182,7 @@ def test_python_field_update_replaces_whole_field():
 
     operations, error = protocol.parse(
         '''
-preferences_1.content.update("""# Editor
+preferences_1.content.overwrite("""# Editor
 - Use Neovim""")
 sdk.commit()
 ''',
@@ -1165,6 +2191,176 @@ sdk.commit()
 
     assert error is None
     assert operations.model_dump()["preferences"][0]["content"] == "# Editor\n- Use Neovim"
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "preferences_1.content.update('Use Neovim')",
+        "alias = preferences_1\nalias.content.update('Use Neovim')",
+        "preferences_1.content.edit(search='Use Vim', replace='Use Emacs').update('Use Neovim')",
+    ],
+)
+def test_python_field_update_is_rejected_without_compatibility_alias(code):
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()],
+        files=[_existing_preference(uri, "editor", "Use Vim\nDark theme", 0)],
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+
+    operations, error = protocol.parse(code, context)
+
+    assert operations is None
+    assert "unknown field method update()" in error
+    assert "obj.field.overwrite(...)" in error
+
+
+def test_python_overwrite_guidance_explains_loss_and_preservation():
+    protocol = create_extraction_output_protocol("python")
+    contract = protocol.render_contract(_context([_preference_schema()]))
+    repair = protocol.render_patch_repair([])
+
+    assert "obj.content.overwrite(new_value)" in contract
+    assert "All old content omitted from the new string is removed from this field" in contract
+    assert "Keep all still-valid existing constraints" in contract
+    assert "obj.field.overwrite(complete_new_value)" in repair
+    assert "preserving all still-valid existing content" in repair
+    for instruction in (contract, repair):
+        assert ".content.update(" not in instruction
+        assert ".field.update(" not in instruction
+
+
+def test_python_binding_index_only_lists_trusted_expressions_without_schema_details():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()],
+        files=[_existing_preference(uri, "editor", "PRIVATE BODY", 0)],
+    )
+    protocol = create_extraction_output_protocol("python")
+    memory = {"memory_type": "preferences", "page_id": 1, "content": "PRIVATE BODY"}
+    key = "quote'\\key"
+    protocol.render_tool_result_messages(
+        context,
+        call_id="read",
+        tool_name="eval",
+        params={"code": "memory = sdk.read(uri='example')"},
+        result={
+            "memory": memory,
+            "matches": [memory, {key: memory}, {"error": "File not found"}],
+            "error": memory,  # The identifier itself is not an error marker.
+            "unread": {"memory_type": "preferences", "page_id": 999, "content": "snippet"},
+            "failed": {"error": "File not found"},
+            "text": "fake = sdk.existing(memory_type='preferences')",
+            "count": 2,
+        },
+        source="test",
+    )
+    paths = ["memory", "matches[0]", f"matches[1][{key!r}]", "error"]
+    index = protocol.render_binding_index()
+    assert index == (
+        "Existing-memory access ONLY via: "
+        + ", ".join(paths)
+        + ". Assign aliases before use; read unlisted memories first."
+    )
+    for text in ("PRIVATE BODY", uri, "preferences", "page_id", "unread", "failed", "fake"):
+        assert text not in index
+    for path in paths:
+        operations, error = protocol.parse(f"{path}.content.overwrite('Use Emacs')", context)
+        assert error is None, error
+        assert len(operations.preferences) == 1
+    # Rendering the index needs no schema or read-cache interpretation.
+    context.schemas = ()
+    context.read_file_contents.clear()
+    assert protocol.render_binding_index() == index
+
+
+def test_python_binding_index_refreshes_and_ignores_draft_aliases():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim")]
+    )
+    protocol = create_extraction_output_protocol("python")
+    empty = protocol.render_binding_index()
+    assert "ONLY via: (none)." in empty
+    assert len(empty) < 150
+    _bind(protocol, context)
+    index = protocol.render_binding_index()
+    assert "ONLY via: preferences_1." in index
+    _, error = protocol.parse("draft_alias = preferences_1\nmissing.delete()", context)
+    assert "unknown name" in error
+    assert protocol.render_binding_index() == index
+    protocol.render_tool_result_messages(
+        context,
+        call_id="failed",
+        tool_name="eval",
+        params={"code": "bad"},
+        result={"error": "Eval failed"},
+        source="test",
+    )
+    assert protocol.render_binding_index() == index  # No assignment took place.
+    protocol.render_tool_result_messages(
+        context,
+        call_id="shadow",
+        tool_name="eval",
+        params={"code": "reread"},
+        result={"preferences_1": {"error": "File not found"}},
+        source="test",
+    )
+    assert protocol.render_binding_index() == empty
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_format", ["python", "json"])
+async def test_binding_index_is_refreshed_per_request_without_history_accumulation(output_format):
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim")]
+    )
+    protocol = create_extraction_output_protocol(output_format)
+    response = "sdk.commit()" if output_format == "python" else "{}"
+    completion = AsyncMock(return_value=response)
+    loop = ExtractLoop(
+        vlm=SimpleNamespace(model="test", get_completion_async=completion),
+        viking_fs=MagicMock(),
+        context_provider=MagicMock(),
+    )
+    loop._output_protocol = protocol
+    loop._output_context = context
+    messages = [{"role": "system", "content": "Instructions"}]
+    original = copy.deepcopy(messages)
+    await loop._call_llm(messages)
+    protocol.render_tool_result_messages(
+        context,
+        call_id="bind",
+        tool_name="eval",
+        params={"code": "read"},
+        result={"bound": {"memory_type": "preferences", "page_id": 1, "content": "Use Vim"}},
+        source="test",
+    )
+    await loop._call_llm(messages)
+    protocol.render_tool_result_messages(
+        context,
+        call_id="shadow",
+        tool_name="eval",
+        params={"code": "read"},
+        result={"bound": {"error": "File not found"}},
+        source="test",
+    )
+    await loop._call_llm(messages)
+    assert messages == original
+    requests = [call.kwargs["messages"] for call in completion.call_args_list]
+    if output_format == "json":
+        assert protocol.render_binding_index() == ""
+        assert all(request == original for request in requests)
+    else:
+        assert all(len(request) == len(original) + 1 for request in requests)
+        assert "ONLY via: (none)." in requests[0][-1]["content"]
+        assert "ONLY via: bound." in requests[1][-1]["content"]
+        assert "ONLY via: (none)." in requests[2][-1]["content"]
+        assert all(request[-1]["role"] == "user" for request in requests)
+        assert all(request[:-1] == original for request in requests)
 
 
 def test_python_field_edit_emits_block_even_when_search_absent():
@@ -1368,7 +2564,7 @@ sdk.commit()
         ),
         (
             "x = sdk.create_preferences(topic='x', content='y', score=1)\n"
-            "x.content.update('a', 'b')\nsdk.commit()",
+            "x.content.overwrite('a', 'b')\nsdk.commit()",
             "exactly one positional argument",
         ),
         (
@@ -1445,7 +2641,7 @@ def test_python_keeps_valid_create_after_ignored_add_only_delete():
     context = _context([_preference_schema(operation_mode="add_only")], files=[memory_file])
     protocol = create_extraction_output_protocol("python")
     contract = protocol.render_contract(context)
-    protocol.render_new_bindings(context, source="test read")
+    _bind(protocol, context)
 
     operations, error = protocol.parse(
         "preferences_1.delete()\n"
@@ -1545,6 +2741,9 @@ The program above applies the requested update.""",
         ("sdk.read('viking://user/alice/memories/preferences/editor.md')", "sdk.read()"),
         ("read('viking://user/alice/memories/preferences/editor.md')", "function 'read'"),
         ("sdk.search('editor')", "sdk.search()"),
+        ("sdk.search_by_session(limit=5)", "sdk.search_by_session()"),
+        ("sdk.read_ss_project(project_id='proj_1')", "sdk.read_ss_project()"),
+        ("sdk.ls(uri='viking://user/alice/memories')", "sdk.ls()"),
         ("search('editor')", "function 'search'"),
     ],
 )
@@ -1563,8 +2762,9 @@ def test_python_read_search_errors_keep_native_tools_available_for_retry(
     assert error_fragment in error
     assert protocol.keep_tools_enabled_after_parse_error(error)
     retry = protocol.render_format_retry(error)
-    assert "native search/read tool" in retry
-    assert "Do not emit sdk.search(), sdk.read()" in retry
+    assert "native read-only tool" in retry
+    assert "inside eval with an assignment" in retry
+    assert "Do not put read/search calls in the final program" in retry
 
 
 def test_python_sdk_read_error_takes_priority_over_reassigning_existing_binding():
@@ -1836,3 +3036,465 @@ def test_python_rejects_string_percent_formatting():
 
     assert operations is None
     assert "%-formatting is not allowed" in error
+
+
+@pytest.mark.parametrize("memory_type", ["preferences", "ss_clip"])
+def test_output_contract_does_not_inject_source_provenance_fields(memory_type):
+    schema = _preference_schema().model_copy(update={"memory_type": memory_type})
+    context = _context([schema])
+    protocol = create_extraction_output_protocol("python")
+    assert "source_turn_ids" not in protocol.render_contract(context)
+    assert "source_turn_ids" not in json.dumps(context.operations_model.model_json_schema())
+    operations, error = protocol.parse(
+        f"sdk.create_{memory_type}(topic='editor', content='Use Vim', score=0)", context
+    )
+    assert error is None
+    assert "source_turn_ids" not in operations.model_dump()[memory_type][0]
+
+
+def test_python_local_aliases_share_canonical_object_without_duplicate_updates():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim")]
+    )
+    protocol = create_extraction_output_protocol("python")
+    _render_eval_results(
+        protocol,
+        context,
+        {"prefetched_search": [{"memory_type": "preferences", "page_id": 1, "content": "Use Vim"}]},
+    )
+    operations, error = protocol.parse(
+        "first = prefetched_search[0]\nsecond = first\n"
+        "first.content.overwrite('Use Emacs')\nsecond.content.overwrite('Use Neovim')",
+        context,
+    )
+    assert error is None, error
+    assert len(operations.preferences) == 1
+    assert operations.preferences[0].page_id == 1
+    assert operations.preferences[0].content == "Use Neovim"
+    assert not context.create_page_ids
+    assert context.read_file_contents[uri].plain_content() == "Use Vim"
+    unchanged, error = protocol.parse("first = prefetched_search[0]", context)
+    assert error is None and unchanged.preferences == []
+    missing, error = protocol.parse("first.content.overwrite('No alias in this response')", context)
+    assert missing is None and "unknown name" in error
+
+
+def test_python_local_alias_delete_is_emitted_once():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim")]
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    operations, error = protocol.parse(
+        "first = preferences_1\nsecond = first\nsecond.delete()",
+        context,
+    )
+    assert error is None, error
+    assert operations.preferences == []
+    assert len(operations.delete_ids) == 1 and operations.delete_ids[0].delete_page_id == 1
+
+
+def test_python_new_object_alias_preserves_single_create_intent():
+    context = _context([_preference_schema()])
+    protocol = create_extraction_output_protocol("python")
+    operations, error = protocol.parse(
+        "created = sdk.create_preferences(topic='editor', content='Use Vim', score=0)\n"
+        "alias = created\nalias.content.overwrite('Use Emacs')",
+        context,
+    )
+    assert error is None, error
+    assert len(operations.preferences) == 1
+    assert operations.preferences[0].content == "Use Emacs"
+    assert context.create_page_ids == {operations.preferences[0].page_id}
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "sdk = preferences_1",
+        "preferences_1 = preferences_1",
+        "alias = preferences_1\nalias = preferences_1",
+        "alias = preferences_1\nvalue = alias.__class__",
+        "alias = preferences_1\nimport os",
+    ],
+)
+def test_python_aliases_do_not_relax_name_identity_or_execution_guards(code):
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim")]
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    operations, error = protocol.parse(code, context)
+    assert operations is None and error
+    assert context.read_file_contents[uri].plain_content() == "Use Vim"
+
+
+def test_python_alias_contract_explains_same_object_not_copy():
+    protocol = create_extraction_output_protocol("python")
+    contract = protocol.render_contract(_context([_preference_schema()]))
+    assert "alias = existing_1" in contract
+    assert "do not create or copy memories" in contract
+
+
+def test_python_alias_preserves_existing_immutable_field_behavior():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "editor", "Use Vim")]
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    operations, error = protocol.parse(
+        "alias = preferences_1\nalias.topic.overwrite('different_identity')\n"
+        "alias.content.overwrite('Use Emacs')",
+        context,
+    )
+    assert error is None, error
+    assert len(operations.preferences) == 1
+    assert operations.preferences[0].topic == "editor"
+    assert operations.preferences[0].page_id == 1
+    assert operations.preferences[0].content == "Use Emacs"
+
+
+@pytest.mark.parametrize("repair", [False, True])
+def test_python_nested_quote_guidance_example_preserves_inner_code(repair):
+    protocol = create_extraction_output_protocol("python")
+    context = _context([_preference_schema()])
+    instruction = (
+        protocol.render_format_retry("Line 5: invalid Python syntax: invalid character '：'")
+        if repair
+        else protocol.render_contract(context)
+    )
+
+    assert r'encode each embedded literal """ as \"\"\"' in instruction
+    assert r"each literal backslash as \\" in instruction
+    assert "not the enclosing opening and closing delimiters" in instruction
+    assert "decoded once" in instruction
+    if repair:
+        assert "rather than deleting or rewriting valid content" in instruction
+    else:
+        assert 'ALWAYS use a triple-quoted string ("""...""")' in instruction
+    examples = re.findall(r"```python\n(.*?)\n```", instruction, re.DOTALL)
+    example = next(code for code in examples if code.startswith("obj.content.overwrite("))
+    outer = ast.parse(example)
+    inner = ast.literal_eval(outer.body[0].value.args[0])
+    assert inner == 'note = """first line\nsecond line"""'
+    ast.parse(inner)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'Ordinary "quotes", Alice\'s apostrophe, {braces}, and 中文标点：。',
+        'note = """first line\n第二行：保留内容"""',
+        r'note = """C:\\temp\\notes and a literal \\n"""',
+        "note = '''first line\nsecond line'''",
+        "A trailing literal backslash: " + "\\",
+    ],
+)
+def test_python_escaped_triple_quoted_content_round_trips(content):
+    protocol = create_extraction_output_protocol("python")
+    context = _context([_preference_schema()])
+    # Apply the documented encoding to the contents only, once at the outer layer.
+    encoded = content.replace("\\", "\\\\").replace('"""', r"\"\"\"")
+    program = (
+        'sdk.create_preferences(topic="""nested""", '
+        f'content="""{encoded}""", score=1)\nsdk.commit()'
+    )
+
+    operations, error = protocol.parse(program, context)
+
+    assert error is None
+    assert operations.model_dump()["preferences"][0]["content"] == content
+
+
+def test_python_unescaped_nested_quotes_stay_invalid_and_receive_escape_guidance():
+    protocol = create_extraction_output_protocol("python")
+    context = _context([_preference_schema()])
+    inner = 'dag = workflow("example")\nreminder = tell("""中文：第一行\n第二行""")\n'
+    program = (
+        f'sdk.create_preferences(topic="""nested""", content="""{inner}""", score=1)\nsdk.commit()'
+    )
+
+    operations, error = protocol.parse(program, context)
+
+    assert operations is None
+    assert "invalid Python syntax" in error
+    assert "invalid character" in error
+    instruction = protocol.render_format_retry(error)
+    assert error in instruction
+    assert "quote delimiter closed the surrounding string early" in instruction
+    assert r'encode each embedded literal """ as \"\"\"' in instruction
+    # Rendering guidance must not weaken parsing or silently rewrite an invalid program.
+    again, repeated_error = protocol.parse(program, context)
+    assert again is None
+    assert repeated_error == error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_format", ["python", "json"])
+async def test_refetch_names_do_not_shadow_names_in_previous_model_draft(output_format):
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context([_preference_schema()])
+    loop = ExtractLoop(vlm=SimpleNamespace(model="test"), viking_fs=MagicMock())
+    loop._output_context = context
+    loop._output_protocol = create_extraction_output_protocol(output_format)
+    loop._output_protocol.render_contract(context)
+    loop._last_operations_content = "refetched_memory_1 = existing_project"
+    messages = []
+    await loop._add_refetch_results_to_messages(messages, {uri: {"error": "File not found"}})
+    pair = messages[1:3]
+    _assert_native_pair(
+        pair,
+        python_result=output_format == "python",
+        call_id=pair[0]["tool_calls"][0]["id"],
+        tool_name="eval",
+        params={"code": f"refetched_memory_2 = sdk.read(uri={uri!r})"},
+        result={"refetched_memory_2": {"error": "File not found"}},
+    )
+
+
+@pytest.mark.parametrize("operation", ["edit", "drop", "overwrite"])
+def test_experience_schema_allows_local_edits_and_full_replacement(operation):
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_yaml(str(resolve_memory_templates_dir() / "experiences.yaml"))
+    old = MemoryFile(
+        uri="viking://user/alice/memories/experiences/case_a.md",
+        memory_type="experiences",
+        content='dag = workflow("review")\n# stale comment\nr = tell("old reminder")',
+        extra_fields={"experience_name": "case_a"},
+    )
+    context = _context([registry.get("experiences")], files=[old])
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    replacement = 'dag = workflow("review")\nr = tell("new reminder")'
+    statement = {
+        "edit": 'experiences_1.content.edit(search="old reminder", replace="new reminder")',
+        "drop": 'experiences_1.content.drop(text="# stale comment\\n")',
+        "overwrite": f"experiences_1.content.overwrite({replacement!r})",
+    }[operation]
+    operations, error = protocol.parse(statement + "\nsdk.commit()", context)
+    assert error is None
+    result = operations.model_dump()["experiences"][0]["content"]
+    expected = {
+        "edit": {"blocks": [{"search": "old reminder", "replace": "new reminder"}]},
+        "drop": {"blocks": [{"delete": "# stale comment\n"}]},
+        "overwrite": replacement,
+    }[operation]
+    assert result == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_format", ["python", "json"])
+async def test_eval_aliases_share_prefetch_tool_and_refetch_bindings(output_format):
+    from openviking.server.identity import RequestContext, Role
+    from openviking.session.memory.session_extract_context_provider import (
+        SessionExtractContextProvider,
+    )
+    from openviking.session.memory.tools import MemoryEvalFunction
+    from openviking_cli.session.user_id import UserIdentifier
+
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    memory = _existing_preference(uri, "editor", "Use Vim")
+    context = _context([_preference_schema()], files=[memory], available_tools=("eval",))
+    protocol = create_extraction_output_protocol(output_format)
+    protocol.render_contract(context)
+    raw = {"memory_type": "preferences", "uri": uri, "content": "1\tUse Vim", "topic": "editor"}
+    prefetch = []
+    add_tool_call_pair_to_messages(
+        prefetch,
+        "prefetch",
+        "eval",
+        {"code": "prefetched_search = sdk.search_by_session(limit=5)"},
+        {"prefetched_search": [raw], "missing": {"error": "File not found"}},
+    )
+    messages = protocol.render_prefetch_messages(prefetch, context)
+    provider = SessionExtractContextProvider.__new__(SessionExtractContextProvider)
+    provider._viking_fs = AsyncMock()
+    provider._ctx = RequestContext(user=UserIdentifier("default", "alice"), role=Role.USER)
+    provider._transaction_handle = None
+    provider._read_file_contents = context.read_file_contents
+    provider._schema_directories = []
+    provider._allowed_memory_read_uris = {uri}
+    provider._eager_prefetch = False
+    provider.get_extract_context = lambda: context
+    provider._get_memory_eval_functions = lambda: {
+        "read": MemoryEvalFunction(
+            name="read",
+            signature="read(uri: str)",
+            description="Read.",
+            allowed_arguments=frozenset({"uri"}),
+            required_arguments=frozenset({"uri"}),
+            kind="read",
+        )
+    }
+    loop = ExtractLoop.__new__(ExtractLoop)
+    loop.context_provider = provider
+    loop._output_protocol = protocol
+    loop._output_context = context
+    loop._last_operations_content = ""
+    tools_used = []
+    for name, code in [
+        ("one", "alias = prefetched_search[0]\nmissing_alias = missing"),
+        ("two", "second = alias"),
+    ]:
+        await loop._execute_tool_calls(
+            messages, [ToolCall(id=name, name="eval", arguments={"code": code})], tools_used
+        )
+        assert "error" not in tools_used[-1]["result"]
+        assert list(tools_used[-1]["result"]) == (
+            ["alias", "missing_alias"] if name == "one" else ["second"]
+        )
+    provider._viking_fs.read_file.assert_not_awaited()
+    bindings = protocol.get_memory_eval_bindings(context)
+    assert bindings["second"]["uri"] == uri
+    assert bindings["missing_alias"] == {"error": "File not found"}
+    if output_format == "python":
+        assert "second = sdk.existing(" in messages[-1]["content"]
+        assert "# Metadata" not in messages[-1]["content"]
+        operations, error = protocol.parse(
+            "second.content.overwrite('Use Emacs')\nsdk.commit()", context
+        )
+        assert error is None and len(operations.preferences) == 1
+        assert operations.preferences[0].content == "Use Emacs"
+    else:
+        assert json.loads(messages[-1]["content"])["second"] == raw
+    provider._viking_fs.read_file.return_value = (
+        'Use Vim\n\n<!-- MEMORY_FIELDS\n{"memory_type":"preferences","topic":"editor"}\n-->'
+    )
+    await loop._execute_tool_calls(
+        messages,
+        [
+            ToolCall(
+                id="mixed-read",
+                name="eval",
+                arguments={
+                    "code": "mixed_alias = second\nfresh = sdk.read(uri=mixed_alias['uri'])"
+                },
+            )
+        ],
+        tools_used,
+    )
+    assert list(tools_used[-1]["result"]) == ["mixed_alias", "fresh"]
+    assert "Use Vim" in tools_used[-1]["result"]["fresh"]["content"]
+    provider._viking_fs.read_file.assert_awaited_once_with(uri, ctx=provider._ctx)
+    await loop._add_refetch_results_to_messages(messages, {uri: raw})
+    await loop._execute_tool_calls(
+        messages,
+        [ToolCall(id="three", name="eval", arguments={"code": "repaired = refetched_memory_1"})],
+        tools_used,
+    )
+    assert tools_used[-1]["result"]["repaired"]["uri"] == uri
+    assert (
+        create_extraction_output_protocol(output_format).get_memory_eval_bindings(
+            _context([_preference_schema()])
+        )
+        == {}
+    )
+
+
+def test_python_eval_bindings_expose_only_visible_fields_and_are_snapshots():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    memory = _existing_preference(uri, "editor", "Use Vim")
+    memory.extra_fields.update(source_extraction_id="private", last_update_trace_id="private")
+    context = _context([_preference_schema()], files=[memory])
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    before = dict(memory.extra_fields)
+    snapshot = protocol.get_memory_eval_bindings(context)
+    bound = snapshot["preferences_1"]
+    assert bound["uri"] == uri and bound["memory_type"] == "preferences"
+    assert bound["content"] == "Use Vim"
+    assert (
+        not {"page_id", "version", "source_extraction_id", "last_update_trace_id", "_uri"}
+        & bound.keys()
+    )
+    bound["content"] = "not a write"
+    assert memory.content == "Use Vim" and memory.extra_fields == before
+    assert protocol.get_memory_eval_bindings(context)["preferences_1"]["content"] == "Use Vim"
+
+
+@pytest.mark.parametrize("output_format", ["python", "json"])
+def test_eval_exported_bindings_follow_reassignment_and_ignore_tool_errors(output_format):
+    context = _context([_preference_schema()])
+    protocol = create_extraction_output_protocol(output_format)
+    _render_eval_results(protocol, context, {"selected": [1], "other": {"items": [2]}})
+    _render_eval_results(protocol, context, {"selected": [3]})
+    _render_eval_results(protocol, context, {"error": "parse failed"})
+    snapshot = protocol.get_memory_eval_bindings(context)
+    assert snapshot == {"selected": [3], "other": {"items": [2]}}
+    snapshot["other"]["items"].append(4)
+    assert protocol.get_memory_eval_bindings(context)["other"] == {"items": [2]}
+
+
+def test_json_eval_prefetch_registers_bindings_without_reformatting_native_content():
+    context = _context([_preference_schema()])
+    protocol = create_extraction_output_protocol("json")
+    messages = []
+    add_tool_call_pair_to_messages(
+        messages,
+        "prefetch",
+        "eval",
+        {"code": "items = sdk.search_by_session(limit=1)"},
+        {"items": [{"uri": "known", "content": "text"}]},
+    )
+    messages[-1]["content"] = json.dumps(json.loads(messages[-1]["content"]), indent=2)
+    original = copy.deepcopy(messages)
+    assert protocol.render_prefetch_messages(messages, context) == original
+    assert protocol.get_memory_eval_bindings(context) == {
+        "items": [{"uri": "known", "content": "text"}]
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_format", ["python", "json"])
+async def test_parallel_eval_calls_share_only_the_previous_turn_snapshot(output_format):
+    from openviking.server.identity import RequestContext, Role, ToolContext
+    from openviking.session.memory.tools import MemoryEvalFunction, MemoryEvalTool
+    from openviking_cli.session.user_id import UserIdentifier
+
+    context = _context([_preference_schema()])
+    protocol = create_extraction_output_protocol(output_format)
+    _render_eval_results(protocol, context, {"known": [{"content": "trusted"}]})
+    function = MemoryEvalFunction(
+        name="read",
+        signature="read(uri: str)",
+        description="Read.",
+        allowed_arguments=frozenset({"uri"}),
+        required_arguments=frozenset({"uri"}),
+        kind="read",
+    )
+    provider = SimpleNamespace()
+
+    async def execute(tool_call):
+        tool_context = ToolContext(
+            viking_fs=None,
+            request_ctx=RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER),
+            memory_eval_functions={"read": function},
+            memory_eval_bindings=provider.memory_eval_bindings,
+        )
+        return await MemoryEvalTool().execute(tool_context, **tool_call.arguments)
+
+    provider.execute_tool = execute
+    loop = ExtractLoop.__new__(ExtractLoop)
+    loop.context_provider, loop._output_protocol, loop._output_context = provider, protocol, context
+    messages, used = [], []
+    await loop._execute_tool_calls(
+        messages,
+        [
+            ToolCall(id="first", name="eval", arguments={"code": "first = known[0]"}),
+            ToolCall(id="too-early", name="eval", arguments={"code": "second = first"}),
+        ],
+        used,
+    )
+    assert used[0]["result"] == {"first": {"content": "trusted"}}
+    assert "unknown result variable" in used[1]["result"]["error"]
+    assert [m["role"] for m in messages] == ["assistant", "tool", "tool"]
+    await loop._execute_tool_calls(
+        messages,
+        [ToolCall(id="next-turn", name="eval", arguments={"code": "second = first"})],
+        used,
+    )
+    assert used[-1]["result"] == {"second": {"content": "trusted"}}

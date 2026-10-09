@@ -210,7 +210,9 @@ class SchemaModelGenerator:
             models[memory_type.memory_type] = self.create_flat_data_model(memory_type)
         return models
 
-    def create_structured_operations_model(self, role_scope: Optional[RoleScope] = None) -> Type[BaseModel]:
+    def create_structured_operations_model(
+        self, role_scope: Optional[RoleScope] = None
+    ) -> Type[BaseModel]:
         """
         Create a structured MemoryOperations model with type-safe write operations.
 
@@ -352,6 +354,7 @@ class SchemaModelGenerator:
 
         self._operations_model = StructuredMemoryOperations
         return self._operations_model
+
 
 class SchemaPromptGenerator:
     """

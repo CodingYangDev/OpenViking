@@ -720,6 +720,7 @@ export class OpenVikingClient {
       session_id: options.sessionId,
       memory_policy: options.memoryPolicy,
       memory_extraction_config: options.memoryExtractionConfig,
+      extraction_context: options.extractionContext,
       telemetry: options.telemetry,
     });
     if ("autoCommitPolicy" in options)
@@ -745,6 +746,7 @@ export class OpenVikingClient {
   ): Promise<JsonObject> {
     const body = compact({
       memory_extraction_config: options.memoryExtractionConfig,
+      extraction_context: options.extractionContext,
       telemetry: options.telemetry,
     });
     if ("autoCommitPolicy" in options)

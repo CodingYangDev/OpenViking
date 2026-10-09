@@ -95,6 +95,37 @@ async def test_async_http_client_batch_add_messages_url_encodes_session_id():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wait", [True, False])
+async def test_async_http_client_runs_deferred_experience_learning(wait):
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
+    client._http = fake_http
+    client._handle_response = lambda _response: {"applied_count": 1}
+    uris = ["viking://user/u/memories/trajectories/case/a.md"]
+
+    result = await client.learn_experiences(
+        trajectory_uris=uris,
+        max_cases=5,
+        retry_failed=True,
+        lease_seconds=120,
+        wait=wait,
+    )
+
+    assert result == {"applied_count": 1}
+    fake_http.post.assert_awaited_once_with(
+        "/api/v1/agent-evolution/experiences/learn",
+        json={
+            "trajectory_uris": uris,
+            "max_cases": 5,
+            "retry_failed": True,
+            "lease_seconds": 120,
+            "wait": wait,
+        },
+        timeout=1800.0,
+    )
+
+
+@pytest.mark.asyncio
 async def test_async_http_client_sends_message_semantics_and_turn_retention():
     client = AsyncHTTPClient(url="http://localhost:1933")
     fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
@@ -265,11 +296,18 @@ async def test_async_http_client_sends_event_memory_tag_configuration():
     client._handle_response_data = lambda _response: {"result": {"status": "ok"}}
     config = {"events": {"tags": ["team=search", "channel=web"]}}
 
-    await client.create_session("tagged-session", options={"memory_extraction_config": config})
+    await client.create_session(
+        "tagged-session",
+        options={
+            "memory_extraction_config": config,
+            "extraction_context": '{"project_id":"project-1"}',
+        },
+    )
     await client.update_session_config(
         "tagged-session",
         {
             "memory_extraction_config": config,
+            "extraction_context": '{"project_id":"project-2"}',
             "auto_commit_policy": {"message_count_threshold": 25},
         },
     )
@@ -280,10 +318,12 @@ async def test_async_http_client_sends_event_memory_tag_configuration():
     assert fake_http.post.await_args_list[0].kwargs["json"] == {
         "session_id": "tagged-session",
         "memory_extraction_config": config,
+        "extraction_context": '{"project_id":"project-1"}',
     }
     assert fake_http.patch.await_args_list[0].args == ("/api/v1/sessions/tagged-session/config",)
     assert fake_http.patch.await_args_list[0].kwargs["json"] == {
         "memory_extraction_config": config,
+        "extraction_context": '{"project_id":"project-2"}',
         "auto_commit_policy": {"message_count_threshold": 25},
     }
     assert fake_http.post.await_args_list[1].kwargs["json"] == {
@@ -1675,3 +1715,42 @@ async def test_import_ovpack_fails_fast_when_path_is_directory(tmp_path):
 
     with pytest.raises(ValueError, match="is not a file"):
         await client.import_ovpack(str(pack_dir), parent="viking://resources/")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("threshold", [None, 0.0, 0.15])
+async def test_search_advice_mode_does_not_send_session_or_scope_defaults(threshold):
+    import httpx
+
+    client = AsyncHTTPClient(url="http://test")
+    client._request = AsyncMock(
+        return_value=httpx.Response(200, json={"status": "ok", "result": {"instructions": []}})
+    )
+    state = [{"role": "user", "content": "Review the total"}]
+    result = await client.search(
+        "q", limit=3, options={"mode": "advice", "state": state, "score_threshold": threshold}
+    )
+    assert result == {"instructions": []}
+    client._request.assert_awaited_once_with(
+        "POST",
+        "/api/v1/search/search",
+        json={
+            "query": "q",
+            "limit": 3,
+            "mode": "advice",
+            "state": state,
+            "score_threshold": threshold,
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kwargs", [{"session_id": "s"}, {"target_uri": "viking://user/other/memories"}]
+)
+async def test_advice_search_rejects_session_or_scope_arguments(kwargs):
+    client = AsyncHTTPClient(url="http://test")
+    client._request = AsyncMock()
+    with pytest.raises(ValueError, match="does not accept"):
+        await client.search("q", options={"mode": "advice", "state": []}, **kwargs)
+    client._request.assert_not_awaited()

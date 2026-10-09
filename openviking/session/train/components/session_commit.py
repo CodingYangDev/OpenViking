@@ -6,12 +6,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
+from asyncio import wait_for
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from openviking.session.train.components.progress import run_with_progress
+import httpx
+
+from openviking.session.train.components.progress import format_label, run_with_progress
 from openviking.session.train.components.session_analyzer import (
     experience_execution_from_runtime,
 )
@@ -26,10 +31,15 @@ from openviking.session.train.domain import (
     RolloutTrainingResult,
     RubricEvaluation,
 )
-from openviking.session.train.utils import average_score, validate_rollouts_have_cases
+from openviking.session.train.utils import (
+    average_score,
+    summarize_session_commits,
+    validate_rollouts_have_cases,
+)
 from openviking_cli.client.http import AsyncHTTPClient
+from openviking_cli.exceptions import AlreadyExistsError, NotFoundError
 
-_TRAINING_COMMIT_MEMORY_TYPES = ("cases", "experiences")
+_TRAINING_COMMIT_MEMORY_TYPES = ("cases", "trajectories")
 _TRAINING_CASE_SPEC_PROTOCOL = "openviking.batch_train.case_spec.v1"
 _TRAINING_CASE_SPEC_HEADER = "# OpenViking Batch Training CaseSpec v1"
 _SESSION_BATCH_ADD_MESSAGE_LIMIT = 100
@@ -37,7 +47,7 @@ _SESSION_BATCH_ADD_MESSAGE_LIMIT = 100
 
 @dataclass(slots=True)
 class SessionCommitPolicyTrainer:
-    """Train remotely by writing rollout messages to sessions and committing them."""
+    """Phase 1: persist rollout Trajectories without triggering Experience learning."""
 
     client: AsyncHTTPClient
     run_id: str = ""
@@ -84,21 +94,42 @@ class SessionCommitPolicyTrainer:
         commit_results = await run_with_progress(
             rollout_list,
             coroutine_factory=_commit,
-            label="train_start",
+            label="session_commit_start",
             enabled=self.show_progress,
             description=(
                 f"Processing {len(rollout_list)} rollouts, concurrency={self.commit_concurrency}"
             ),
             concurrency=self.commit_concurrency,
         )
+        # Keep skipped rollouts in reports/artifacts without submitting them for learning.
         analysis_list = [_analysis_from_rollout(rollout) for rollout in rollout_list]
         errors = [item["error"] for item in commit_results if item.get("error")]
+        trajectory_uris = list(
+            dict.fromkeys(
+                uri for item in commit_results for uri in item.get("trajectory_uris", []) if uri
+            )
+        )
+        commit_summary = summarize_session_commits(commit_results)
+        if self.show_progress:
+            print(
+                f"{format_label('train_commit')} "
+                + " ".join(f"{key}={value}" for key, value in commit_summary.items()),
+                flush=True,
+            )
         apply_result = PolicyApplyResult(
             updated_policy_set=policy_set,
+            written_uris=[],
             errors=errors,
             metadata={
-                "committed_rollout_count": len(commit_results),
+                "committed_rollout_count": sum(
+                    item.get("task_status") != "skipped" for item in commit_results
+                ),
+                "skipped_rollout_count": sum(
+                    item.get("task_status") == "skipped" for item in commit_results
+                ),
                 "commit_results": commit_results,
+                "commit_summary": commit_summary,
+                "trajectory_uris": trajectory_uris,
                 "run_id": self.run_id,
             },
         )
@@ -115,6 +146,7 @@ class SessionCommitPolicyTrainer:
                 "score": average_score(analysis_list),
                 "source": "session_commit_trainer",
                 "run_id": self.run_id,
+                "trajectory_uris": trajectory_uris,
             },
         )
 
@@ -128,16 +160,30 @@ class SessionCommitPolicyTrainer:
         session_id = _session_id_for_rollout(rollout, run_id=self.run_id)
         stage = "prepare_messages"
         try:
-            messages = (
-                [_case_spec_message_to_request(rollout)]
-                + [_message_to_request(message) for message in rollout.messages]
-                + [_evaluation_message_to_request(rollout)]
-            )
+            if execution_error := rollout.metadata.get("execution_error"):
+                skipped = {
+                    "index": index,
+                    "session_id": "",
+                    "stage": "skip_execution_error",
+                    "task_id": "",
+                    "archive_uri": "",
+                    "task_status": "skipped",
+                    "skip_reason": "rollout_execution_error",
+                    "execution_error": execution_error,
+                    "score": _rollout_score(rollout),
+                    "error": None,
+                    "trajectory_uris": [],
+                }
+                await self._record_event(
+                    "train_commit_skipped",
+                    rollout=rollout,
+                    execution_metadata=execution_metadata,
+                    **skipped,
+                )
+                return skipped
+            messages = build_commit_messages(rollout)
             stage = "create_session"
-            await self.client.create_session(
-                session_id=session_id,
-                options={"memory_policy": _training_commit_memory_policy()},
-            )
+            await self._create_session(session_id)
             stage = "batch_add_messages"
             await self._batch_add_messages(session_id, messages)
             stage = "commit_session"
@@ -166,6 +212,12 @@ class SessionCommitPolicyTrainer:
             stage = "wait_task"
             task = await self._wait_task(task_id) if task_id else None
             task_error = _task_error(task)
+            task_result = task.get("result") if isinstance(task, dict) else None
+            trajectory_uris = (
+                list(task_result.get("trajectory_uris", []) or [])
+                if isinstance(task_result, dict)
+                else []
+            )
             if task_error:
                 print(
                     f"[session_commit] failed stage={stage} session_id={session_id} "
@@ -187,6 +239,7 @@ class SessionCommitPolicyTrainer:
                 task_status=task.get("status") if isinstance(task, dict) else None,
                 score=_rollout_score(rollout),
                 error=task_error,
+                trajectory_uris=trajectory_uris,
             )
             return {
                 "index": index,
@@ -199,11 +252,13 @@ class SessionCommitPolicyTrainer:
                 "task_status": task.get("status") if isinstance(task, dict) else None,
                 "score": _rollout_score(rollout),
                 "error": task_error,
+                "trajectory_uris": trajectory_uris,
             }
         except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
             print(
                 f"[session_commit] failed stage={stage} session_id={session_id} "
-                f"task_id=<none> trace_id=<none> error={exc}",
+                f"task_id=<none> trace_id=<none> error={error}",
                 flush=True,
             )
             await self._record_event(
@@ -219,7 +274,7 @@ class SessionCommitPolicyTrainer:
                 telemetry_id=None,
                 task_status="failed",
                 score=_rollout_score(rollout),
-                error=str(exc),
+                error=error,
             )
             return {
                 "index": index,
@@ -231,8 +286,39 @@ class SessionCommitPolicyTrainer:
                 "telemetry_id": None,
                 "task_status": "failed",
                 "score": _rollout_score(rollout),
-                "error": str(exc),
+                "error": error,
+                "trajectory_uris": [],
             }
+
+    async def _create_session(self, session_id: str) -> None:
+        """Retry read failures, reconciling a possibly successful create by its fixed ID."""
+        retry_delay = 0.5
+        check_existing = False
+        while True:
+            try:
+                if check_existing:
+                    try:
+                        await self.client.get_session(session_id)
+                    except NotFoundError:
+                        pass
+                    else:
+                        return
+                try:
+                    await self.client.create_session(
+                        session_id=session_id,
+                        options={"memory_policy": _training_commit_memory_policy()},
+                    )
+                except AlreadyExistsError:
+                    if not check_existing:
+                        raise
+                    # The original POST may have finished after the reconciliation GET.
+                    await self.client.get_session(session_id)
+                return
+            except httpx.ReadError:
+                check_existing = True
+                delay = random.uniform(retry_delay / 2, retry_delay)
+                await asyncio.sleep(delay)
+                retry_delay = min(retry_delay * 2, 30.0)
 
     async def _record_event(
         self,
@@ -271,18 +357,53 @@ class SessionCommitPolicyTrainer:
             )
 
     async def _wait_task(self, task_id: str) -> dict[str, Any]:
-        deadline = (
-            asyncio.get_running_loop().time() + self.timeout_seconds
-            if self.timeout_seconds is not None
-            else None
+        return await wait_for_task(
+            self.client,
+            task_id,
+            timeout_seconds=self.timeout_seconds,
+            poll_interval_seconds=self.poll_interval_seconds,
+            timeout_error="commit task timeout",
         )
-        while True:
-            task = await self.client.get_task(task_id)
+
+
+async def wait_for_task(
+    client: AsyncHTTPClient,
+    task_id: str,
+    *,
+    timeout_seconds: float | None,
+    poll_interval_seconds: float,
+    timeout_error: str = "task timeout",
+    on_update: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    """Poll an existing task without replaying submission; retry ReadError with backoff."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds if timeout_seconds is not None else None
+    retry_delay = 0.5
+    while deadline is None or loop.time() < deadline:
+        delay = poll_interval_seconds
+        try:
+            remaining = None if deadline is None else max(0.0, deadline - loop.time())
+            task = await wait_for(client.get_task(task_id), timeout=remaining)
+        except TimeoutError:
+            if deadline is None or loop.time() < deadline:
+                raise
+            break
+        except httpx.ReadError:
+            delay = random.uniform(retry_delay / 2, retry_delay)
+            retry_delay = min(retry_delay * 2, 30.0)
+        else:
+            if task and on_update is not None:
+                await on_update(task)
             if task and task.get("status") in {"completed", "failed", "cancelled"}:
                 return task
-            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
-                return {"task_id": task_id, "status": "timeout", "error": "commit task timeout"}
-            await asyncio.sleep(self.poll_interval_seconds)
+            retry_delay = 0.5
+        if deadline is not None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            delay = min(delay, remaining)
+        await asyncio.sleep(delay)
+    return {"task_id": task_id, "status": "timeout", "error": timeout_error}
 
 
 def _rollout_event_fields(
@@ -415,6 +536,15 @@ def _new_run_id() -> str:
     return f"{int(time.time())}_{uuid4().hex[:8]}"
 
 
+def build_commit_messages(rollout: Rollout) -> list[dict[str, Any]]:
+    """Build the exact request messages used by Session commits and artifact exports."""
+    return (
+        [_case_spec_message_to_request(rollout)]
+        + [_message_to_request(message) for message in rollout.messages]
+        + [_evaluation_message_to_request(rollout)]
+    )
+
+
 def _case_spec_message_to_request(rollout: Rollout) -> dict[str, Any]:
     text = (
         f"{_TRAINING_CASE_SPEC_HEADER}\n\n"
@@ -480,13 +610,9 @@ def _stable_task_signature(rollout: Rollout) -> str:
 
 def _stable_case_metadata(rollout: Rollout) -> dict[str, Any]:
     metadata = dict(rollout.case.metadata or {})
+    metadata.pop("experience_execution", None)
     metadata.setdefault("rollout_case_name", rollout.case.name)
     metadata.setdefault("rollout_task_signature", rollout.case.task_signature)
-    experience_execution = experience_execution_from_runtime(
-        dict(rollout.metadata or {}).get("dag_runtime")
-    )
-    if experience_execution:
-        metadata["experience_execution"] = experience_execution
     return metadata
 
 
@@ -518,7 +644,12 @@ def _evaluation_message_to_request(rollout: Rollout) -> dict[str, Any]:
 
 def _evaluation_payload_json(rollout: Rollout) -> str:
     return json.dumps(
-        {"evaluation": _evaluation_payload(rollout.evaluation)},
+        {
+            "evaluation": _evaluation_payload(rollout.evaluation),
+            "experience_execution": experience_execution_from_runtime(
+                dict(rollout.metadata or {}).get("dag_runtime")
+            ),
+        },
         ensure_ascii=False,
         indent=2,
         sort_keys=True,

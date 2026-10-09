@@ -453,7 +453,10 @@ class PolicyOptimizationPipeline(Protocol):
     async def train_from_rollouts(...) -> RolloutTrainingResult: ...
 ```
 
-当前实现：`OfflinePolicyOptimizationPipeline`。
+当前实现：`OfflinePolicyOptimizationPipeline`。构造时显式传入 `snapshotter`、
+`rollout_executor` 和 `policy_trainer`；需要分阶段学习时再传入 `experience_learner`。
+本地训练的 analyze/estimate/plan/apply 组件由 `BatchPolicyTrainer` 持有；
+远端训练直接传入 `SessionCommitPolicyTrainer`，不再提供不会执行的占位组件。
 
 ## 7. PipelineContext / ExecutionContext
 

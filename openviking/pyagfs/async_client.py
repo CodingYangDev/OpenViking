@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import random
 from collections.abc import Iterator
 from typing import Any, BinaryIO, Dict, List, Union
 
 from openviking.service.task_tracker_concurrency import run_to_completion
+from openviking.storage.errors import LockAcquisitionError
 
 from .protocols import AGFSSyncClientProtocol
 
@@ -360,6 +363,58 @@ class AsyncAGFSClient:
 
     # -- pathlock async wrappers ------------------------------------------------
 
+    async def _acquire_pathlock(
+        self,
+        method_name: str,
+        fs_ctx: Dict[str, str],
+        *targets: Any,
+        timeout_secs: float,
+        owner_lease_ref: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        """Wait for contention on the event loop, leaving workers free for I/O/release."""
+        if not math.isfinite(timeout_secs) or timeout_secs < 0:
+            raise ValueError("timeout_secs must be a finite non-negative number")
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + timeout_secs
+        retry_delay = 0.1
+        while True:
+            work = asyncio.create_task(
+                self.run(method_name, fs_ctx, *targets, 0.0, owner_lease_ref)
+            )
+            try:
+                return await asyncio.shield(work)
+            except asyncio.CancelledError:
+                # A native call cannot be interrupted. Keep its result so a lease
+                # acquired during cancellation is released rather than abandoned.
+                async def finish(acquisition=work):
+                    try:
+                        lease = await acquisition
+                    except Exception:
+                        return
+                    await self.pathlock_release(lease, fs_ctx=fs_ctx)
+
+                cleanup = asyncio.create_task(finish())
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                cleanup.result()
+                raise
+            except LockAcquisitionError as exc:
+                if timeout_secs == 0:
+                    raise
+                remaining = deadline - loop.time()
+                if remaining > 0:
+                    delay = min(random.uniform(retry_delay / 2, retry_delay), remaining)
+                    await asyncio.sleep(delay)
+                    if loop.time() < deadline:
+                        retry_delay = min(retry_delay * 2, 0.5)
+                        continue
+                elapsed_ms = int((loop.time() - started) * 1000)
+                raise LockAcquisitionError(f"lock acquire timed out after {elapsed_ms}ms") from exc
+
     async def pathlock_acquire_exact(
         self,
         path: str,
@@ -369,12 +424,12 @@ class AsyncAGFSClient:
         fs_ctx: Dict[str, str] | None = None,
     ) -> Dict[str, Any]:
         """Acquire an exact lock on a single path."""
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_exact",
             _fs_ctx_or_default(path, fs_ctx),
             path,
-            timeout_secs,
-            owner_lease_ref,
+            timeout_secs=timeout_secs,
+            owner_lease_ref=owner_lease_ref,
         )
 
     async def pathlock_acquire_exact_batch(
@@ -386,12 +441,12 @@ class AsyncAGFSClient:
         fs_ctx: Dict[str, str] | None = None,
     ) -> Dict[str, Any]:
         """Acquire exact locks on multiple paths."""
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_exact_batch",
             _fs_ctx_or_default(paths[0] if paths else "/", fs_ctx),
             paths,
-            timeout_secs,
-            owner_lease_ref,
+            timeout_secs=timeout_secs,
+            owner_lease_ref=owner_lease_ref,
         )
 
     async def pathlock_acquire_tree(
@@ -403,12 +458,12 @@ class AsyncAGFSClient:
         fs_ctx: Dict[str, str] | None = None,
     ) -> Dict[str, Any]:
         """Acquire a tree lock on a single path."""
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_tree",
             _fs_ctx_or_default(path, fs_ctx),
             path,
-            timeout_secs,
-            owner_lease_ref,
+            timeout_secs=timeout_secs,
+            owner_lease_ref=owner_lease_ref,
         )
 
     async def pathlock_acquire_tree_batch(
@@ -420,12 +475,12 @@ class AsyncAGFSClient:
         fs_ctx: Dict[str, str] | None = None,
     ) -> Dict[str, Any]:
         """Acquire tree locks on multiple paths."""
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_tree_batch",
             _fs_ctx_or_default(paths[0] if paths else "/", fs_ctx),
             paths,
-            timeout_secs,
-            owner_lease_ref,
+            timeout_secs=timeout_secs,
+            owner_lease_ref=owner_lease_ref,
         )
 
     async def pathlock_acquire_exact_tree_batch(
@@ -439,13 +494,13 @@ class AsyncAGFSClient:
     ) -> Dict[str, Any]:
         """Acquire a mixed batch of exact and tree locks."""
         first = exact_paths[0] if exact_paths else (tree_paths[0] if tree_paths else "/")
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_exact_tree_batch",
             _fs_ctx_or_default(first, fs_ctx),
             exact_paths,
             tree_paths,
-            timeout_secs,
-            owner_lease_ref,
+            timeout_secs=timeout_secs,
+            owner_lease_ref=owner_lease_ref,
         )
 
     async def pathlock_acquire_batch(
@@ -466,12 +521,12 @@ class AsyncAGFSClient:
             if request.get("kind") not in {"exact", "tree"}:
                 raise ValueError("pathlock request.kind must be 'exact' or 'tree'")
         first = requests[0]["path"]
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_batch",
             _fs_ctx_or_default(first, fs_ctx),
             requests,
-            timeout_secs,
-            owner_lease_ref,
+            timeout_secs=timeout_secs,
+            owner_lease_ref=owner_lease_ref,
         )
 
     async def pathlock_as_borrowed(

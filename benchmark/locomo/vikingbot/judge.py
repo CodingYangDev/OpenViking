@@ -10,11 +10,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from progress_utils import (
-    AsyncProgressTracker,
-    format_duration,
-    make_three_state_progress,
+    ProgressTracker,
     should_show_progress,
 )
+
+from openviking.utils.progress import format_duration, make_three_state_progress
 
 # 加载本地环境变量文件
 env_file = Path.home() / ".openviking_benchmark_env"
@@ -160,7 +160,7 @@ async def main():
 
     if show_progress:
         progress, task_id = make_three_state_progress(description="Judge")
-        progress_tracker = AsyncProgressTracker(progress, task_id, total=len(ungraded))
+        progress_tracker = ProgressTracker(progress, task_id, total=len(ungraded))
     else:
         progress = None
         progress_tracker = None

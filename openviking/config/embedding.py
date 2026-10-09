@@ -25,6 +25,7 @@ from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
 @dataclass(frozen=True)
 class EmbeddingResourceStatus:
     """Read-only Account embedding state."""
@@ -165,9 +166,7 @@ class AccountEmbeddingProvider:
                     raise RuntimeError("Account embedding provider is closed")
 
             settings = await self._resolver.resolve(account_id)
-            fingerprint = hashlib.sha256(
-                settings.embedding.model_dump_json().encode()
-            ).hexdigest()
+            fingerprint = hashlib.sha256(settings.embedding.model_dump_json().encode()).hexdigest()
             with self._lock:
                 if self._closed:
                     raise RuntimeError("Account embedding provider is closed")

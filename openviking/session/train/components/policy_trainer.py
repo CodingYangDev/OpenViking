@@ -105,14 +105,17 @@ class BatchPolicyTrainer:
 
 @dataclass(slots=True)
 class StreamingPolicyTrainerConfig:
-    """Configuration for automatic streaming rollout training."""
+    """Streaming window settings and externally triggered Case-learning concurrency."""
 
     max_gradients_per_update: int = 16
     max_wait_seconds: float = 10.0
     timer_check_interval_seconds: float = 1.0
     trace_console: bool = False
+    max_concurrent_cases: int = 10
 
     def __post_init__(self) -> None:
+        if self.max_concurrent_cases <= 0:
+            raise ValueError("max_concurrent_cases must be > 0")
         if self.max_gradients_per_update <= 0:
             raise ValueError("max_gradients_per_update must be > 0")
         if self.max_wait_seconds <= 0:
@@ -140,6 +143,8 @@ class StreamingPolicyTrainer:
     ``max_gradients_per_update`` or when the oldest buffered gradient waits at
     least ``max_wait_seconds``.  If the submitting call triggers a count-based
     flush, it waits for optimizer/apply completion before returning.
+    ``train_gradients`` instead executes a caller-defined complete batch immediately,
+    without window buffering or count-based splitting.
     """
 
     policy_set: ExperienceSet
@@ -156,8 +161,10 @@ class StreamingPolicyTrainer:
     )
     _last_apply_result: PolicyApplyResult | None = field(init=False, default=None, repr=False)
     _closed: bool = field(init=False, default=False, repr=False)
+    _execution_lock: asyncio.Lock = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self._execution_lock = asyncio.Lock()
         self.context = _coerce_pipeline_context(self.context)
         self._core = PolicyTrainingEngine(
             rollout_analyzer=self.rollout_analyzer,
@@ -193,13 +200,16 @@ class StreamingPolicyTrainer:
 
         ``close`` is idempotent.  The first call cancels the background timer
         and applies any remaining buffered gradients with ``flush_reason="close"``.
-        Subsequent calls are no-ops and return ``None``.
+        Admitted explicit batches are also drained. Subsequent calls are no-ops
+        and return ``None``.
         """
 
         if self._closed:
             return None
         self._closed = True
-        return await self._batcher.close()
+        result = await self._batcher.close()
+        async with self._execution_lock:
+            return result
 
     @tracer("train.streaming_policy_trainer.submit_rollout", ignore_result=True, ignore_args=True)
     async def submit_rollout(
@@ -295,6 +305,24 @@ class StreamingPolicyTrainer:
         self._last_apply_result = result.apply_result
         return _scope_training_result_to_submitter(result, buffered)
 
+    @tracer("train.streaming_policy_trainer.train_gradients", ignore_result=True, ignore_args=True)
+    async def train_gradients(
+        self,
+        gradients: list[SemanticGradient],
+        *,
+        analyses: list[RolloutAnalysis] | None = None,
+        batch_finalizer: Callable[[RolloutTrainingResult], Awaitable[None]] | None = None,
+    ) -> RolloutTrainingResult:
+        """Execute one complete batch now, without window buffering or count-based splitting."""
+        if self._closed:
+            raise RuntimeError("StreamingPolicyTrainer is closed")
+        return await self._process_batch(
+            [_BufferedRolloutTraining(gradients=list(gradients), batch_finalizer=batch_finalizer)],
+            "explicit",
+            preserve_batch=True,
+            analyses=_unique_by_identity(analyses or []),
+        )
+
     @tracer("train.streaming_policy_trainer.train_rollouts", ignore_result=True, ignore_args=True)
     async def train_rollouts(
         self,
@@ -311,16 +339,42 @@ class StreamingPolicyTrainer:
         self,
         items: list["_BufferedRolloutTraining"],
         reason: str,
+        *,
+        preserve_batch: bool = False,
+        analyses: list[RolloutAnalysis] | None = None,
     ) -> RolloutTrainingResult:
-        chunks = _chunks_buffered_items_by_gradient_count(
-            items,
-            self.config.max_gradients_per_update,
+        # Keep one trainer's cached policy state and finalizers ordered across
+        # explicit calls and streaming flushes. Different Cases use separate trainers.
+        async with self._execution_lock:
+            return await self._train_batch(
+                items, reason, preserve_batch=preserve_batch, analyses=analyses
+            )
+
+    async def _train_batch(
+        self,
+        items: list["_BufferedRolloutTraining"],
+        reason: str,
+        *,
+        preserve_batch: bool,
+        analyses: list[RolloutAnalysis] | None,
+    ) -> RolloutTrainingResult:
+        chunks = (
+            [_BufferedRolloutTrainingChunk([g for item in items for g in item.gradients])]
+            if preserve_batch
+            else _chunks_buffered_items_by_gradient_count(
+                items, self.config.max_gradients_per_update
+            )
         )
         gradients = [gradient for chunk in chunks for gradient in chunk.gradients]
-        analyses = _unique_by_identity(
-            [item.analysis for item in items if item.analysis is not None]
+        if analyses is None:
+            analyses = _unique_by_identity(
+                [item.analysis for item in items if item.analysis is not None]
+            )
+        rollouts = _unique_by_identity(
+            [analysis.rollout for analysis in analyses if analysis.rollout is not None]
+            if preserve_batch
+            else [item.rollout for item in items if item.rollout is not None]
         )
-        rollouts = _unique_by_identity([item.rollout for item in items if item.rollout is not None])
         tracer.info(
             "StreamingPolicyTrainer flush started "
             f"reason={reason} "
@@ -358,8 +412,12 @@ class StreamingPolicyTrainer:
                 console=self.config.trace_console,
             )
 
-        plan = _combine_update_plans(plans)
-        apply_result = _combine_apply_results(apply_results, fallback_policy_set=self.policy_set)
+        plan = plans[0] if preserve_batch else _combine_update_plans(plans)
+        apply_result = (
+            apply_results[0]
+            if preserve_batch
+            else _combine_apply_results(apply_results, fallback_policy_set=self.policy_set)
+        )
         self.policy_set = apply_result.updated_policy_set
         self._last_apply_result = apply_result
         chunk_gradient_counts = [len(chunk.gradients) for chunk in chunks]
@@ -376,7 +434,7 @@ class StreamingPolicyTrainer:
                 "chunk_count": len(chunk_gradient_counts),
                 "chunk_gradient_counts": chunk_gradient_counts,
                 "score": average_score(analyses),
-                "source": "streaming_rollouts",
+                "source": "explicit_gradients" if preserve_batch else "streaming_rollouts",
                 "flush_reason": reason,
             },
         )
@@ -555,6 +613,10 @@ def _plan_item_belongs_to_sessions(
         return False
     if case_name and item.memory_type == "experiences" and item.target_name != case_name:
         return False
+    patch_metadata = getattr(item, "metadata", {}).get("patch_metadata", {})
+    for source in patch_metadata.get("source_sessions", []):
+        if isinstance(source, dict) and str(source.get("source_session_uri") or "") in session_uris:
+            return True
     for link in getattr(item, "links", []) or []:
         try:
             if hasattr(link, "to_uri"):

@@ -344,6 +344,8 @@ class MemoryFile(BaseModel):
 
 
 class ResolvedOperation(BaseModel):
+    # SDK create intent, never a model-writable field or persisted memory metadata.
+    create_only: bool = Field(default=False, exclude=True)
     old_memory_file_content: Optional[MemoryFile] = None
     memory_fields: Dict
     memory_type: str  # The memory type (e.g., 'tools', 'skills', 'events')

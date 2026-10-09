@@ -1,11 +1,16 @@
 """Tests for LoCoMo benchmark progress utilities."""
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 from rich.progress import ProgressColumn
 
 from benchmark.locomo.vikingbot.progress_utils import (
-    AsyncProgressTracker,
+    ProgressTracker,
+)
+from openviking.utils.progress import (
     ProgressSummaryColumn,
-    ThreadSafeProgressTracker,
     ThreeStateBarColumn,
     make_three_state_progress,
 )
@@ -52,7 +57,7 @@ def test_progress_summary_shows_failed_only_when_non_zero():
 
 def test_locomo_progress_tracker_records_failed_jobs():
     progress, task_id = make_three_state_progress(description="Test", transient=True)
-    tracker = ThreadSafeProgressTracker(progress, task_id, total=2)
+    tracker = ProgressTracker(progress, task_id, total=2)
 
     tracker.job_started()
     tracker.job_finished()
@@ -67,16 +72,36 @@ def test_locomo_progress_tracker_records_failed_jobs():
     assert task.fields["failed"] == 1
 
 
-def test_async_progress_tracker_records_failed_jobs():
+def test_progress_tracker_counts_concurrent_threads():
     progress, task_id = make_three_state_progress(description="Test", transient=True)
-    tracker = AsyncProgressTracker(progress, task_id, total=2)
+    tracker = ProgressTracker(progress, task_id, total=100)
 
-    tracker.job_started()
-    tracker.job_finished(failed=True)
+    def run_job(index):
+        tracker.job_started()
+        tracker.job_finished(failed=index % 4 == 0)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(run_job, range(100)))
 
     task = progress.tasks[0]
-    assert tracker.done == 1
-    assert tracker.failed == 1
-    assert task.completed == 1
-    assert task.fields["succeeded"] == 0
-    assert task.fields["failed"] == 1
+    assert (tracker.done, tracker.running, tracker.failed) == (100, 0, 25)
+    assert task.completed == 100
+    assert task.fields["succeeded"] == 75
+
+
+@pytest.mark.asyncio
+async def test_progress_tracker_counts_concurrent_async_tasks():
+    progress, task_id = make_three_state_progress(description="Test", transient=True)
+    tracker = ProgressTracker(progress, task_id, total=20)
+
+    async def run_job(index):
+        tracker.job_started()
+        await asyncio.sleep(0)
+        tracker.job_finished(failed=index % 4 == 0)
+
+    await asyncio.gather(*(run_job(index) for index in range(20)))
+
+    task = progress.tasks[0]
+    assert (tracker.done, tracker.running, tracker.failed) == (20, 0, 5)
+    assert task.completed == 20
+    assert task.fields["succeeded"] == 15

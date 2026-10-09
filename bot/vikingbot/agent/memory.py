@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from vikingbot.config.loader import load_config
-from vikingbot.openviking_mount.ov_server import VikingClient
+from vikingbot.openviking_mount.ov_server import (
+    VikingClient,
+    extract_memories,
+)
 from vikingbot.utils.helpers import ensure_dir
 
 if TYPE_CHECKING:
@@ -127,18 +130,6 @@ class MemoryStore:
     @classmethod
     def _limit_memories(cls, result: list[Any], limit: int) -> list[Any]:
         return sorted(result, key=cls._get_score, reverse=True)[:limit]
-
-    @staticmethod
-    def _extract_memories(result: Any) -> list[Any]:
-        if not result:
-            return []
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict):
-            memories = result.get("memories")
-            return memories if isinstance(memories, list) else []
-        memories = getattr(result, "memories", None)
-        return memories if isinstance(memories, list) else []
 
     @classmethod
     def _dedupe_memories(cls, memories: list[Any]) -> list[Any]:
@@ -463,7 +454,7 @@ class MemoryStore:
                 except Exception as e:
                     logger.warning(f"Failed to search {target_uri}: {e}")
                     continue
-                type_memories.extend(self._extract_memories(result))
+                type_memories.extend(extract_memories(result))
             type_memories = self._limit_memories(self._dedupe_memories(type_memories), quota)
             all_memories.extend(
                 self._with_recall_metadata(memory, memory_type, rank)
@@ -900,7 +891,7 @@ class MemoryStore:
             except Exception as exc:
                 logger.warning(f"[READ_CASE_MEMORY]: exact lookup candidate search error. {exc}")
                 continue
-            for memory in self._extract_memories(result):
+            for memory in extract_memories(result):
                 uri = self._get_uri(memory)
                 if not uri or uri in seen:
                     continue

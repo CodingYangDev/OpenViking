@@ -3,7 +3,6 @@
 """OpenAI VLM backend implementation"""
 
 import base64
-import json
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -15,7 +14,7 @@ from openviking.models.network import (
     create_optional_async_httpx_client,
     create_optional_sync_httpx_client,
 )
-from openviking.telemetry import tracer
+from openviking.telemetry import get_current_telemetry_stage, tracer
 from openviking.utils.async_client_cache import LoopScopedAsyncClientCache
 from openviking.utils.message_format import format_messages, sanitize_openai_messages
 from openviking.utils.multimodal import redact_image_data_urls
@@ -28,7 +27,7 @@ except ImportError:
 
 from openviking.utils.model_retry import retry_async, retry_sync
 
-from ..base import ToolCall, VLMBase, VLMResponse
+from ..base import VLMBase, VLMResponse
 from ..registry import DEFAULT_AZURE_API_VERSION
 
 logger = get_logger(__name__)
@@ -226,20 +225,6 @@ class OpenAIVLM(VLMBase):
             )
         return
 
-    def _parse_tool_calls(self, message) -> List[ToolCall]:
-        """Parse tool calls from OpenAI response message."""
-        tool_calls = []
-        if hasattr(message, "tool_calls") and message.tool_calls:
-            for tc in message.tool_calls:
-                args = tc.function.arguments
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {"raw": args}
-                tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
-        return tool_calls
-
     def _build_vlm_response(self, response, has_tools: bool) -> Union[str, VLMResponse]:
         """Build response from OpenAI response. Returns str or VLMResponse based on has_tools."""
         if isinstance(response, str):
@@ -247,22 +232,17 @@ class OpenAIVLM(VLMBase):
 
         choice = response.choices[0]
         message = choice.message
-        tracer.info(f"result={message.content}")
+        if get_current_telemetry_stage() != "memory_extract":
+            tracer.info(f"result={message.content}")
         if has_tools:
-            usage = {}
-            if hasattr(response, "usage") and response.usage:
-                usage = {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                    "prompt_tokens_details": getattr(response.usage, "prompt_tokens_details", None),
-                }
+            usage = self._response_usage(response)
 
             return VLMResponse(
                 content=message.content,
                 tool_calls=self._parse_tool_calls(message),
                 finish_reason=choice.finish_reason or "stop",
                 usage=usage,
+                server_request_id=getattr(response, "_request_id", None),
             )
         return message.content or ""
 

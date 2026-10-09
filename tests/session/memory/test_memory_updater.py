@@ -798,13 +798,15 @@ class TestMemoryUpdater:
             description="experience memory",
             directory="viking://user/{{ user_space }}/memories/experiences",
             filename_template="{{ experience_name }}.md",
-            fields=[],
+            fields=[
+                MemoryField(name="content", field_type=FieldType.STRING, merge_op=MergeOp.PATCH)
+            ],
             overview_template="overview",
         )
         registry = MagicMock()
         registry.get.return_value = schema
 
-        updater = MemoryUpdater(registry=registry)
+        updater = MemoryUpdater(registry=registry, transaction_handle="test-lease")
         updater._vectorize_memories = AsyncMock()
         updater.generate_overview = AsyncMock()
 
@@ -813,7 +815,13 @@ class TestMemoryUpdater:
         async def mock_read_file(uri, **kwargs):
             if uri == deleted_uri:
                 raise AssertionError("deleted URI should not be read")
-            return MemoryFileUtils.write(MemoryFile(uri=uri, content="new content"))
+            return MemoryFileUtils.write(
+                MemoryFile(
+                    uri=uri,
+                    memory_type="experiences",
+                    content='dag = workflow("review")\nr = tell("new content")',
+                )
+            )
 
         mock_viking_fs.read_file = AsyncMock(side_effect=mock_read_file)
         mock_viking_fs.write_file = AsyncMock()

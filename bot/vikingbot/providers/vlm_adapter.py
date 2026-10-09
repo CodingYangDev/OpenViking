@@ -7,16 +7,27 @@ configuration semantics are consistent with openviking server's vlm section.
 
 import asyncio
 import json
+import random
 import re
 import time
 import traceback
+import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
+import httpcore
+import httpx
 from loguru import logger
 
 from openviking.models.vlm.backends.volcengine_vlm import build_volcengine_request_headers
-from openviking.utils.model_retry import is_retryable_rate_limit_error, rate_limit_retry_delay
+from openviking.utils.exceptions import AllCredentialsFailedError
+from openviking.utils.model_retry import (
+    is_retryable_rate_limit_error,
+    is_retryable_timeout_error,
+    rate_limit_retry_delay,
+)
 from openviking.utils.multimodal import redact_image_data_urls
 from vikingbot.integrations.langfuse import LangfuseClient
 from vikingbot.providers.base import (
@@ -29,6 +40,9 @@ from vikingbot.providers.base import (
     stream_delta_value,
 )
 from vikingbot.utils.tracing import get_current_response_id
+
+_STREAM_SLOW_SECONDS = 60.0
+_STREAM_PROGRESS_INTERVAL_SECONDS = 300.0
 
 _MAX_ERROR_LOG_VALUE_CHARS = 4096
 _MAX_ERROR_LOG_ITEMS = 50
@@ -88,6 +102,61 @@ def _exception_chain(error: BaseException) -> list[BaseException]:
             current, "__context__"
         )
     return chain
+
+
+def _model_exception_chain(error: BaseException) -> list[BaseException]:
+    pending = _exception_chain(error)
+    seen: set[int] = set()
+    chain: list[BaseException] = []
+    while pending:
+        exc = pending.pop()
+        if id(exc) in seen:
+            continue
+        seen.add(id(exc))
+        chain.append(exc)
+        if isinstance(exc, AllCredentialsFailedError):
+            for _, _, cause, _ in exc.errors:
+                pending.extend(_exception_chain(cause))
+    return chain
+
+
+def _stream_transport_error_types(error: BaseException) -> set[str]:
+    """Recognize the existing retryable connect/read causes, including failover errors."""
+    kinds: set[str] = set()
+    for exc in _model_exception_chain(error):
+        if isinstance(exc, (httpx.ConnectError, httpcore.ConnectError)):
+            kinds.add("connect")
+        elif isinstance(exc, (httpx.ReadError, httpcore.ReadError)):
+            kinds.add("read")
+    return kinds
+
+
+def _chat_retry_error_types(error: BaseException) -> set[str]:
+    """Allow known transient failures when no partial response has been delivered."""
+    status = _safe_exception_attribute(error, "status_code")
+    if isinstance(status, int) and 400 <= status < 500 and status != 429:
+        return set()
+    kinds = _stream_transport_error_types(error)
+    for exc in _model_exception_chain(error):
+        if is_retryable_rate_limit_error(exc):
+            kinds.add("rate_limit")
+        if is_retryable_timeout_error(exc):
+            kinds.add("timeout")
+        body = _safe_exception_attribute(exc, "body")
+        details = body.get("error", body) if isinstance(body, dict) else {}
+        if not isinstance(details, dict):
+            details = {}
+        codes = (
+            _safe_exception_attribute(exc, "code"),
+            _safe_exception_attribute(exc, "type"),
+            details.get("code"),
+            details.get("type"),
+        )
+        if _safe_exception_attribute(exc, "status_code") == 500 or any(
+            value in ("InternalServiceError", "InternalServerError") for value in codes
+        ):
+            kinds.add("service")
+    return kinds
 
 
 def _redact_error_text(value: str) -> str:
@@ -228,6 +297,159 @@ def _exception_log_details(error: BaseException) -> dict[str, str]:
     }
 
 
+@dataclass(slots=True)
+class _ModelCallDiagnostics:
+    """Request-local metadata only; never retain prompts, chunks, or argument contents."""
+
+    session_id: str | None
+    model: str
+    operation: str = "chat_stream"
+    logical_request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    started_at: float = field(default_factory=lambda: time.perf_counter())
+    phase: str = "preparing"
+    attempt_count: int = 0
+    attempt_started_at: float | None = None
+    client_request_id: str | None = None
+    server_request_id: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    response_chars: int | None = None
+    response_received_at: float | None = None
+    first_chunk_at: float | None = None
+    last_chunk_at: float | None = None
+    sdk_chunk_count: int = 0
+    total_sdk_chunk_count: int = 0
+    finish_reason: str | None = None
+    tool_argument_chars: int = 0
+    retry_count: int = 0
+    retry_counts: dict[str, int] = field(
+        default_factory=lambda: {"connect": 0, "read": 0, "rate_limit": 0}
+    )
+    backoff_seconds: float = 0.0
+    backoff_started_at: float | None = None
+    last_error_type: str | None = None
+    _timer: asyncio.TimerHandle | None = None
+
+    def start(self) -> None:
+        self._timer = asyncio.get_running_loop().call_later(
+            _STREAM_SLOW_SECONDS, self._report_pending
+        )
+
+    def _report_pending(self) -> None:
+        self.log("pending")
+        self._timer = asyncio.get_running_loop().call_later(
+            _STREAM_PROGRESS_INTERVAL_SECONDS, self._report_pending
+        )
+
+    def finish(self, outcome: str) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+        if outcome != "success" or time.perf_counter() - self.started_at >= _STREAM_SLOW_SECONDS:
+            self.log(outcome)
+
+    def begin_attempt(self, model: str, headers: Any) -> None:
+        self.attempt_count += 1
+        self.attempt_started_at = time.perf_counter()
+        self.model = model
+        self.phase = "waiting_response"
+        self.client_request_id = _first_header_value(
+            httpx.Headers(headers or {}), ("x-client-request-id",)
+        )
+        self.server_request_id = None
+        self.prompt_tokens = None
+        self.completion_tokens = None
+        self.reasoning_tokens = None
+        self.response_chars = None
+        self.response_received_at = None
+        self.first_chunk_at = None
+        self.last_chunk_at = None
+        self.sdk_chunk_count = 0
+        self.finish_reason = None
+        self.tool_argument_chars = 0
+
+    def record_response(self, response: LLMResponse) -> None:
+        usage = response.usage if isinstance(response.usage, dict) else {}
+        for name in ("prompt_tokens", "completion_tokens", "reasoning_tokens"):
+            value = usage.get(name)
+            # Missing usage is unknown, not zero; do not estimate or log arbitrary values.
+            setattr(self, name, value if type(value) is int and value >= 0 else None)
+        content = response.content
+        self.response_chars = (
+            len(content.strip()) if isinstance(content, str) else 0 if content is None else None
+        )
+
+    def received_chunk(self) -> None:
+        now = time.perf_counter()
+        if self.first_chunk_at is None:
+            self.first_chunk_at = now
+        self.last_chunk_at = now
+        self.sdk_chunk_count += 1
+        self.total_sdk_chunk_count += 1
+
+    def log(self, outcome: str) -> None:
+        now = time.perf_counter()
+        attempt_start = self.attempt_started_at
+        backoff = self.backoff_seconds
+        if self.backoff_started_at is not None:
+            backoff += now - self.backoff_started_at
+        data = {
+            "outcome": outcome,
+            "session_id": self.session_id,
+            "logical_request_id": self.logical_request_id,
+            "client_request_id": self.client_request_id,
+            "server_request_id": self.server_request_id,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "response_chars": self.response_chars,
+            "model": self.model,
+            "phase": self.phase,
+            "elapsed_s": round(now - self.started_at, 3),
+            "attempt_count": self.attempt_count,
+            "attempt_elapsed_s": (
+                round(now - attempt_start, 3) if attempt_start is not None else None
+            ),
+            "response_after_s": (
+                round(self.response_received_at - attempt_start, 3)
+                if self.response_received_at is not None and attempt_start is not None
+                else None
+            ),
+            "first_chunk_after_s": (
+                round(self.first_chunk_at - attempt_start, 3)
+                if self.first_chunk_at is not None and attempt_start is not None
+                else None
+            ),
+            "last_chunk_age_s": (
+                round(now - self.last_chunk_at, 3) if self.last_chunk_at is not None else None
+            ),
+            "sdk_chunk_count": self.sdk_chunk_count,
+            "total_sdk_chunk_count": self.total_sdk_chunk_count,
+            "finish_reason": self.finish_reason,
+            "tool_argument_chars": self.tool_argument_chars,
+            "retry_count": self.retry_count,
+            # Counts are retry cycles containing each cause; mixed credential causes can overlap.
+            "retry_counts": self.retry_counts,
+            "backoff_s": round(backoff, 3),
+            "last_error_type": self.last_error_type,
+        }
+        if self.operation == "chat":
+            # A provider call may have its own finite SDK/backend retries. Do not
+            # label this count as HTTP attempts or invent streaming progress.
+            data["attempt_scope"] = "provider_call"
+            for key in (
+                "first_chunk_after_s",
+                "last_chunk_age_s",
+                "sdk_chunk_count",
+                "total_sdk_chunk_count",
+                "tool_argument_chars",
+            ):
+                data.pop(key)
+            logger.warning("[LLM_CHAT_DIAGNOSTIC] {}", _render_error_log_value(data))
+        else:
+            logger.warning("[LLM_STREAM_DIAGNOSTIC] {}", _render_error_log_value(data))
+
+
 class VLMProviderAdapter(LLMProvider):
     """Adapter that wraps an openviking VLMBase instance as an LLMProvider.
 
@@ -259,6 +481,10 @@ class VLMProviderAdapter(LLMProvider):
         session_id: str | None = None,
     ) -> LLMResponse:
         effective_model = model or self._default_model
+        diagnostics = _ModelCallDiagnostics(session_id, effective_model, operation="chat")
+        diagnostics.retry_counts.update(service=0, timeout=0)
+        diagnostics.start()
+        outcome = "cancelled"
 
         # --- Langfuse: start observation ---
         langfuse_observation = None
@@ -283,11 +509,13 @@ class VLMProviderAdapter(LLMProvider):
                         )
 
             # --- Call VLM backend ---
-            attempt = 1
+            rate_limit_attempt = 1
+            transient_delay = 0.5
             # An explicit empty list asks VLM backends for a structured response
             # without exposing tools, so per-response usage is preserved.
             response_tools = tools if tools is not None else []
             while True:
+                diagnostics.begin_attempt(effective_model, None)
                 try:
                     result = await self._vlm.get_completion_async(
                         messages=messages,
@@ -297,34 +525,65 @@ class VLMProviderAdapter(LLMProvider):
                     )
                     break
                 except Exception as e:
-                    if not is_retryable_rate_limit_error(e):
-                        raise
-                    delay = rate_limit_retry_delay(attempt)
-                    logger.warning(
-                        "VLM adapter chat rate limited; retrying attempt={} delay={:.1f}s error={}",
-                        attempt,
-                        delay,
-                        e,
+                    diagnostics.last_error_type = type(e).__name__
+                    chain = _exception_chain(e)
+                    request = _first_exception_attribute(chain, "request")
+                    response = _first_exception_attribute(chain, "response")
+                    diagnostics.client_request_id = _first_header_value(
+                        _safe_exception_attribute(request, "headers"), ("x-client-request-id",)
                     )
-                    await asyncio.sleep(delay)
-                    attempt += 1
+                    diagnostics.server_request_id = _first_header_value(
+                        _safe_exception_attribute(response, "headers"), _SERVER_REQUEST_ID_HEADERS
+                    )
+                    kinds = _chat_retry_error_types(e)
+                    if not kinds:
+                        raise
+                    if "rate_limit" in kinds:
+                        delay = rate_limit_retry_delay(rate_limit_attempt)
+                        rate_limit_attempt += 1
+                    else:
+                        delay = random.uniform(transient_delay / 2, transient_delay)
+                        transient_delay = min(30.0, transient_delay * 2)
+                    diagnostics.retry_count += 1
+                    for kind in kinds:
+                        diagnostics.retry_counts[kind] += 1
+                    diagnostics.phase = "backoff"
+                    diagnostics.backoff_started_at = time.perf_counter()
+                    try:
+                        await asyncio.sleep(delay)
+                    finally:
+                        diagnostics.backoff_seconds += (
+                            time.perf_counter() - diagnostics.backoff_started_at
+                        )
+                        diagnostics.backoff_started_at = None
 
+            diagnostics.response_received_at = time.perf_counter()
             llm_response = self._convert_response(result)
+            diagnostics.record_response(llm_response)
+            diagnostics.client_request_id = getattr(result, "client_request_id", None)
+            diagnostics.server_request_id = getattr(result, "server_request_id", None)
+            diagnostics.finish_reason = llm_response.finish_reason
+            diagnostics.phase = "completed"
 
             # --- Langfuse: end observation ---
             if langfuse_observation:
                 self._end_langfuse_observation(langfuse_observation, llm_response)
 
+            outcome = "failed" if llm_response.finish_reason == "error" else "success"
             return llm_response
 
         except Exception as e:
+            outcome = "failed"
+            diagnostics.last_error_type = type(e).__name__
             if langfuse_observation:
                 self._end_langfuse_observation_error(langfuse_observation, e)
             self._log_request_exception("chat", e, model=effective_model)
             return LLMResponse(
-                content=f"Error calling LLM in VLM Adapter: {str(e)}",
+                content=f"Error calling LLM in VLM Adapter: {_redact_error_text(str(e))}",
                 finish_reason="error",
             )
+        finally:
+            diagnostics.finish(outcome)
 
     async def chat_stream(
         self,
@@ -347,20 +606,12 @@ class VLMProviderAdapter(LLMProvider):
                 yield event
             return
 
+        diagnostics = _ModelCallDiagnostics(
+            session_id=session_id, model=model or self._default_model
+        )
+        diagnostics.start()
+        outcome = "cancelled"
         try:
-            stream_with_failover = getattr(self._vlm, "stream_with_failover", None)
-            if callable(stream_with_failover):
-                async for event in self._chat_stream_failover_with_retry(
-                    stream_with_failover,
-                    messages=messages,
-                    tools=tools,
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                ):
-                    yield event
-                return
-
             async for event in self._chat_stream_with_retry(
                 self._vlm,
                 messages=messages,
@@ -368,9 +619,13 @@ class VLMProviderAdapter(LLMProvider):
                 model=model,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                diagnostics=diagnostics,
             ):
                 yield event
+            outcome = "success"
         except Exception as exc:
+            outcome = "failed"
+            diagnostics.last_error_type = type(exc).__name__
             self._log_request_exception("chat_stream", exc, model=model or self._default_model)
             yield LLMStreamEvent(
                 type="response",
@@ -379,6 +634,8 @@ class VLMProviderAdapter(LLMProvider):
                     finish_reason="error",
                 ),
             )
+        finally:
+            diagnostics.finish(outcome)
 
     def _log_request_exception(
         self,
@@ -425,47 +682,6 @@ class VLMProviderAdapter(LLMProvider):
             getattr(vlm, "get_async_client", None)
         )
 
-    async def _chat_stream_failover_with_retry(
-        self,
-        stream_with_failover: Any,
-        *,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
-        model: str | None,
-        max_tokens: int | None,
-        temperature: float,
-    ) -> AsyncIterator[LLMStreamEvent]:
-        attempt = 1
-        while True:
-            emitted = False
-            try:
-                async for event in stream_with_failover(
-                    lambda vlm: self._chat_stream_backend(
-                        vlm,
-                        messages=messages,
-                        tools=tools,
-                        model=model,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                    )
-                ):
-                    emitted = True
-                    yield event
-                return
-            except Exception as exc:
-                if emitted or not is_retryable_rate_limit_error(exc):
-                    raise
-                delay = rate_limit_retry_delay(attempt)
-                logger.warning(
-                    "VLM credential stream rate limited; retrying attempt={} "
-                    "delay={:.1f}s error={}",
-                    attempt,
-                    delay,
-                    exc,
-                )
-                await asyncio.sleep(delay)
-                attempt += 1
-
     async def _chat_stream_with_retry(
         self,
         vlm: Any,
@@ -474,34 +690,65 @@ class VLMProviderAdapter(LLMProvider):
         model: str | None,
         max_tokens: int | None,
         temperature: float,
+        diagnostics: _ModelCallDiagnostics,
     ) -> AsyncIterator[LLMStreamEvent]:
-        attempt = 1
+        stream_backend = partial(
+            self._chat_stream_backend,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            diagnostics=diagnostics,
+        )
+        stream_with_failover = getattr(vlm, "stream_with_failover", None)
+        use_failover = callable(stream_with_failover)
+        rate_limit_attempt = 1
+        transport_delay = 0.5
         while True:
             emitted = False
             try:
-                async for event in self._chat_stream_backend(
-                    vlm,
-                    messages=messages,
-                    tools=tools,
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                ):
+                stream = (
+                    stream_with_failover(stream_backend) if use_failover else stream_backend(vlm)
+                )
+                async for event in stream:
                     emitted = True
                     yield event
                 return
             except Exception as exc:
-                if emitted or not is_retryable_rate_limit_error(exc):
+                diagnostics.last_error_type = type(exc).__name__
+                if emitted:
                     raise
-                delay = rate_limit_retry_delay(attempt)
-                logger.warning(
-                    "VLM adapter stream rate limited; retrying attempt={} delay={:.1f}s error={}",
-                    attempt,
-                    delay,
-                    exc,
-                )
-                await asyncio.sleep(delay)
-                attempt += 1
+                retry_kinds = _stream_transport_error_types(exc)
+                if retry_kinds:
+                    # Capped state avoids exponent overflow during unlimited retries.
+                    delay = random.uniform(transport_delay / 2, transport_delay)
+                    transport_delay = min(30.0, transport_delay * 2)
+                elif is_retryable_rate_limit_error(exc):
+                    retry_kinds = {"rate_limit"}
+                    delay = rate_limit_retry_delay(rate_limit_attempt)
+                    logger.warning(
+                        "VLM {} stream rate limited; retrying attempt={} delay={:.1f}s error={}",
+                        "credential" if use_failover else "adapter",
+                        rate_limit_attempt,
+                        delay,
+                        exc,
+                    )
+                    rate_limit_attempt += 1
+                else:
+                    raise
+                diagnostics.retry_count += 1
+                for kind in retry_kinds:
+                    diagnostics.retry_counts[kind] += 1
+                diagnostics.phase = "backoff"
+                diagnostics.backoff_started_at = time.perf_counter()
+                try:
+                    await asyncio.sleep(delay)
+                finally:
+                    diagnostics.backoff_seconds += (
+                        time.perf_counter() - diagnostics.backoff_started_at
+                    )
+                    diagnostics.backoff_started_at = None
 
     async def _chat_stream_backend(
         self,
@@ -512,6 +759,7 @@ class VLMProviderAdapter(LLMProvider):
         model: str | None,
         max_tokens: int | None,
         temperature: float,
+        diagnostics: _ModelCallDiagnostics,
     ) -> AsyncIterator[LLMStreamEvent]:
         kwargs = self._build_stream_kwargs(
             vlm,
@@ -528,9 +776,17 @@ class VLMProviderAdapter(LLMProvider):
         usage: dict[str, int] = {}
         start_time = time.perf_counter()
 
+        diagnostics.begin_attempt(kwargs["model"], kwargs.get("extra_headers"))
         client = vlm.get_async_client()
         response = await client.chat.completions.create(**kwargs)
+        diagnostics.response_received_at = time.perf_counter()
+        diagnostics.server_request_id = _first_header_value(
+            _safe_exception_attribute(_safe_exception_attribute(response, "response"), "headers"),
+            _SERVER_REQUEST_ID_HEADERS,
+        )
+        diagnostics.phase = "reading_stream"
         async for chunk in response:
+            diagnostics.received_chunk()
             chunk_usage = self._parse_usage(getattr(chunk, "usage", None))
             if chunk_usage:
                 usage = chunk_usage
@@ -541,6 +797,8 @@ class VLMProviderAdapter(LLMProvider):
             choice = choices[0]
             if getattr(choice, "finish_reason", None):
                 finish_reason = choice.finish_reason or finish_reason
+                diagnostics.finish_reason = finish_reason
+                diagnostics.phase = "waiting_stream_end"
             delta = getattr(choice, "delta", None)
             if delta is None:
                 continue
@@ -548,12 +806,20 @@ class VLMProviderAdapter(LLMProvider):
             reasoning_delta = stream_delta_value(delta, "reasoning_content")
             if reasoning_delta:
                 reasoning_parts.append(reasoning_delta)
+                diagnostics.phase = "delivering"
                 yield LLMStreamEvent(type="reasoning_delta", content=reasoning_delta)
+                diagnostics.phase = (
+                    "waiting_stream_end" if diagnostics.finish_reason else "reading_stream"
+                )
 
             content_delta = stream_delta_value(delta, "content")
             if content_delta:
                 content_parts.append(content_delta)
+                diagnostics.phase = "delivering"
                 yield LLMStreamEvent(type="content_delta", content=content_delta)
+                diagnostics.phase = (
+                    "waiting_stream_end" if diagnostics.finish_reason else "reading_stream"
+                )
 
             for fallback_index, delta_tool_call in enumerate(
                 getattr(delta, "tool_calls", None) or []
@@ -563,20 +829,24 @@ class VLMProviderAdapter(LLMProvider):
                     delta_tool_call,
                     fallback_index=fallback_index,
                 )
+                diagnostics.tool_argument_chars += len(
+                    stream_delta_value(getattr(delta_tool_call, "function", None), "arguments")
+                )
 
         if usage:
             self._record_vlm_usage(vlm, usage, time.perf_counter() - start_time)
 
-        yield LLMStreamEvent(
-            type="response",
-            response=build_stream_response(
-                content="".join(content_parts),
-                reasoning_content="".join(reasoning_parts),
-                raw_tool_calls=tool_calls,
-                finish_reason=finish_reason,
-                usage=usage,
-            ),
+        diagnostics.phase = "delivering"
+        llm_response = build_stream_response(
+            content="".join(content_parts),
+            reasoning_content="".join(reasoning_parts),
+            raw_tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
         )
+        diagnostics.record_response(llm_response)
+        yield LLMStreamEvent(type="response", response=llm_response)
+        diagnostics.phase = "completed"
 
     def _build_stream_kwargs(
         self,
@@ -647,11 +917,15 @@ class VLMProviderAdapter(LLMProvider):
         if not raw_usage:
             return {}
 
-        usage = {
-            "prompt_tokens": cls._usage_value(raw_usage, "prompt_tokens"),
-            "completion_tokens": cls._usage_value(raw_usage, "completion_tokens"),
-            "total_tokens": cls._usage_value(raw_usage, "total_tokens"),
-        }
+        usage = {}
+        for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = (
+                raw_usage.get(name)
+                if isinstance(raw_usage, dict)
+                else getattr(raw_usage, name, None)
+            )
+            if value is not None:
+                usage[name] = int(value)
         prompt_details = (
             raw_usage.get("prompt_tokens_details")
             if isinstance(raw_usage, dict)
@@ -664,12 +938,14 @@ class VLMProviderAdapter(LLMProvider):
         )
         cached = cls._usage_value(prompt_details, "cached_tokens") if prompt_details else 0
         reasoning = (
-            cls._usage_value(completion_details, "reasoning_tokens") if completion_details else 0
+            completion_details.get("reasoning_tokens")
+            if isinstance(completion_details, dict)
+            else getattr(completion_details, "reasoning_tokens", None)
         )
         if cached:
             usage["cache_read_input_tokens"] = cached
-        if reasoning:
-            usage["reasoning_tokens"] = reasoning
+        if reasoning is not None:
+            usage["reasoning_tokens"] = int(reasoning)
         return usage
 
     def _record_vlm_usage(

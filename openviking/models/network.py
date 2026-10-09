@@ -100,8 +100,7 @@ def _adapter_for(url: str) -> ModelNetworkAdapter | None:
                 "Model service discovery URL requires a registered model network adapter"
             )
         raise RuntimeError(
-            f"Registered model network adapter does not support URL scheme "
-            f"'{urlparse(url).scheme}'"
+            f"Registered model network adapter does not support URL scheme '{urlparse(url).scheme}'"
         )
     return None
 

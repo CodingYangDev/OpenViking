@@ -413,7 +413,7 @@ class OpenVikingPostCallHook(Hook):
                 match = re.search(r"^---\s*\nname:\s*(.+?)\s*\n", result_text, re.MULTILINE)
                 if match:
                     skill_name = match.group(1).strip()
-                    if skill_name == "experience_loader":
+                    if skill_name in {"experience_loader", "advice_loader"}:
                         return {"tool_name": tool_name, "params": params, "result": result}
                     desc_match = re.search(r"^description:\s*(.+)$", result_text, re.MULTILINE)
                     skill_query = desc_match.group(1).strip() if desc_match else skill_name

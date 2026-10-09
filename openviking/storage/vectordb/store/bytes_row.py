@@ -159,9 +159,7 @@ class _PyBytesRow:
                 bytes_item = value.encode("utf-8")
                 bytes_item_len = len(bytes_item)
                 if bytes_item_len > STRING_MAX_UINT16_LENGTH:
-                    raise ValueError(
-                        f"string field '{field_meta.name}' exceeds 65535 bytes"
-                    )
+                    raise ValueError(f"string field '{field_meta.name}' exceeds 65535 bytes")
                 var_fmt_list.append("H")
                 var_val_list.append(bytes_item_len)
                 variable_region_offset += UINT16_SIZE

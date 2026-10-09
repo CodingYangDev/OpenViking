@@ -241,7 +241,9 @@ class StructuredVLM:
         """Async version of complete_model."""
         effective_thinking = self._get_vlm().thinking if thinking is None else thinking
         schema = model_class.model_json_schema()
-        response = await self.complete_json_async(prompt, schema=schema, thinking=effective_thinking)
+        response = await self.complete_json_async(
+            prompt, schema=schema, thinking=effective_thinking
+        )
         if response is None:
             return None
 

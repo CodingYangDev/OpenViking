@@ -51,7 +51,7 @@ description: |
      - The required Markdown shape is one H1 per participant followed directly by bullets;
        H2/H3 headings and prose paragraphs are forbidden.
      - If the existing content has extra headings or non-profile content, rewrite the
-       COMPLETE content with obj.content.update(...), rather than preserving the old layout
+       COMPLETE content with obj.content.overwrite(...), rather than preserving the old layout
        through many small edits.
      - Remove events, experiences, goals, plans, preferences, personality judgments, entity
        details, temporary states, role-play, unsupported claims, duplicate/paraphrased bullets,
@@ -103,7 +103,7 @@ fields:
       JSON, prose paragraphs, category labels, event timelines, historical narratives,
       goals/plans, preferences, personality judgments, entity details, or temporary states.
 
-      If existing content violates this schema, use obj.content.update(...) to replace the
+      If existing content violates this schema, use obj.content.overwrite(...) to replace the
       COMPLETE field with a normalized version. Preserve all untouched valid current-state
       facts, but delete non-profile content, merge semantic duplicates, and replace stale
       conflicting states with the latest confirmed state.

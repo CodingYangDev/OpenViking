@@ -8,6 +8,7 @@ import ast
 import json
 import keyword
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, get_args, get_origin
 
@@ -26,6 +27,7 @@ from openviking.session.memory.merge_op import (
     SearchReplaceBlock,
     StrPatch,
 )
+from openviking.session.memory.tools import add_tool_call_pair_to_messages
 from openviking.session.memory.utils.description_template import render_description_template
 from openviking.session.memory.utils.line_numbers import (
     every_line_has_line_numbers,
@@ -35,7 +37,11 @@ from openviking.session.memory.utils.line_numbers import (
 _PYTHON_FENCE_RE = re.compile(r"```python[ \t]*\r?\n(?P<code>[\s\S]*?)```", re.IGNORECASE)
 _PYTHON_FENCE_START_RE = re.compile(r"```python[ \t]*\r?\n", re.IGNORECASE)
 _HIDDEN_MEMORY_FIELDS = {
+    "trajectory_format",
+    "evaluation",
+    "evaluation_criteria",
     "experience_execution",
+    "experience_update",
     "source_extraction_id",
     "source_extraction_ids",
     "last_update_trace_id",
@@ -69,33 +75,55 @@ _SAFE_STRING_METHODS = {
 # applied to the would-be result size before any allocation.
 _MAX_EXPRESSION_SIZE = 1_000_000
 _REPEATABLE_SEQUENCES = (str, bytes, list, tuple)
+_NESTED_STRING_GUIDANCE = r'''Keep the enclosing triple-quoted SDK string. When its contents include code or quoted text,
+encode each embedded literal """ as \"\"\" and each literal backslash as \\.
+Escape only the string contents, not the enclosing opening and closing delimiters. These
+escapes are decoded once by the outer Python string, so the stored content retains its original
+quotes, backslashes and newlines. Ordinary quotes and real newlines may remain inside the
+triple-quoted string; a backslash that must remain in stored text must be escaped.
+Syntax-only example (use an actual existing-object binding instead of obj, and your own content):
+```python
+obj.content.overwrite("""note = \"\"\"first line
+second line\"\"\"""")
+```'''
+
 _CONTRACT_PREAMBLE = (
     "## Output Format: restricted Python memory SDK",
     "Return only Python code, optionally wrapped in one ```python code fence.",
     "The code is interpreted as a restricted DSL and cannot access Python modules, files, or the network.",
-    "The SDK is write-only. To inspect memories, call the native search/read tools before returning the program; never emit sdk.search(), sdk.read(), or sdk.existing() (only the system binds existing objects).",
+    "The final SDK program is write-only. To inspect memories, use the available native read-only tool before returning the program. Inside eval, each SDK read/search call must be assigned to a variable; never put read/search calls in the final program. Only the system may emit sdk.existing() or sdk.error().",
     "Never return memory content as bare Markdown; all changes must be arguments to SDK calls.",
-    "Existing objects shown by the system may use obj.update(field=value, ...) to set complete "
-    "scalar/immutable fields, obj.delete(replacement=None),",
+    "Tool replies are Python result code, not JSON. Eval results keep their assigned variable names. "
+    "Loaded memories appear as sdk.existing(...) objects; search results may contain these objects "
+    "in lists or dictionaries. Use their shown names or indexed references (e.g. matches[0]) directly "
+    "in the final program; do not repeat their binding declarations. Failed reads appear as sdk.error(message); these are not editable memory objects.",
+    "Existing objects shown by the system may use obj.update(field=value, ...) for "
+    "scalar/immutable fields according to their schema merge rules, obj.delete(replacement=None),",
     "and, when links are enabled, obj.link(target, link_type='related_to', weight=0.5, match_text=None, description='').",
     "To change an existing string field, edit it through the object's field attribute. Use the "
     "real field name (e.g. content), NOT the literal word 'field':",
-    "  - obj.content.update(new_value): replace the whole field with a complete new string.",
+    "  - obj.content.overwrite(new_value): replace the whole field with a complete new string. "
+    "This is not an append or merge. All old content omitted from the new string is removed "
+    "from this field. Keep all still-valid existing constraints.",
     "  - obj.content.edit(search=..., replace=...): replace one exact snippet in place.",
     "  - obj.content.drop(text=...): delete one exact snippet in place.",
-    "edit()/drop() may be chained, e.g. obj.content.edit(search='a', replace='b').drop(text='c'); do not mix them with .update() in one chain.",
+    "edit()/drop() may be chained, e.g. obj.content.edit(search='a', replace='b').drop(text='c'); do not mix them with .overwrite() in one chain.",
     "A field attribute is a write handle only; you cannot read it as a string or call str methods on it.",
     "Each search= (and drop text=) MUST be copied verbatim from the current field value shown in the object's sdk.existing(...) binding, and must occur exactly once. If the snippet appears more than once, include an adjacent unique line just before or after it so the match is unique. Never use text from the conversation or the new facts you intend to add as a search anchor; that text is not in the current content and the edit will fail.",
     "edit()/drop() only work on an existing memory's string field; new memories from create/set must be given complete field values.",
-    "For existing memories, prefer the smallest unique edit()/drop(). Do not rewrite the entire field just to add or change a few facts; large full-content rewrites are more likely to be truncated or malformed. Use obj.content.update() only when most of the content changes.",
+    "For existing memories, prefer the smallest unique edit()/drop(). Do not rewrite the entire field just to add or change a few facts; large full-content rewrites are more likely to be truncated or malformed. Use obj.content.overwrite() only when most of the content changes.",
     'ALWAYS use a triple-quoted string ("""...""") for EVERY natural-language argument '
     "(content, summary, goal, and every search=/replace=/text= snippet), even one-liners. "
     "Prose frequently contains apostrophes (e.g. Evan's), quotes, colons, or dates that break "
     'single- or double-quoted literals. Inside triple quotes, escape any literal """ and '
     "backslash; never put a real newline inside a single- or double-quoted string.",
-    "Only keyword arguments are accepted by create, set, and obj.update(); a field's update() takes one positional string. Unknown business fields are ignored.",
+    _NESTED_STRING_GUIDANCE,
+    "Only keyword arguments are accepted by create, set, and obj.update(); a field's overwrite() takes one positional string. Unknown business fields are ignored.",
     "You may end the program with sdk.commit(); when present it must be the final call. If there are no changes, return only sdk.commit().",
-    "Use the system-provided existing-object variable names exactly as shown. When a newly "
+    "Use system-provided existing-object bindings, or assign a fresh alias such as "
+    "alias = existing_1 (using a binding actually shown in the tool results). "
+    "Aliases refer to the same memory object; "
+    "they do not create or copy memories. Never overwrite an existing binding. When a newly "
     "created memory must be referenced by delete(replacement=...) or link(...), assign the "
     "create call to a variable first, for example: canonical = sdk.create_<type>(...); "
     "duplicate_1.delete(replacement=canonical). Never recreate or rebind an existing object "
@@ -118,7 +146,7 @@ _LINK_RULES = (
     "- link_type uses lowercase snake_case: related_to (default), belongs_to, "
     "derived_from, caused_by, contradicts, evolved_from.",
     "- For a newly created object, assign the create/set call to a variable first, then "
-    "call .link() on it (see the preamble); existing objects use their provided variable names.",
+    "call .link() on it (see the preamble); existing objects use their provided bindings or aliases.",
     "- Links are optional; only create them when the relationship is explicit in the "
     "conversation. Do not link every memory to every other memory.",
     "",
@@ -145,6 +173,13 @@ class _MemoryObject:
     changed_fields: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class _ExistingMemoryReference:
+    """A tool-visible reference; the compiler resolves it from its trusted read cache."""
+
+    uri: str
+
+
 _UNSET = object()
 
 
@@ -164,10 +199,47 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
     name = "python"
 
     def __init__(self) -> None:
-        self._uri_to_name: dict[str, str] = {}
-        self._type_counts: dict[str, int] = {}
-        self._context_counts: dict[str, int] = {}
+        self._result_bindings: dict[str, Any] = {}
         self._last_error_allows_tool_retry = False
+
+    def get_memory_eval_bindings(self, context: ExtractionOutputContext) -> dict[str, Any]:
+        """Expose the same trusted objects as read-result values, without write handles."""
+        schemas = {schema.memory_type: schema for schema in context.schemas}
+
+        def snapshot(value: Any) -> Any:
+            if isinstance(value, _ExistingMemoryReference):
+                memory = context.read_file_contents[value.uri]
+                memory_type = memory.memory_type or memory.extra_fields.get("memory_type")
+                fields = _visible_memory_fields(memory, schemas[memory_type], context)
+                return {**deepcopy(fields), "uri": value.uri, "memory_type": memory_type}
+            if isinstance(value, list):
+                return [snapshot(item) for item in value]
+            if isinstance(value, dict):
+                return {key: snapshot(item) for key, item in value.items()}
+            return deepcopy(value)
+
+        return {name: snapshot(value) for name, value in self._result_bindings.items()}
+
+    def render_binding_index(self) -> str:
+        paths: list[str] = []
+
+        def collect(value: Any, path: str) -> None:
+            if isinstance(value, _ExistingMemoryReference):
+                paths.append(path)
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    collect(item, f"{path}[{index}]")
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    collect(item, f"{path}[{key!r}]")
+
+        for name, value in self._result_bindings.items():
+            collect(value, name)
+        return (
+            "Existing-memory access ONLY via: "
+            + (", ".join(paths) or "(none)")
+            + ". Assign aliases before use; read unlisted memories first."
+        )
 
     def render_contract(self, context: ExtractionOutputContext) -> str:
         _validate_alias_uniqueness(context.schemas)
@@ -222,7 +294,7 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             lines.extend(self._render_singleton_rules(context, schema, identity_fields))
         merge_ops = {
             field.name: (
-                "editable string: obj.field.edit/drop/update"
+                "editable string: obj.field.edit/drop/overwrite"
                 if field.merge_op == MergeOp.PATCH and field.field_type == FieldType.STRING
                 else field.merge_op.value
             )
@@ -273,8 +345,8 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         del context
         return """
 ## Memory Object Rules
-- Update or delete an existing memory only through its system-provided bound object; never pass or construct a URI.
-- Create collection memories with listed sdk.create_<memory_type>(...) methods.
+- Update or delete an existing memory only through its system-provided bound object or an alias of that object; never pass or construct a URI.
+- Create collection memories with listed sdk.create_<memory_type>(...) methods. create_* is create-only: an existing target or duplicate target in one program fails without overwriting it. Read existing memories through eval and edit their content in place; use content.overwrite(...) only for a complete field replacement.
 - Set a single-file memory with its listed sdk.set_<memory_type>(...) method; each target scope has only one such object.
 - Existing-object identity, storage paths, and immutable fields are preserved by the system.
 - delete() removes the whole object; use obj.content.drop(text=...) (with the real field name) when only some content must go and the rest stays.
@@ -286,6 +358,7 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         self, content: str, context: ExtractionOutputContext
     ) -> tuple[Any | None, str | None]:
         self._last_error_allows_tool_retry = False
+        context.create_page_ids.clear()
         try:
             code = _extract_python_code(content)
             compiler = _PythonProgramCompiler(context=context, protocol=self)
@@ -320,16 +393,18 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         if error and _is_string_literal_syntax_error(error):
             quote_guidance = (
                 " If the error is about a string literal, the offending line is shown above; a "
-                "quote or newline inside prose likely ended the string early. Rewrite every "
+                "quote, newline or unescaped nested delimiter may have ended the string early. "
+                "Keep valid outer triple quotes and fix escaping inside them. Write every "
                 "natural-language argument (content, summary, goal, and every search=/replace=/"
                 'text= snippet) as a triple-quoted string ("""...""") so embedded quotes and '
                 "newlines stay inside the literal."
             )
         if self.keep_tools_enabled_after_parse_error(error):
             tool_guidance = (
-                " The memory SDK is write-only. Call the available native search/read tool now; "
-                "after its result is returned, update the system-provided object variable. "
-                "Do not emit sdk.search(), sdk.read(), or construct a memory URI in Python."
+                " The final SDK program is write-only. Call the available native read-only tool "
+                "inside eval with an assignment; after its result "
+                "is returned, update the system-provided object variable. "
+                "Do not put read/search calls in the final program or guess a memory URI."
             )
         return (
             "Your previous output was not a valid restricted Python memory SDK program."
@@ -338,7 +413,10 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             "Put Markdown memory content inside quoted SDK arguments, using triple-quoted strings "
             '("""...""") for any multi-line or Markdown text so newlines and quotes stay inside '
             "the literal; never return it as the program itself. No changes from the invalid program "
-            "were applied."
+            "were applied. A syntax error pointing at prose or punctuation may mean an embedded "
+            "quote delimiter closed the surrounding string early; check its escaping rather than "
+            "deleting or rewriting valid content to avoid the reported character."
+            f"\n\n{_NESTED_STRING_GUIDANCE}"
         )
 
     def keep_tools_enabled_after_parse_error(self, error: str | None) -> bool:
@@ -359,7 +437,8 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             "more than once, include enough contiguous surrounding context to make it unique. Do not "
             "use text from the conversation or the new facts you intend to add as a search anchor. "
             "If you copy from numbered read output, exclude the `line_number<TAB>` prefix. If the "
-            "change is too broad for a clean snippet, use obj.field.update(complete_new_value) instead. "
+            "change is too broad for a clean snippet, use obj.field.overwrite(complete_new_value) instead, "
+            "preserving all still-valid existing content. "
             "Regenerate the complete restricted Python SDK program, including previous successful "
             "operations and fixed failed operations. Output only Python code."
             "\n\nFailed edits:\n" + details
@@ -380,18 +459,6 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             "\n\nResolution issues:\n" + details
         )
 
-    def render_new_bindings(self, context: ExtractionOutputContext, *, source: str) -> str:
-        declarations = []
-        for uri, memory_file in context.read_file_contents.items():
-            declaration = self._render_existing_binding(
-                context, uri=uri, memory_file=memory_file, result=None, source=source
-            )
-            if declaration:
-                declarations.append(declaration)
-        if not declarations:
-            return ""
-        return "\n".join(declarations)
-
     def render_tool_result_messages(
         self,
         context: ExtractionOutputContext,
@@ -402,167 +469,125 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         result: Any,
         source: str,
     ) -> list[dict[str, Any]]:
-        del call_id
-        code = self._render_tool_result(
-            context, tool_name=tool_name, params=params, result=result, source=source
+        del source
+        messages: list[dict[str, Any]] = []
+        add_tool_call_pair_to_messages(
+            messages, call_id=call_id, tool_name=tool_name, params=params, result=result
         )
-        return [{"role": "user", "content": code}]
+        # The transport remains a native tool pair. Only Python's tool content
+        # changes representation; raw execution results and JSON mode are unchanged.
+        if isinstance(result, dict) and isinstance(result.get("error"), str):
+            expression, _, metadata = self._render_result_value(context, result, path=tool_name)
+            messages[-1]["content"] = "\n".join([expression, *metadata])
+            return messages
 
-    def render_prefetch_messages(
-        self,
-        messages: list[dict[str, Any]],
-        context: ExtractionOutputContext,
-    ) -> list[dict[str, Any]]:
-        rendered: list[dict[str, Any]] = []
-        for message in messages:
-            invocation = _parse_tool_result_message(message)
-            if invocation is None:
-                # Provider-authored conversation/instruction text may still name
-                # JSON; adapt its wording to this protocol without touching the
-                # structured tool-result messages rendered below.
-                rendered.append(self._normalize_message_instruction(message))
-                continue
-            tool_name, params, result = invocation
-            rendered.extend(
-                self.render_tool_result_messages(
-                    context,
-                    call_id="prefetch",
-                    tool_name=tool_name,
-                    params=params,
-                    result=result,
-                    source="prefetch",
-                )
+        results = (
+            result if tool_name == "eval" and isinstance(result, dict) else {tool_name: result}
+        )
+        declarations = []
+        for name, value in results.items():
+            _require_identifier(name, "tool result variable")
+            if name == "sdk" or name.startswith("_"):
+                raise ValueError(f"Invalid tool result variable: {name!r}")
+            uri = params.get("uri") if tool_name == "read" and isinstance(params, dict) else None
+            expression, binding, metadata = self._render_result_value(
+                context, value, path=name, uri=uri
             )
+            self._result_bindings[name] = binding
+            declarations.append(f"{name} = {expression}")
+            declarations.extend(metadata)
+        messages[-1]["content"] = "\n".join(declarations) or repr(result)
+        return messages
 
-        remaining_bindings = self.render_new_bindings(context, source="prefetch")
-        if remaining_bindings:
-            rendered.append({"role": "user", "content": remaining_bindings})
-        return rendered
-
-    def _normalize_message_instruction(self, message: dict[str, Any]) -> dict[str, Any]:
-        content = message.get("content")
-        if not isinstance(content, str):
-            return message
-        normalized = self.normalize_provider_instruction(content)
-        if normalized == content:
-            return message
-        return {**message, "content": normalized}
-
-    def _render_tool_result(
+    def _render_result_value(
         self,
         context: ExtractionOutputContext,
+        value: Any,
         *,
-        tool_name: str,
-        params: dict[str, Any],
-        result: Any,
-        source: str,
-    ) -> str:
-        if tool_name == "read" and isinstance(result, dict) and "error" not in result:
-            uri = str(params.get("uri") or result.get("uri") or "")
-            memory_file = context.read_file_contents.get(uri)
-            if memory_file is not None:
-                binding = self._render_existing_binding(
-                    context,
-                    uri=uri,
-                    memory_file=memory_file,
-                    result=result,
-                    source=source,
+        path: str,
+        uri: str | None = None,
+    ) -> tuple[str, Any, list[str]]:
+        """Render literal containers, replacing only actually-read memories by SDK objects."""
+        if isinstance(value, dict):
+            if isinstance(value.get("error"), str):
+                return (
+                    f"sdk.error({value['error']!r})",
+                    value,
+                    self._render_result_metadata(value, path=path, exclude={"error"}),
                 )
-                if binding:
-                    return binding
-            return self._render_reference_context(result, preferred_name=result.get("context_role"))
-
-        if tool_name == "search":
-            return self._render_search_comment(context, params, result)
-
-        if isinstance(result, dict) and "error" in result:
-            name = self._next_context_name(f"{tool_name}_error")
-            return f"# {tool_name} failed for {params!r}.\n{name} = {result!r}"
-
-        name = self._next_context_name(f"{tool_name}_result")
-        return f"# {tool_name} result loaded by {source}.\n{name} = {result!r}"
+            result_uri = value.get("uri") or uri
+            page_id = value.get("page_id")
+            mapped_uri = (
+                context.page_id_map.resolve(page_id)
+                if isinstance(page_id, int) and not isinstance(page_id, bool)
+                else None
+            )
+            if result_uri and mapped_uri and result_uri != mapped_uri:
+                # Never turn inconsistent identity metadata into an editable reference.
+                return repr(value), value, []
+            result_uri = result_uri or mapped_uri
+            memory_file = (
+                context.read_file_contents.get(result_uri) if isinstance(result_uri, str) else None
+            )
+            schema = next(
+                (s for s in context.schemas if s.memory_type == value.get("memory_type")), None
+            )
+            if (
+                memory_file is not None
+                and schema is not None
+                and (memory_file.memory_type or memory_file.extra_fields.get("memory_type"))
+                == schema.memory_type
+                and "error" not in value
+            ):
+                fields = _visible_memory_fields(memory_file, schema, context)
+                fields.update({key: value[key] for key in fields.keys() & value.keys()})
+                content = fields.get("content")
+                if isinstance(content, str) and every_line_has_line_numbers(content):
+                    fields["content"] = strip_line_numbers(content)
+                args = [f"memory_type={schema.memory_type!r}"]
+                args.extend(f"{_identifier_alias(key)}={v!r}" for key, v in fields.items())
+                comments = self._render_result_metadata(
+                    value, path=path, exclude={*fields, "memory_type", "uri"}
+                )
+                return (
+                    f"sdk.existing({', '.join(args)})",
+                    _ExistingMemoryReference(result_uri),
+                    comments,
+                )
+            items, bindings, metadata = [], {}, []
+            for key, item in value.items():
+                expression, binding, comments = self._render_result_value(
+                    context, item, path=f"{path}[{key!r}]"
+                )
+                items.append(f"{key!r}: {expression}")
+                bindings[key] = binding
+                metadata.extend(comments)
+            return "{" + ", ".join(items) + "}", bindings, metadata
+        if isinstance(value, list):
+            items, bindings, metadata = [], [], []
+            for index, item in enumerate(value):
+                expression, binding, comments = self._render_result_value(
+                    context, item, path=f"{path}[{index}]"
+                )
+                items.append(expression)
+                bindings.append(binding)
+                metadata.extend(comments)
+            return "[" + ", ".join(items) + "]", bindings, metadata
+        return repr(value), value, []
 
     @staticmethod
-    def _render_search_comment(
-        context: ExtractionOutputContext, params: dict[str, Any], result: Any
-    ) -> str:
-        # Search only returns URIs (no content), so it cannot become an
-        # sdk.existing() binding. Files actually read are bound separately as
-        # sdk.existing(); how to reach the rest depends on whether a read tool
-        # is available this run.
-        uris = _search_result_uris(result)
-        query = params.get("query")
-        query_label = f" query={query!r}" if query else ""
-        if not uris:
-            return f"# Search{query_label} found no memory files."
-        listing = "\n".join(f"# - {uri}" for uri in uris)
-        if "read" in context.available_tools:
-            guidance = "read them with the read tool before updating them"
-        else:
-            guidance = (
-                "any you need to edit are already provided as sdk.existing bindings; "
-                "there is no read tool, so treat anything not shown above as new"
-            )
-        return f"# Search{query_label} found the following memory files; {guidance}:\n{listing}"
-
-    def _render_existing_binding(
-        self,
-        context: ExtractionOutputContext,
-        *,
-        uri: str,
-        memory_file: MemoryFile,
-        result: dict[str, Any] | None,
-        source: str,
-    ) -> str:
-        name = self._uri_to_name.get(uri)
-        if name is not None and result is None:
-            return ""
-        memory_type = str(
-            memory_file.memory_type or memory_file.extra_fields.get("memory_type") or "memory"
-        )
-        schemas = {schema.memory_type: schema for schema in context.schemas}
-        schema = schemas.get(memory_type)
-        if schema is None:
-            return ""
-
-        if name is None:
-            count = self._type_counts.get(memory_type, 0) + 1
-            self._type_counts[memory_type] = count
-            # Binding variable names must be valid Python identifiers, so alias
-            # the memory_type on the DSL surface (real name is kept everywhere else).
-            name = f"{_identifier_alias(memory_type)}_{count}"
-            self._uri_to_name[uri] = name
-        fields = _visible_memory_fields(memory_file, schema, context)
-        maintenance_notice = None
-        if result is not None:
-            fields.update({key: result[key] for key in fields.keys() & result.keys()})
-            maintenance_notice = result.get("memory_maintenance_notice")
-        content = fields.get("content")
-        if isinstance(content, str) and every_line_has_line_numbers(content):
-            fields["content"] = strip_line_numbers(content)
-        args = [f"memory_type={memory_type!r}"]
-        args.extend(f"{_identifier_alias(key)}={value!r}" for key, value in fields.items())
-        binding = (
-            f"# Existing memory loaded by {source}; this binding is system-provided.\n"
-            f"{name} = sdk.existing({', '.join(args)})"
-        )
-        if maintenance_notice is not None:
-            binding += "\n# Memory maintenance notice: " + json.dumps(
-                maintenance_notice, ensure_ascii=False
-            )
-        return binding
-
-    def _render_reference_context(self, result: Any, *, preferred_name: Any = None) -> str:
-        name = self._next_context_name(str(preferred_name or "read_result"))
-        return f"# Read-only context; this is not a mutable memory object.\n{name} = {result!r}"
-
-    def _next_context_name(self, stem: str) -> str:
-        normalized = re.sub(r"\W+", "_", stem).strip("_").lower() or "context"
-        if normalized[0].isdigit() or keyword.iskeyword(normalized):
-            normalized = f"context_{normalized}"
-        count = self._context_counts.get(normalized, 0) + 1
-        self._context_counts[normalized] = count
-        return normalized if count == 1 else f"{normalized}_{count}"
+    def _render_result_metadata(
+        value: dict[str, Any], *, path: str, exclude: set[str]
+    ) -> list[str]:
+        metadata = {
+            key: item
+            for key, item in value.items()
+            if key not in exclude
+            and key != "page_id"
+            and key not in _HIDDEN_MEMORY_FIELDS
+            and not key.startswith("_")
+        }
+        return [f"# Metadata for {path}: {metadata!r}"] if metadata else []
 
     def normalize_provider_instruction(self, instruction: str) -> str:
         replacements = {
@@ -578,43 +603,6 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         for old, new in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
             instruction = instruction.replace(old, new)
         return instruction
-
-    def binding_name(self, uri: str) -> str | None:
-        return self._uri_to_name.get(uri)
-
-
-def _parse_tool_result_message(
-    message: dict[str, Any],
-) -> tuple[str, dict[str, Any], Any] | None:
-    if message.get("role") != "user" or not isinstance(message.get("content"), str):
-        return None
-    try:
-        payload = json.loads(message["content"])
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, dict) or not isinstance(payload.get("tool_call_name"), str):
-        return None
-    params = payload.get("args")
-    if not isinstance(params, dict) or "result" not in payload:
-        return None
-    return payload["tool_call_name"], params, payload["result"]
-
-
-def _search_result_uris(result: Any) -> list[str]:
-    """Extract memory-file URIs from a search tool result of varying shape."""
-    items: Any
-    if isinstance(result, dict):
-        items = result.get("memories", [])
-    elif isinstance(result, list):
-        items = result
-    else:
-        items = []
-    uris: list[str] = []
-    for item in items:
-        uri = item.get("uri") if isinstance(item, dict) else item
-        if isinstance(uri, str) and uri:
-            uris.append(uri)
-    return list(dict.fromkeys(uris))
 
 
 class _PythonProgramCompiler:
@@ -646,6 +634,9 @@ class _PythonProgramCompiler:
         self._next_new_page_id = self._find_next_new_page_id(100)
         self._committed = False
         self._load_existing_objects()
+        self._input_value_names = {
+            name for name, value in self.values.items() if not _contains_memory_object(value)
+        }
 
     def compile(self, code: str) -> Any:
         try:
@@ -657,7 +648,7 @@ class _PythonProgramCompiler:
             if _looks_like_bare_markdown(code):
                 raise ExtractionOutputProtocolError(
                     "Output is bare Markdown, not a Python SDK program; put memory content inside "
-                    "a quoted sdk.create_*/sdk.set_* argument or an existing object's update() call"
+                    "a quoted sdk.create_*/sdk.set_* argument or an existing string field's overwrite() call"
                 ) from exc
             raise ExtractionOutputProtocolError(
                 f"Line {exc.lineno or 1}: invalid Python syntax: {exc.msg}"
@@ -675,23 +666,38 @@ class _PythonProgramCompiler:
         return self._build_operations()
 
     def _load_existing_objects(self) -> None:
-        for uri, memory_file in self.context.read_file_contents.items():
-            name = self.protocol.binding_name(uri)
-            if not name:
-                continue
-            memory_type = str(
-                memory_file.memory_type or memory_file.extra_fields.get("memory_type") or ""
-            )
-            if memory_type not in self.schemas:
-                continue
-            page_id = self.context.page_id_map.get_page_id(uri)
-            self.objects[name] = _MemoryObject(
-                name=name,
-                memory_type=memory_type,
-                page_id=page_id,
-                fields=_visible_memory_fields(memory_file, self.schemas[memory_type], self.context),
-                existing=True,
-            )
+        by_uri: dict[str, _MemoryObject] = {}
+
+        def load(value: Any, path: str) -> Any:
+            if isinstance(value, _ExistingMemoryReference):
+                if value.uri not in by_uri:
+                    memory_file = self.context.read_file_contents[value.uri]
+                    memory_type = str(
+                        memory_file.memory_type or memory_file.extra_fields.get("memory_type")
+                    )
+                    page_id = self.context.page_id_map.get_page_id(value.uri)
+                    obj = _MemoryObject(
+                        name=path,
+                        memory_type=memory_type,
+                        page_id=page_id,
+                        fields=_visible_memory_fields(
+                            memory_file, self.schemas[memory_type], self.context
+                        ),
+                        existing=True,
+                    )
+                    by_uri[value.uri] = obj
+                    # Multiple eval variables may refer to one file. Persist it
+                    # once, while every displayed reference sees the same object.
+                    self.objects[f"__existing_{page_id}"] = obj
+                return by_uri[value.uri]
+            if isinstance(value, list):
+                return [load(item, f"{path}[{i}]") for i, item in enumerate(value)]
+            if isinstance(value, dict):
+                return {key: load(item, f"{path}[{key!r}]") for key, item in value.items()}
+            return value
+
+        for name, value in self.protocol._result_bindings.items():
+            self.values[name] = load(value, name)
 
     def _execute_statement(self, node: ast.stmt) -> None:
         if isinstance(node, ast.Assign):
@@ -707,14 +713,16 @@ class _PythonProgramCompiler:
                 self._error(node, "side-effect calls cannot be assigned")
             if isinstance(value, _MemoryObject):
                 if value.existing or value.name:
-                    self._error(
-                        node, "only a new sdk.create_*() or sdk.set_*() result may be assigned"
-                    )
-                value.name = name
-                self.objects[name] = value
+                    # An alias refers to the canonical object; registering it
+                    # again would duplicate writes/deletes in _build_operations.
+                    self.values[name] = value
+                else:
+                    value.name = name
+                    self.objects[name] = value
             elif isinstance(value, _FieldHandle):
                 self._error(
-                    node, "field edits (obj.field.update/edit/drop) must be standalone statements"
+                    node,
+                    "field edits (obj.field.overwrite/edit/drop) must be standalone statements",
                 )
             else:
                 if _contains_memory_object(value):
@@ -735,6 +743,11 @@ class _PythonProgramCompiler:
 
     def _reserve_name(self, name: str, node: ast.AST) -> None:
         _require_identifier(name, "variable")
+        if name in self._input_value_names and name != "sdk" and name not in _SAFE_BUILTINS:
+            # A failed read or plain result is not an existing object. The final
+            # program may reuse that name for a newly created memory once.
+            self._input_value_names.remove(name)
+            self.values.pop(name)
         if name == "sdk" or name in _SAFE_BUILTINS or name in self.objects or name in self.values:
             self._error(node, f"variable {name!r} is reserved or already assigned")
 
@@ -785,7 +798,7 @@ class _PythonProgramCompiler:
                     f"{owner.name or owner.memory_type}: {available}.{hint}",
                 )
             # obj.<field> is a write handle, not the raw value: it exposes
-            # .update()/.edit()/.drop() and cannot be read as a string.
+            # .overwrite()/.edit()/.drop() and cannot be read as a string.
             return _FieldHandle(owner=owner, field_name=real_field)
         if isinstance(node, ast.Subscript):
             return self._eval(node.value)[self._eval_slice(node.slice)]
@@ -979,10 +992,19 @@ class _PythonProgramCompiler:
             return None
         if method == "existing":
             self._error(node, "sdk.existing() is reserved for system-provided bindings")
+        if method == "error":
+            self._error(
+                node,
+                "sdk.error() is reserved for system-provided tool results; "
+                "if there are no memory changes, return sdk.commit()",
+            )
         self._error(
             node,
             f"unknown SDK method sdk.{method}()",
-            allow_tool_retry=method in ("read", "search"),
+            allow_tool_retry=(
+                method in ("read", "search", "search_by_session", "ls")
+                or method.startswith("read_")
+            ),
         )
 
     def _call_memory(
@@ -1071,23 +1093,23 @@ class _PythonProgramCompiler:
         )
 
     def _call_field(self, handle: _FieldHandle, method: str, node: ast.Call) -> _FieldHandle:
-        if method == "update":
+        if method == "overwrite":
             kwargs = self._eval_keywords(node)
             if kwargs or len(node.args) != 1:
                 self._error(
                     node,
-                    "field.update() takes exactly one positional argument: the complete new value",
+                    "field.overwrite() takes exactly one positional argument: the complete new value",
                 )
             value = self._eval(node.args[0])
             if _contains_memory_object(value) or isinstance(value, _FieldHandle):
-                self._error(node, "field.update() value must be a plain string")
+                self._error(node, "field.overwrite() value must be a plain string")
             if handle.blocks or handle.full_value is not _UNSET:
-                self._error(node, "field.update() cannot be chained with edit()/drop()")
+                self._error(node, "field.overwrite() cannot be chained with edit()/drop()")
             handle.full_value = value
             return handle
         if method in ("edit", "drop"):
             if handle.full_value is not _UNSET:
-                self._error(node, "field.edit()/drop() cannot be chained after update()")
+                self._error(node, "field.edit()/drop() cannot be chained after overwrite()")
             kwargs = self._eval_keywords(node)
             if method == "edit":
                 if node.args or set(kwargs) != {"search", "replace"}:
@@ -1109,7 +1131,7 @@ class _PythonProgramCompiler:
             return handle
         self._error(
             node,
-            f"unknown field method {method}(); use obj.field.update(...), "
+            f"unknown field method {method}(); use obj.field.overwrite(...), "
             "obj.field.edit(search=..., replace=...), or obj.field.drop(text=...)",
         )
 
@@ -1119,7 +1141,7 @@ class _PythonProgramCompiler:
         schema = self.schemas[owner.memory_type]
         field_schema = {item.name: item for item in schema.fields}.get(name)
         if handle.full_value is _UNSET and not handle.blocks:
-            self._error(node, f"{owner.name}.{name} edit has no update()/edit()/drop() call")
+            self._error(node, f"{owner.name}.{name} edit has no overwrite()/edit()/drop() call")
         if (
             field_schema is not None
             and field_schema.merge_op == MergeOp.IMMUTABLE
@@ -1137,7 +1159,7 @@ class _PythonProgramCompiler:
             self._error(
                 node,
                 "field.edit()/drop() can only patch an existing memory; a memory created in "
-                "this program has no prior content — pass the complete value to field.update()",
+                "this program has no prior content — pass the complete value to field.overwrite()",
             )
         if field_schema is None or not (
             field_schema.merge_op == MergeOp.PATCH and field_schema.field_type == FieldType.STRING
@@ -1259,7 +1281,16 @@ class _PythonProgramCompiler:
                 if not skip and remapped["f"] != remapped["t"]:
                     payload["links"].append(remapped)
         try:
-            return self.context.operations_model.model_validate(payload)
+            operations = self.context.operations_model.model_validate(payload)
+            self.context.create_page_ids = {
+                obj.page_id
+                for obj in self.objects.values()
+                if not obj.existing
+                and not obj.deleted
+                and obj.changed_fields
+                and self.schemas[obj.memory_type].filename_has_variables()
+            }
+            return operations
         except Exception as exc:
             raise ExtractionOutputProtocolError(
                 f"SDK operations failed schema validation: {exc}"

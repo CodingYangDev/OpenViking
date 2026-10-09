@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,6 +13,7 @@ from typing import Any
 
 from openviking.session.train.components.dataset_service import jsonable
 from openviking.session.train.components.reporter import NoopPipelineLifecycleHook
+from openviking.session.train.utils import call_hook
 
 
 @dataclass(slots=True)
@@ -57,9 +57,7 @@ class CompositeEventRecorder:
             record = getattr(recorder, "record", None)
             if record is None:
                 continue
-            result = record(event, **fields)
-            if inspect.isawaitable(result):
-                await result
+            await call_hook(record, event, **fields)
 
 
 @dataclass(slots=True)

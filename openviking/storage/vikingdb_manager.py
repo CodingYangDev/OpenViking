@@ -158,6 +158,7 @@ class VikingDBManager(VikingVectorIndexBackend):
             logger.error(f"Error getting embedding queue size: {e}")
             return 0
 
+
 class VikingDBManagerProxy:
     """
     租户绑定的 VikingDBManager 代理。

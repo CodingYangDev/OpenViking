@@ -4,12 +4,10 @@
 
 from __future__ import annotations
 
-import inspect
 import time
 from typing import Any
 
 from openviking.session.train.components.case_loader import make_trial_case_loader
-from openviking.session.train.components.policy_trainer import BatchPolicyTrainer
 from openviking.session.train.context import (
     ExecutionContext,
     PipelineContext,
@@ -27,16 +25,17 @@ from openviking.session.train.domain import (
 )
 from openviking.session.train.interfaces import (
     CaseLoader,
-    GradientEstimator,
-    PolicyOptimizer,
+    ExperienceLearner,
     PolicySnapshotter,
     PolicyTrainer,
-    PolicyUpdater,
-    RolloutAnalyzer,
     RolloutExecutor,
     SemanticGradient,
 )
-from openviking.session.train.utils import average_score, validate_rollouts_have_cases
+from openviking.session.train.utils import (
+    average_score,
+    call_hook,
+    validate_rollouts_have_cases,
+)
 from openviking.telemetry import tracer
 
 
@@ -45,7 +44,8 @@ class OfflinePolicyOptimizationPipeline:
 
     This class wires the protocol interfaces together.  It does not implement
     rollout execution, LLM analysis, gradient estimation, optimization, or file
-    updates itself.
+    updates itself. Inject a PolicyTrainer; its concrete implementation owns
+    analysis, estimation, optimization and persistence components.
 
     ``train`` updates the policy set from case rollouts. ``eval`` only executes
     and analyzes rollouts; it never estimates gradients or writes policy files.
@@ -58,20 +58,13 @@ class OfflinePolicyOptimizationPipeline:
         *,
         snapshotter: PolicySnapshotter,
         rollout_executor: RolloutExecutor,
-        rollout_analyzer: RolloutAnalyzer,
-        gradient_estimator: GradientEstimator,
-        policy_optimizer: PolicyOptimizer,
-        policy_updater: PolicyUpdater,
-        policy_trainer: PolicyTrainer | None = None,
+        policy_trainer: PolicyTrainer,
+        experience_learner: ExperienceLearner | None = None,
     ) -> None:
+        self.experience_learner = experience_learner
         self.snapshotter = snapshotter
         self.rollout_executor = rollout_executor
-        self.policy_trainer = policy_trainer or BatchPolicyTrainer(
-            rollout_analyzer=rollout_analyzer,
-            gradient_estimator=gradient_estimator,
-            policy_optimizer=policy_optimizer,
-            policy_updater=policy_updater,
-        )
+        self.policy_trainer = policy_trainer
 
     @tracer("train.pipeline.train", ignore_result=True, ignore_args=True)
     async def train(
@@ -208,8 +201,8 @@ class OfflinePolicyOptimizationPipeline:
         offline optimization:
 
         The configured PolicyTrainer owns downstream training semantics. The
-        default BatchPolicyTrainer analyzes rollouts locally; remote trainers
-        may submit raw rollouts to a server-side analyzer.
+        default BatchPolicyTrainer analyzes rollouts locally. Remote training first
+        commits Sessions, then explicitly invokes the configured ExperienceLearner.
         """
 
         ctx = context if isinstance(context, PipelineContext) else PipelineContext()
@@ -220,6 +213,8 @@ class OfflinePolicyOptimizationPipeline:
             policy_set,
             ctx,
         )
+        if self.experience_learner is not None:
+            result = await self.experience_learner.learn([result], policy_set, ctx)
         result.metadata["source"] = "external_rollouts"
         return result
 
@@ -239,6 +234,9 @@ class OfflinePolicyOptimizationPipeline:
         snapshot_ids: list[str] = []
         rollout_report: dict[str, Any] | None = None
 
+        trajectory_batches: list[RolloutTrainingResult] = []
+        session_commit_cost_seconds = 0.0
+        experience_learn_cost_seconds = 0.0
         epoch_started_at = time.monotonic()
         async for cases in case_loader.batches(ctx.case_load_context):
             rollout_started_at = time.monotonic()
@@ -260,16 +258,37 @@ class OfflinePolicyOptimizationPipeline:
             )
             rollout_report = _with_cost(hook_rollout_report, rollout_cost_seconds)
             await _emit_train_rollout_report(ctx, rollout_report)
+            # Phase 1 in remote training: commit Sessions and collect Trajectories.
+            training_started_at = time.monotonic()
             training_result = await self.policy_trainer.train_rollouts(
                 rollouts,
                 current_policy_set,
                 ctx,
             )
+            if self.experience_learner is not None:
+                session_commit_cost_seconds += time.monotonic() - training_started_at
+                trajectory_batches.append(training_result)
             gradients = list(training_result.gradients)
             all_analyses.extend(training_result.analyses)
             last_plan = training_result.plan
             last_apply_result = training_result.apply_result
             all_gradients.extend(gradients)
+            current_policy_set = last_apply_result.updated_policy_set
+
+        # Phase 2 is an epoch barrier, not a side effect of each commit batch.
+        # A Case's observations may span multiple loader batches.
+        if self.experience_learner is not None and trajectory_batches:
+            learning_started_at = time.monotonic()
+            training_result = await self.experience_learner.learn(
+                trajectory_batches,
+                current_policy_set,
+                ctx,
+            )
+            experience_learn_cost_seconds = time.monotonic() - learning_started_at
+            all_analyses = list(training_result.analyses)
+            all_gradients = list(training_result.gradients)
+            last_plan = training_result.plan
+            last_apply_result = training_result.apply_result
             current_policy_set = last_apply_result.updated_policy_set
 
         epoch_cost_seconds = time.monotonic() - epoch_started_at
@@ -290,6 +309,14 @@ class OfflinePolicyOptimizationPipeline:
                 "gradient_count": len(all_gradients),
                 "train_rollout_report": rollout_report,
                 "cost_seconds": epoch_cost_seconds,
+                **(
+                    {
+                        "session_commit_cost_seconds": session_commit_cost_seconds,
+                        "experience_learn_cost_seconds": experience_learn_cost_seconds,
+                    }
+                    if self.experience_learner is not None
+                    else {}
+                ),
             },
         )
 
@@ -409,7 +436,7 @@ async def _emit_train_rollout_end(
 ) -> dict[str, Any] | None:
     hook_report: dict[str, Any] | None = None
     for hook in ctx.lifecycle_hooks:
-        result = await _call_hook(
+        result = await call_hook(
             hook.on_train_rollout_end,
             epoch=epoch,
             rollouts=rollouts,
@@ -438,17 +465,6 @@ def _merge_report_hook_result(
     return result
 
 
-async def _call_hook(method: Any, **kwargs: Any) -> Any:
-    result = method(**kwargs)
-    if inspect.isawaitable(result):
-        return await result
-    return result
-
-
-async def _call_event_hook(method: Any, **kwargs: Any) -> None:
-    await _call_hook(method, **kwargs)
-
-
 async def _emit_epoch_end(
     *,
     epoch_result: PipelineEpochResult,
@@ -457,7 +473,7 @@ async def _emit_epoch_end(
 ) -> PipelineHookDecision | None:
     hook_decision: PipelineHookDecision | None = None
     for hook in ctx.lifecycle_hooks:
-        result = await _call_hook(
+        result = await call_hook(
             hook.on_epoch_end,
             epoch_result=epoch_result,
             policy_set=policy_set,
@@ -482,7 +498,7 @@ async def _emit_eval_end(
 ) -> dict[str, Any] | None:
     hook_report: dict[str, Any] | None = None
     for hook in ctx.lifecycle_hooks:
-        result = await _call_hook(
+        result = await call_hook(
             hook.on_eval_end,
             evaluation_result=evaluation_result,
             policy_set=policy_set,
@@ -560,7 +576,7 @@ def _merge_hook_decision(
 
 async def _emit_epoch_start(ctx: PipelineContext, epoch: int) -> None:
     for hook in ctx.lifecycle_hooks:
-        await _call_event_hook(hook.on_epoch_start, epoch=epoch, context=ctx)
+        await call_hook(hook.on_epoch_start, epoch=epoch, context=ctx)
 
 
 async def _emit_train_rollout_report(
@@ -570,7 +586,7 @@ async def _emit_train_rollout_report(
     if report is None:
         return
     for hook in ctx.lifecycle_hooks:
-        await _call_event_hook(
+        await call_hook(
             hook.on_train_rollout_report,
             report=report,
             context=ctx,
@@ -584,7 +600,7 @@ async def _emit_train_report(
     if report is None:
         return
     for hook in ctx.lifecycle_hooks:
-        await _call_event_hook(hook.on_train_report, report=report, context=ctx)
+        await call_hook(hook.on_train_report, report=report, context=ctx)
 
 
 async def _emit_eval_report(ctx: PipelineContext, report: dict[str, Any] | None) -> None:
@@ -600,7 +616,7 @@ async def _emit_eval_report(ctx: PipelineContext, report: dict[str, Any] | None)
         ).split(maxsplit=1)[0]
     )
     for hook in ctx.lifecycle_hooks:
-        await _call_event_hook(
+        await call_hook(
             hook.on_eval_report,
             label=label,
             report=report,

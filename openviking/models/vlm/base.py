@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """VLM base interface and abstract classes"""
 
+import json
 import logging
 import re
 from abc import ABC, abstractmethod
@@ -50,6 +51,10 @@ class VLMResponse:
     reasoning_content: Optional[str] = (
         None  # For thinking process (doubao thinking, deepseek r1, etc.)
     )
+
+    # Correlation IDs, not completion IDs or arbitrary response headers.
+    client_request_id: Optional[str] = None
+    server_request_id: Optional[str] = None
 
     @property
     def has_tool_calls(self) -> bool:
@@ -203,6 +208,42 @@ class VLMBase(ABC):
         raise UnsupportedMediaInputError(
             f"VLM provider {self.provider!r} does not support audio/video inputs"
         )
+
+    @staticmethod
+    def _response_usage(response: Any) -> Dict[str, Any]:
+        """Preserve SDK usage, including an explicitly reported zero reasoning count."""
+        raw_usage = getattr(response, "usage", None)
+        if not raw_usage:
+            return {}
+        usage = {
+            "prompt_tokens": raw_usage.prompt_tokens,
+            "completion_tokens": raw_usage.completion_tokens,
+            "total_tokens": raw_usage.total_tokens,
+            "prompt_tokens_details": getattr(raw_usage, "prompt_tokens_details", None),
+        }
+        details = getattr(raw_usage, "completion_tokens_details", None)
+        reasoning = (
+            details.get("reasoning_tokens")
+            if isinstance(details, dict)
+            else getattr(details, "reasoning_tokens", None)
+        )
+        if reasoning is not None:
+            usage["reasoning_tokens"] = reasoning
+        return usage
+
+    def _parse_tool_calls(self, message) -> List[ToolCall]:
+        """Normalize tool calls from OpenAI-compatible response messages."""
+        tool_calls = []
+        if hasattr(message, "tool_calls") and message.tool_calls:
+            for tc in message.tool_calls:
+                args = tc.function.arguments
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {"raw": args}
+                tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
+        return tool_calls
 
     def _clean_response(self, content: str) -> str:
         """Strip reasoning tags (e.g. ``<think>...</think>``) from model output."""
@@ -759,9 +800,7 @@ class FailoverVLM(VLMBase):
         backup_tracker = self.backup.token_tracker
         if primary_tracker is backup_tracker:
             return primary_tracker.to_dict()
-        merged_tracker = TokenUsageTracker.merge(
-            primary_tracker, backup_tracker
-        )
+        merged_tracker = TokenUsageTracker.merge(primary_tracker, backup_tracker)
         return merged_tracker.to_dict()
 
     def reset_token_usage(self) -> None:
@@ -820,9 +859,7 @@ class MultiCredentialVLM(VLMBase):
             "temperature": first.temperature,
             "max_retries": first.max_retries,
             "timeout": first.timeout,
-            "max_tokens": (
-                min(configured_token_limits) if configured_token_limits else None
-            ),
+            "max_tokens": (min(configured_token_limits) if configured_token_limits else None),
             "thinking": first.thinking,
         }
         super().__init__(config)

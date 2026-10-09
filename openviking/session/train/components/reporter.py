@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import inspect
 import sys
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
@@ -17,7 +16,9 @@ except Exception:  # pragma: no cover - rich is optional
     Console = None
     Text = None
 
-from openviking.session.train.components.progress import format_duration, format_label, label_style
+from openviking.session.train.components.progress import format_label, label_style
+from openviking.session.train.utils import call_hook
+from openviking.utils.progress import format_duration
 
 HookResult = Awaitable[None] | None
 ReportHookResult = Awaitable[dict[str, Any] | None] | dict[str, Any] | None
@@ -195,7 +196,8 @@ async def emit_run_summary(
 
     lifecycle_hooks = list(getattr(context, "lifecycle_hooks", []) or [])
     for hook in lifecycle_hooks:
-        result = hook.on_run_summary(
+        await call_hook(
+            hook.on_run_summary,
             title=title,
             fields=fields,
             baseline_eval=baseline_eval,
@@ -206,8 +208,6 @@ async def emit_run_summary(
             rollouts_index_path=rollouts_index_path,
             latest_failed_rollout=latest_failed_rollout,
         )
-        if inspect.isawaitable(result):
-            await result
 
 
 @dataclass(slots=True)
@@ -338,6 +338,11 @@ class ConsolePipelineReporter(NoopPipelineLifecycleHook):
             [
                 ("epoch", report["epoch"]),
                 ("commits", report["committed_rollout_count"], "cyan"),
+                *(
+                    [("skipped", report["skipped_rollout_count"], "yellow")]
+                    if report.get("skipped_rollout_count")
+                    else []
+                ),
                 ("errors", error_count, "green" if error_count == 0 else "red bold"),
                 *_cost_field(report),
             ],
@@ -392,13 +397,7 @@ class ConsolePipelineReporter(NoopPipelineLifecycleHook):
 
     def _print_line(self, label: str, fields: list[tuple[Any, ...]]) -> None:
         if not self.use_rich:
-            print(
-                f"[{label}] "
-                + " ".join(
-                    _plain_field(item)
-                    for item in fields
-                )
-            )
+            print(f"[{label}] " + " ".join(_plain_field(item) for item in fields))
             return
         console = Console()
         line = Text()
@@ -609,12 +608,6 @@ def _test_summary_fragments(data: dict[str, Any]) -> list[tuple[str, str]]:
         (f"{data.get('passed_count')}/{data.get('case_count')}", _passed_style(data)),
     ]
     return fragments
-
-
-def fmt_score(value: Any) -> str:
-    if value is None:
-        return "n/a"
-    return f"{float(value):.6f}"
 
 
 def fmt_percent(value: Any) -> str:

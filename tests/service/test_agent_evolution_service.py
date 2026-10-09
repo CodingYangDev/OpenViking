@@ -94,6 +94,39 @@ async def test_list_trajectories_by_experience_rejects_other_user_uri():
 
 
 @pytest.mark.asyncio
+async def test_learn_experiences_delegates_to_session_compressor():
+    compressor = Mock()
+    compressor.learn_pending_experiences = AsyncMock(
+        return_value={"case_count": 1, "trajectory_count": 2}
+    )
+    service = AgentEvolutionService(
+        viking_fs=Mock(),
+        vikingdb=Mock(),
+        session_compressor=compressor,
+    )
+    uris = ["viking://user/alice/memories/trajectories/case_a/a.md"]
+
+    result = await service.learn_experiences(
+        ctx=_ctx(),
+        trajectory_uris=uris,
+        case_names=None,
+        max_cases=5,
+        retry_failed=True,
+        lease_seconds=120,
+    )
+
+    assert result == {"case_count": 1, "trajectory_count": 2}
+    compressor.learn_pending_experiences.assert_awaited_once_with(
+        ctx=_ctx(),
+        trajectory_uris=uris,
+        case_names=None,
+        max_cases=5,
+        retry_failed=True,
+        lease_seconds=120,
+    )
+
+
+@pytest.mark.asyncio
 async def test_list_trajectories_by_experience_filters_created_at_by_utc_date():
     experience_uri = "viking://user/alice/memories/experiences/exchange.md"
     viking_fs = Mock()
@@ -273,3 +306,29 @@ async def test_get_experience_outcome_distribution_rejects_other_user_uri():
             experience_uri="viking://user/bob/memories/experiences/exchange.md",
             ctx=_ctx(),
         )
+
+
+@pytest.mark.asyncio
+async def test_learning_shutdown_before_worker_starts_marks_task_cancelled(monkeypatch):
+    from types import SimpleNamespace
+
+    from openviking.service import agent_evolution_service as module
+
+    tracker = SimpleNamespace(
+        create=AsyncMock(return_value=SimpleNamespace(task_id="learn-1")),
+        start=AsyncMock(),
+        complete=AsyncMock(),
+        fail=AsyncMock(),
+        mark_cancelled=AsyncMock(),
+    )
+    monkeypatch.setattr(module, "get_task_tracker", lambda: tracker)
+    compressor = SimpleNamespace(learn_pending_experiences=AsyncMock())
+    service = AgentEvolutionService(viking_fs=Mock(), session_compressor=compressor)
+    assert await service.learn_experiences(ctx=_ctx(), wait=False) == {"task_id": "learn-1"}
+    # Do not yield: shutdown must also handle a worker that hasn't entered its try block.
+    await service.close_background_tasks()
+    compressor.learn_pending_experiences.assert_not_awaited()
+    tracker.mark_cancelled.assert_awaited_once_with(
+        "learn-1", account_id="account", user_id="alice"
+    )
+    assert not service._learning_tasks

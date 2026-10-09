@@ -452,9 +452,7 @@ class _SemanticMixin:
                 )
             analyzer = IntentAnalyzer(
                 max_recent_messages=5,
-                query_planner=await self._vlm_resolver.get_query_planner(
-                    real_ctx.account_id
-                ),
+                query_planner=await self._vlm_resolver.get_query_planner(real_ctx.account_id),
             )
             with telemetry.measure("search.intent_analysis"):
                 query_plan = await analyzer.analyze(

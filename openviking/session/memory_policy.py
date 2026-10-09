@@ -10,11 +10,21 @@ from typing import Any, Optional
 
 from openviking.session.memory.constants import (
     AGENT_EVOLUTION_MEMORY_TYPES,
+    CASE_MEMORY_TYPE,
+    DEFAULT_EXTRACT_MAX_ITERATIONS,
     EXPERIENCE_MEMORY_TYPE,
+    TRAJECTORY_MEMORY_TYPE,
 )
 from openviking_cli.exceptions import InvalidArgumentError
 
-_POLICY_KEYS = {"self", "peer", "memory_types", "working_memory"}
+_POLICY_KEYS = {
+    "self",
+    "peer",
+    "memory_types",
+    "working_memory",
+    "extract_max_iterations",
+    "extract_thinking",
+}
 _TARGET_KEYS = {"enabled"}
 _TRUE_STRINGS = {"1", "true", "yes", "on"}
 _FALSE_STRINGS = {"", "0", "false", "no", "off"}
@@ -79,6 +89,8 @@ def _parse_memory_types(data: Any) -> Optional[set[str]]:
         memory_types.add(item)
     if EXPERIENCE_MEMORY_TYPE in memory_types:
         memory_types.update(AGENT_EVOLUTION_MEMORY_TYPES)
+    elif TRAJECTORY_MEMORY_TYPE in memory_types:
+        memory_types.add(CASE_MEMORY_TYPE)
     else:
         memory_types.difference_update(AGENT_EVOLUTION_MEMORY_TYPES)
     return memory_types
@@ -92,6 +104,20 @@ class MemoryPolicy:
     peer_enabled: bool = True
     memory_types: Optional[set[str]] = None
     working_memory_enabled: bool = True
+    extract_max_iterations: int = DEFAULT_EXTRACT_MAX_ITERATIONS
+    extract_thinking: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.extract_thinking, bool):
+            raise InvalidArgumentError("memory_policy.extract_thinking must be a boolean")
+        if (
+            isinstance(self.extract_max_iterations, bool)
+            or not isinstance(self.extract_max_iterations, int)
+            or self.extract_max_iterations < 1
+        ):
+            raise InvalidArgumentError(
+                "memory_policy.extract_max_iterations must be a positive integer"
+            )
 
     @classmethod
     def default(cls) -> "MemoryPolicy":
@@ -117,6 +143,10 @@ class MemoryPolicy:
             working_memory_enabled=_target_enabled(
                 data.get("working_memory"), default_enabled=True, key="working_memory"
             ),
+            extract_max_iterations=data.get(
+                "extract_max_iterations", DEFAULT_EXTRACT_MAX_ITERATIONS
+            ),
+            extract_thinking=data.get("extract_thinking", False),
         )
 
     def validate_memory_types(self, known_memory_types: set[str]) -> None:
@@ -135,6 +165,10 @@ class MemoryPolicy:
         }
         if not self.working_memory_enabled:
             data["working_memory"] = {"enabled": False}
+        if self.extract_max_iterations != DEFAULT_EXTRACT_MAX_ITERATIONS:
+            data["extract_max_iterations"] = self.extract_max_iterations
+        if self.extract_thinking:
+            data["extract_thinking"] = True
         if self.memory_types is not None:
             data["memory_types"] = sorted(self.memory_types)
         return data

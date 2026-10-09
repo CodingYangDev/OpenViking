@@ -119,7 +119,6 @@ def _fill_telemetry_summary_to_span(snapshot, span):
         logger.debug("failed to fill telemetry summary into span", exc_info=True)
 
 
-
 async def run_with_telemetry(
     *,
     operation: str,

@@ -46,6 +46,17 @@ Session API 按认证用户作用域访问会话，并返回 canonical user sess
 | memory_policy | object | 否 | None | 会话默认的记忆抽取策略。可选的 `self` 和 `peer` 开关控制写入目标；可选的 `working_memory.enabled=false` 跳过 archive summary；可选的顶层 `memory_types` 将抽取限制为指定的 enabled memory schema。包含 `experiences` 时会自动激活 `cases` 和 `trajectories`；不包含 `experiences` 时，显式传入的 `cases` 和 `trajectories` 会被忽略。所有 `enabled` 值都应使用 JSON 布尔值。旧版 boolean-like 值暂时仍兼容（字符串 `"false"` 会正确解析为 false），但会产生弃用警告。未传或为 `null` 时允许所有 enabled memory schema。非法结构或未知 memory type 会以 `InvalidArgumentError` 拒绝。 |
 | auto_commit_policy | object | 否 | None | 可选的自动 commit 策略（见下表）。传入的字段会被校验并 clamp 到取值范围，然后合并到默认值之上；最终生效的策略会在响应的 `result.auto_commit_policy` 中返回，并持久化到 session meta。省略时，新 Session 先继承 `server.user_config_defaults.auto_commit_policy`，再沿用现有 `memory.session_auto_commit.enabled` 行为。之后可通过 `update_session_config()` 部分更新或禁用该策略。 |
 
+可通过正整数 `memory_policy.extract_max_iterations` 调整每个会话记忆抽取批次的初始
+LLM 迭代预算，默认 `3`。例如创建会话时传入 `{"memory_policy": {"extract_max_iterations": 6}}`。
+预算包含首次 LLM 调用；现有工具调用和格式修复逻辑仍可能追加轮数，因此它不是严格的请求次数
+硬上限。合法的空操作结果仍会立即结束，不会自动重试。此配置不改变独立的 Agent 进化或合并循环。
+
+可通过布尔值 `memory_policy.extract_thinking` 控制会话记忆提取每轮 LLM 调用的
+thinking，默认 `false`。例如 `{"memory_policy": {"extract_thinking": true}}`。
+只接受 JSON 布尔值，不接受字符串或数字。该参数沿用 commit、session、user 的
+策略优先级，随 commit 持久化，并应用到每个提取批次；不修改全局模型配置，
+也不影响独立的摘要、经验优化或合并调用。
+
 `auto_commit_policy` 字段（均为可选；存在 policy 时，未传字段回退到默认值）：
 
 | 字段 | 类型 | 默认值 | 上限 | 说明 |

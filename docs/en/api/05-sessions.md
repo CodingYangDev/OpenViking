@@ -46,6 +46,22 @@ Create a new session. Sessions are containers for conversations, storing message
 | memory_policy | object | No | None | Default memory extraction policy for the session. Optional `self` and `peer` switches control write targets, optional `working_memory.enabled=false` skips archive summaries, and optional top-level `memory_types` limits extraction to specific enabled memory schemas. Including `experiences` automatically activates `cases` and `trajectories`; without `experiences`, explicitly supplied `cases` and `trajectories` are ignored. Use JSON booleans for every `enabled` value. Legacy boolean-like values remain accepted temporarily (including string `"false"`, which is parsed as false) but emit a deprecation warning. When `memory_types` is omitted or `null`, all enabled memory schemas are allowed. Invalid shapes or unknown memory types are rejected with `InvalidArgumentError`. |
 | auto_commit_policy | object | No | None | Optional auto-commit policy (see table below). Any provided fields are validated, clamped to their bounds, and merged over the defaults; the effective policy is returned in the response `result.auto_commit_policy` and persisted into session metadata. If omitted, the new Session inherits `server.user_config_defaults.auto_commit_policy`, then the existing `memory.session_auto_commit.enabled` behavior. The policy can later be partially updated or disabled through `update_session_config()`. |
 
+Set `memory_policy.extract_max_iterations` to a positive integer to adjust the initial
+LLM iteration budget for each session-memory extraction batch (default: `3`), for
+example `{"memory_policy": {"extract_max_iterations": 6}}` when creating a session.
+The budget includes the first LLM call. Existing tool-call and format-repair
+extensions may add rounds, so this is not a hard request limit; a valid empty
+operation plan still finishes immediately. Separate agent-evolution/merge loops
+are not changed by this setting.
+
+Set `memory_policy.extract_thinking` to a boolean to control thinking for each
+session-memory extraction LLM call (default: `false`), for example
+`{"memory_policy": {"extract_thinking": true}}`. Only JSON booleans are accepted.
+The setting follows the existing commit/session/user policy precedence, is
+persisted with the commit, and applies to every extraction batch. It does not
+change the global model configuration or separate summary, agent-evolution, or
+merge calls.
+
 `auto_commit_policy` fields (all optional; omitted fields fall back to the defaults when a policy is present):
 
 | Field | Type | Default | Max | Description |

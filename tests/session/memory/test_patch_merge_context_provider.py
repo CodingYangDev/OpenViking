@@ -49,35 +49,38 @@ async def test_patch_merge_context_provider_prefetch_reads_originals_and_renders
             )
         ],
     )
-    provider.read_file = AsyncMock(
+    provider._eval_memory = AsyncMock(
         return_value={
-            "memory_type": "experiences",
-            "experience_name": "booking",
-            "content": "1\told line\n2\tkeep line",
+            "prefetched_memory_1": {
+                "memory_type": "experiences",
+                "experience_name": "booking",
+                "content": "1\told line\n2\tkeep line",
+            }
         }
     )
 
     messages = await provider.prefetch()
 
     assert provider.get_tools() == []
-    assert provider.read_file.await_count == 1
-    read_message = json.loads(messages[0]["content"])
-    assert read_message["tool_call_name"] == "read"
-    assert read_message["args"] == {"uri": "viking://user/u/memories/experiences/booking.md"}
-    assert read_message["result"]["experience_name"] == "booking"
-    assert messages[1]["role"] == "user"
-    assert messages[1]["content"].startswith("# Memory File Patches")
-    assert "Patch 1" in messages[1]["content"]
+    provider._eval_memory.assert_awaited_once()
+    call = messages[0]["tool_calls"][0]
+    assert call["function"]["name"] == "eval"
+    assert "prefetched_memory_1 = sdk.read(" in json.loads(call["function"]["arguments"])["code"]
+    assert messages[1]["tool_call_id"] == call["id"]
+    assert json.loads(messages[1]["content"])["prefetched_memory_1"]["experience_name"] == "booking"
+    assert messages[2]["role"] == "user"
+    assert messages[2]["content"].startswith("# Memory File Patches")
+    assert "Patch 1" in messages[2]["content"]
     # Patch headers should not include target_uri/target_name/memory_type
-    assert "target_uri:" not in messages[1]["content"]
-    assert "target_name:" not in messages[1]["content"]
-    assert "  content:" in messages[1]["content"]
-    assert "--- content.before" not in messages[1]["content"]
-    assert "+++ content.after" not in messages[1]["content"]
-    assert "    -old line" in messages[1]["content"]
-    assert "    +new line" in messages[1]["content"]
-    assert "     keep line" in messages[1]["content"]  # n=1 context line
-    assert "  status:" not in messages[1]["content"]
+    assert "target_uri:" not in messages[2]["content"]
+    assert "target_name:" not in messages[2]["content"]
+    assert "  content:" in messages[2]["content"]
+    assert "--- content.before" not in messages[2]["content"]
+    assert "+++ content.after" not in messages[2]["content"]
+    assert "    -old line" in messages[2]["content"]
+    assert "    +new line" in messages[2]["content"]
+    assert "     keep line" in messages[2]["content"]  # n=1 context line
+    assert "  status:" not in messages[2]["content"]
 
 
 @pytest.mark.asyncio
@@ -111,13 +114,7 @@ async def test_patch_merge_context_provider_prefetch_searches_and_reads_extra_ca
             *[f"viking://user/u/memories/experiences/candidate_{idx}.md" for idx in range(10)],
         ]
     )
-    provider.read_file = AsyncMock(
-        return_value={
-            "memory_type": "experiences",
-            "experience_name": "candidate",
-            "content": "candidate content",
-        }
-    )
+    provider._eval_memory = AsyncMock(return_value={})
 
     messages = await provider.prefetch()
 
@@ -125,12 +122,12 @@ async def test_patch_merge_context_provider_prefetch_searches_and_reads_extra_ca
     _, search_kwargs = provider.search_files.await_args
     assert search_kwargs["search_uris"] == ["viking://user/u/memories/experiences"]
     assert search_kwargs["limit"] == 10
-    assert provider.read_file.await_count == 6
-    read_uris = [call.args[0] for call in provider.read_file.await_args_list]
-    assert read_uris[0] == "viking://user/u/memories/experiences/book.md"
-    assert "viking://user/u/memories/experiences/candidate_0.md" in read_uris
-    assert "viking://user/u/memories/experiences/candidate_4.md" in read_uris
-    assert "viking://user/u/memories/experiences/candidate_5.md" not in read_uris
+    provider._eval_memory.assert_awaited_once()
+    code = provider._eval_memory.await_args.args[0]
+    assert "viking://user/u/memories/experiences/book.md" in code
+    assert "viking://user/u/memories/experiences/candidate_0.md" in code
+    assert "viking://user/u/memories/experiences/candidate_4.md" in code
+    assert "viking://user/u/memories/experiences/candidate_5.md" not in code
     assert messages[-1]["content"].startswith("# Memory File Patches")
 
 
@@ -150,19 +147,14 @@ async def test_patch_merge_context_provider_skips_extra_candidates_for_existing_
     provider.search_files = AsyncMock(
         return_value=["viking://user/u/memories/experiences/other.md"]
     )
-    provider.read_file = AsyncMock(
-        return_value={
-            "memory_type": "experiences",
-            "experience_name": "booking",
-            "content": "1\told line",
-        }
-    )
+    provider._eval_memory = AsyncMock(return_value={})
 
     messages = await provider.prefetch()
 
     provider.search_files.assert_not_awaited()
-    provider.read_file.assert_awaited_once_with(uri)
-    assert len(messages) == 2
+    provider._eval_memory.assert_awaited_once()
+    assert uri in provider._eval_memory.await_args.args[0]
+    assert len(messages) == 3
 
 
 @pytest.mark.asyncio
@@ -197,23 +189,17 @@ async def test_patch_merge_context_provider_caps_extra_candidate_reads_at_ten():
             *[f"viking://user/u/memories/experiences/candidate_{idx}.md" for idx in range(20)],
         ]
     )
-    provider.read_file = AsyncMock(
-        return_value={
-            "memory_type": "experiences",
-            "experience_name": "candidate",
-            "content": "candidate content",
-        }
-    )
+    provider._eval_memory = AsyncMock(return_value={})
 
     await provider.prefetch()
 
     _, search_kwargs = provider.search_files.await_args
     assert search_kwargs["limit"] == 20
-    assert provider.read_file.await_count == 22
-    read_uris = [call.args[0] for call in provider.read_file.await_args_list]
-    assert required_uris[-1] in read_uris
-    assert "viking://user/u/memories/experiences/candidate_9.md" in read_uris
-    assert "viking://user/u/memories/experiences/candidate_10.md" not in read_uris
+    assert provider._eval_memory.await_count == 2
+    code = "\n".join(call.args[0] for call in provider._eval_memory.await_args_list)
+    assert required_uris[-1] in code
+    assert "viking://user/u/memories/experiences/candidate_9.md" in code
+    assert "viking://user/u/memories/experiences/candidate_10.md" not in code
 
 
 @pytest.mark.asyncio
@@ -382,12 +368,16 @@ def test_patch_merge_context_provider_instruction_mentions_path_field_normalizat
     instruction = provider.instruction()
 
     assert "independent extraction patch proposals" in instruction
-    assert "same identity under the active memory schema" in instruction
-    assert "same object or occurrence" in instruction
-    assert "overlapping topic only identifies candidates" in instruction
-    assert "never sufficient evidence" in instruction
-    assert "every substantive atomic fact" in instruction
-    assert "If identity is uncertain" in instruction
+    assert "same schema-defined identity" in instruction
+    assert "same entity/event" in instruction
+    assert "same owner and behavioral choice dimension" in instruction
+    assert "Similarity or shared topics are insufficient" in instruction
+    assert "preserve each still-valid distinct fact" in instruction
+    assert "surviving schema-valid destination" in instruction
+    assert "If identity, validity, or destination is uncertain, keep the source" in instruction
+    assert "Split only into distinct schema-valid identities" in instruction
+    assert "never invent identities" in instruction
+    assert "Keep one identity in one object" in instruction
     assert "directory/filename fields" in instruction
     assert "schema identifiers" in instruction
     assert "book not books" in instruction

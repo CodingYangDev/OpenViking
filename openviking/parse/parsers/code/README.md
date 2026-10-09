@@ -30,8 +30,7 @@ OpenViking 通过 **Code Parser** 模块实现对代码仓库的整体解析与�
 
 ```python
 client.add_resource(
-    "https://github.com/volcengine/OpenViking",
-    to="viking://resources/github/volcengine/OpenViking"
+    "https://github.com/volcengine/OpenViking", to="viking://resources/github/volcengine/OpenViking"
 )
 ```
 
@@ -116,13 +115,13 @@ viking://resources/github/volcengine/OpenViking/
 client.add_resource(
     "https://github.com/volcengine/OpenViking",
     to="viking://resources/github/volcengine/OpenViking",
-    reason="引入 OpenViking 源码作为参考"
+    reason="引入 OpenViking 源码作为参考",
 )
 
 # 搜索代码逻辑
 results = client.find(
     "OpenViking 和 VikingDB 的关系是什么？",
-    target_uri="viking://resources/github/volcengine/OpenViking/OpenViking/docs/zh/"
+    target_uri="viking://resources/github/volcengine/OpenViking/OpenViking/docs/zh/",
 )
 ```
 

@@ -491,9 +491,7 @@ class SkillProcessor:
             "content": content,
         }
         if self._vlm_resolver is None:
-            raise RuntimeError(
-                "SkillProcessor requires a VLM resolver for account-owned work"
-            )
+            raise RuntimeError("SkillProcessor requires a VLM resolver for account-owned work")
         extraction_kwargs["vlm"] = await self._vlm_resolver.get_vlm(ctx.account_id)
         extraction_result = await extract_skill_privacy_values(**extraction_kwargs)
         if not extraction_result.values:

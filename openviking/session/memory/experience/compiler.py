@@ -7,7 +7,7 @@ import ast
 from dataclasses import dataclass, field
 from typing import Any
 
-from openviking.session.memory.experience_dag import (
+from openviking.session.memory.experience.dag import (
     DEFAULT_BRANCH_CHOICE,
     MAX_CONTENT_BYTES,
     AskUser,
@@ -22,7 +22,13 @@ from openviking.session.memory.experience_dag import (
 
 _NODE_FACTORIES = {"ask", "call", "check", "tell", "choose"}
 _RELATION_METHODS = {"then", "if_true", "if_false", "case", "default"}
-_CONTROL_PLANE_TOOLS = {"search_exp", "search_experience", "read_experience"}
+_CONTROL_PLANE_TOOLS = {
+    "ask_for_advice",
+    "search_advice",
+    "search_exp",
+    "search_experience",
+    "read_experience",
+}
 
 
 @dataclass(slots=True)

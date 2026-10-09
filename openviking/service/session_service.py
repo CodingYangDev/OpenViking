@@ -43,19 +43,13 @@ from openviking_cli.exceptions import (
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.agent_evolution_config import (
     AgentEvolutionConfig,
-    DagDeciderConfig,
 )
-from openviking_cli.utils.config.jev_config import JevConfig
 from openviking_cli.utils.config.memory_config import SessionAutoCommitConfig
 
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from openviking.config.vlm import VLMResolver
-    from openviking.service.experience_runtime import (
-        SearchExperienceRequest,
-        SearchExperienceResult,
-    )
     from openviking.session.compressor_v3 import SessionCompressorV3
     from openviking.usage_reporter import UsageReporter
 
@@ -74,8 +68,6 @@ class SessionService:
         self._session_compressor = session_compressor
         self._tool_output_externalization_config = ToolOutputExternalizationConfig()
         self._agent_evolution_default_enabled = AgentEvolutionConfig().enabled
-        self._agent_evolution_default_dag_decider: Optional[DagDeciderConfig] = None
-        self._jev_config: Optional[JevConfig] = None
         self._runtime_config_manager: Optional[Any] = None
         self._vlm_resolver: Optional["VLMResolver"] = None
         self._default_user_memory_policy: Optional[Dict[str, Any]] = None
@@ -126,11 +118,6 @@ class SessionService:
     def set_agent_evolution_config(self, config: AgentEvolutionConfig) -> None:
         """Set the default used when an account has no persisted override."""
         self._agent_evolution_default_enabled = config.enabled
-        self._agent_evolution_default_dag_decider = config.dag_decider
-
-    def set_jev_config(self, config: Optional[JevConfig]) -> None:
-        """Set the shared Jev decision-service connection."""
-        self._jev_config = config.model_copy(deep=True) if config is not None else None
 
     def set_runtime_config_manager(self, manager: Any) -> None:
         """Bind the authoritative account runtime-config reader."""
@@ -145,18 +132,6 @@ class SessionService:
             "agent_evolution",
         )
         return self._agent_evolution_default_enabled if setting is None else setting.enabled
-
-    async def get_dag_decider_config(self, account_id: str) -> Optional[DagDeciderConfig]:
-        """Resolve account decision policy with the cluster policy as field fallback."""
-        if self._runtime_config_manager is not None:
-            setting = await self._runtime_config_manager.get_account(
-                account_id,
-                "agent_evolution",
-            )
-            configured = getattr(setting, "dag_decider", None)
-            if configured is not None:
-                return configured
-        return self._agent_evolution_default_dag_decider
 
     def set_usage_reporter(self, usage_reporter: Optional["UsageReporter"]) -> None:
         """Set the usage reporter for newly created sessions."""
@@ -262,6 +237,7 @@ class SessionService:
         auto_commit_policy: Optional[Dict[str, Any]] = None,
         update_auto_commit_policy: bool = False,
         event_tags: Optional[List[str]] = None,
+        extraction_context: str = "",
     ) -> Session:
         """Create a session and persist its root path.
 
@@ -275,6 +251,8 @@ class SessionService:
             event_tags: Optional default custom scalar tags for event memories
                 (``config.memory_extraction_config.events.tags``). Normalized to
                 canonical ``key=value`` form; ``None`` leaves no session default.
+            extraction_context: Trusted text included in every long-term-memory
+                extraction prompt for this session, but not in conversation evidence.
 
         Raises:
             AlreadyExistsError: If a session with the given ID already exists
@@ -307,6 +285,7 @@ class SessionService:
                     event_tags,
                     discard_invalid=True,
                 )
+            session.meta.extraction_context = extraction_context
             await session.ensure_exists()
             self._record_lifecycle_metric("create", "ok")
             return session
@@ -370,23 +349,6 @@ class SessionService:
             logger.debug("Failed to list sessions", exc_info=True)
 
         return list(sessions_by_id.values())
-
-    async def search_exp(
-        self, session_id: str, request: "SearchExperienceRequest", ctx: RequestContext
-    ) -> "SearchExperienceResult":
-        """Select Experience DAGs from context and return their current instructions."""
-        from openviking.service.experience_runtime import ExperienceRuntime
-
-        self._ensure_initialized()
-        if self._vlm_resolver is None:
-            raise NotInitializedError("Account VLM resolver")
-        session = await self.get(session_id, ctx, auto_create=False)
-        return await ExperienceRuntime(
-            self._viking_fs,
-            self._vlm_resolver,
-            dag_decider_config=await self.get_dag_decider_config(ctx.account_id),
-            jev_config=self._jev_config,
-        ).search(session._session_uri, request, ctx)
 
     async def delete(self, session_id: str, ctx: RequestContext) -> bool:
         """Delete a session.
@@ -526,6 +488,7 @@ class SessionService:
             ctx=ctx,
             archive_uri=archive_uri,
             agent_evolution_enabled=await self.get_agent_evolution_enabled(ctx.account_id),
+            extraction_context=session.meta.extraction_context,
         )
         self._record_lifecycle_metric("extract", "ok")
         return memories
@@ -550,26 +513,36 @@ class SessionService:
         ctx: RequestContext,
         *,
         event_tags: Optional[List[str]] = None,
+        extraction_context: Optional[str] = None,
+        update_extraction_context: bool = False,
         auto_commit_policy: Optional[Dict[str, Any]] = None,
         update_auto_commit_policy: bool = False,
     ) -> Session:
         """Update the mutable parts of a session's config.
 
         Only fields explicitly provided are changed. ``event_tags`` uses
-        ``None`` for no change and ``[]`` to clear. ``auto_commit_policy`` is
-        merged field-by-field when ``update_auto_commit_policy`` is true; a
-        policy value of ``None`` disables automatic commits.
+        ``None`` for no change and ``[]`` to clear. ``extraction_context`` is
+        replaced when ``update_extraction_context`` is true. ``auto_commit_policy``
+        is merged field-by-field when ``update_auto_commit_policy`` is true; a policy
+        value of ``None`` disables automatic commits.
         """
         self._ensure_initialized()
+        update_extraction_context = update_extraction_context or extraction_context is not None
         session = await self.get(session_id, ctx)
         normalized_event_tags = (
             normalize_search_tags(event_tags, discard_invalid=True)
             if event_tags is not None
             else None
         )
-        if normalized_event_tags is not None or update_auto_commit_policy:
+        if (
+            normalized_event_tags is not None
+            or update_extraction_context
+            or update_auto_commit_policy
+        ):
             await session.update_config(
                 event_search_tags=normalized_event_tags,
+                extraction_context=extraction_context,
+                update_extraction_context=update_extraction_context,
                 auto_commit_policy=auto_commit_policy,
                 update_auto_commit_policy=update_auto_commit_policy,
             )

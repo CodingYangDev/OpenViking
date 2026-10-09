@@ -353,6 +353,7 @@ def is_content_root_uri(
         and len(parts) == classification.content_index + 1
     )
 
+
 def _validate_peer_id_segments(parts: list[str]) -> None:
     if len(parts) >= 4 and parts[0] == "user" and parts[2] == "peers":
         _require_peer_id_segment(parts[3])

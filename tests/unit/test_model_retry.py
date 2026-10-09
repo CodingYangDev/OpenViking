@@ -370,3 +370,132 @@ def test_numeric_status_code_with_compact_error_code_context_still_matches():
     assert classify_api_error(RuntimeError("Error code:413-Payload Too Large")) == (
         ERROR_CLASS_INPUT_TOO_LARGE
     )
+
+
+def test_rate_limit_backoff_stays_capped_for_unlimited_attempts(monkeypatch):
+    import openviking.utils.model_retry as retry
+
+    monkeypatch.setattr(retry.random, "uniform", lambda low, high: 1.0)
+    assert [retry.rate_limit_retry_delay(i) for i in range(1, 8)] == [5, 10, 20, 40, 80, 120, 120]
+    assert retry.rate_limit_retry_delay(100_000) == 120
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize(
+    "kind", ["builtin", "read", "connect", "write", "pool", "httpcore", "ark", "openai"]
+)
+def test_classify_typed_timeouts_without_message_matching(kind, wrapped):
+    import httpcore
+    import httpx
+
+    if kind == "ark":
+        sdk = pytest.importorskip("volcenginesdkarkruntime._exceptions")
+        error = sdk.ArkAPITimeoutError(
+            request=httpx.Request("POST", "https://offline.invalid"), request_id="offline"
+        )
+    elif kind == "openai":
+        sdk = pytest.importorskip("openai")
+        error = sdk.APITimeoutError(request=httpx.Request("POST", "https://offline.invalid"))
+    else:
+        error = {
+            "builtin": TimeoutError,
+            "read": httpx.ReadTimeout,
+            "connect": httpx.ConnectTimeout,
+            "write": httpx.WriteTimeout,
+            "pool": httpx.PoolTimeout,
+            "httpcore": httpcore.ReadTimeout,
+        }[kind]("")
+    if wrapped:
+        wrapper = RuntimeError("request failed")
+        wrapper.__context__ = error
+        error = wrapper
+    assert classify_api_error(error) == ERROR_CLASS_TRANSIENT
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["400 invalid request", "401 Unauthorized", "403 Forbidden", "429 AccountQuotaExceeded"],
+)
+def test_timeout_cause_does_not_override_nonretryable_error(message):
+    import httpx
+
+    error = RuntimeError(message)
+    error.__cause__ = httpx.ReadTimeout("")
+    assert classify_api_error(error) != ERROR_CLASS_TRANSIENT
+
+
+@pytest.mark.asyncio
+async def test_retry_async_retries_empty_timeout_with_existing_backoff(monkeypatch):
+    import httpx
+
+    import openviking.utils.model_retry as retry
+
+    attempts = 0
+    delays = []
+
+    async def call():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise httpx.ReadTimeout("")
+        return "recovered"
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(retry.asyncio, "sleep", sleep)
+    assert await retry_async(call, max_retries=2, base_delay=1, jitter=False) == "recovered"
+    assert attempts == 3
+    assert delays == [1, 2]
+
+
+def test_retry_sync_timeout_still_respects_retry_limit(monkeypatch):
+    import openviking.utils.model_retry as retry
+
+    attempts = 0
+    delays = []
+
+    def call():
+        nonlocal attempts
+        attempts += 1
+        raise TimeoutError()
+
+    monkeypatch.setattr(retry.time, "sleep", delays.append)
+    with pytest.raises(TimeoutError):
+        retry_sync(call, max_retries=2, base_delay=1, jitter=False)
+    assert attempts == 3
+    assert delays == [1, 2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_backoff", [False, True])
+async def test_retry_async_preserves_cancellation_with_timeout(monkeypatch, during_backoff):
+    import asyncio
+
+    import openviking.utils.model_retry as retry
+
+    attempts = 0
+
+    async def call():
+        nonlocal attempts
+        attempts += 1
+        if during_backoff:
+            raise TimeoutError()
+        raise asyncio.CancelledError()
+
+    async def sleep(delay):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(retry.asyncio, "sleep", sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await retry_async(call, max_retries=3)
+    assert attempts == 1
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 413, 422])
+def test_timeout_cause_does_not_override_structured_client_error(status):
+    import httpx
+
+    error = _ProviderError(status_code=status)
+    error.__cause__ = httpx.ReadTimeout("")
+    assert classify_api_error(error) != ERROR_CLASS_TRANSIENT

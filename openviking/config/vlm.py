@@ -359,11 +359,7 @@ class AccountVLMProvider:
     def _invalidate(self, matches: Callable[[_RequestKey], bool]) -> None:
         with self._lock:
             self._epoch += 1
-            removed = [
-                self._bindings.pop(key)
-                for key in list(self._bindings)
-                if matches(key)
-            ]
+            removed = [self._bindings.pop(key) for key in list(self._bindings) if matches(key)]
             for resource in removed:
                 resource.bindings -= 1
                 if resource.bindings:

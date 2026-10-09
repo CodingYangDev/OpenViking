@@ -362,6 +362,7 @@ type CreateSessionOptions struct {
 	AutoCommitPolicy       map[string]any
 	DisableAutoCommit      bool
 	MemoryExtractionConfig map[string]any
+	ExtractionContext      string
 	Telemetry              any
 	Extra                  map[string]any
 }
@@ -375,6 +376,7 @@ type GetSessionOptions struct {
 type UpdateSessionConfigOptions struct {
 	MemoryExtractionConfig map[string]any
 	AutoCommitPolicy       *map[string]any
+	ExtractionContext      *string
 	Telemetry              any
 	Extra                  map[string]any
 }

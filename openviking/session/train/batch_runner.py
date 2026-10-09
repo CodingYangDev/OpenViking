@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import os
 import shutil
@@ -20,6 +19,7 @@ from openviking.session.train.components.event_recorder import (
     JsonlEventRecorder,
     JsonlPipelineEventHook,
 )
+from openviking.session.train.components.experience_learner import RemoteExperienceLearner
 from openviking.session.train.components.progress import format_label, label_style
 from openviking.session.train.components.remote import RemoteCaseLoader, RemoteRolloutExecutor
 from openviking.session.train.components.report_builder import PipelineReportBuilder
@@ -40,11 +40,10 @@ from openviking.session.train.context import ExecutionContext, PipelineContext
 from openviking.session.train.domain import (
     Case,
     ExperienceSet,
-    PolicyUpdatePlan,
     Rollout,
-    RolloutAnalysis,
 )
 from openviking.session.train.pipeline import OfflinePolicyOptimizationPipeline
+from openviking.session.train.utils import call_hook
 from openviking.telemetry import tracer
 from openviking_cli.client.http import AsyncHTTPClient
 from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
@@ -81,7 +80,7 @@ class BatchTrainEvalConfig:
     skip_final_eval: bool = False
     trials: int = 8
     train_trials: int = 1
-    reuse_train_rollout_cache: bool = False
+    reuse_train_rollout_cache: bool = True
     clean_result: bool = True
     keep_recent_results: int = 5
     events_path: str | None = None
@@ -191,7 +190,7 @@ class BatchTrainEvalReport:
     skip_baseline_eval: bool = False
     trials: int = 8
     train_trials: int = 1
-    reuse_train_rollout_cache: bool = False
+    reuse_train_rollout_cache: bool = True
     rollouts_root: str | None = None
     rollouts_index_path: str | None = None
     latest_failed_rollout: str | None = None
@@ -303,6 +302,7 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
             commit_concurrency=config.commit_concurrency,
             show_progress=True,
             progress_label="train",
+            event_recorder=event_recorder,
         )
         event_recorder.default_fields["run_id"] = policy_trainer.run_id
         pipeline = _build_pipeline(config, policy_trainer)
@@ -312,7 +312,9 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
             latest_pointer_path=_latest_rollouts_path(config),
         )
         remote_executor = getattr(pipeline, "rollout_executor", None)
-        if isinstance(remote_executor, (RemoteRolloutExecutor, CachedEpochZeroTrainRolloutExecutor)):
+        if isinstance(
+            remote_executor, (RemoteRolloutExecutor, CachedEpochZeroTrainRolloutExecutor)
+        ):
             remote_executor.on_rollout_complete = (
                 rollout_artifact_recorder.record_rollout_completion
             )
@@ -735,11 +737,13 @@ def _build_pipeline(
     return OfflinePolicyOptimizationPipeline(
         snapshotter=ContentHashPolicySnapshotter(prefix=f"{config.dataset}-policy-snapshot"),
         rollout_executor=rollout_executor,
-        rollout_analyzer=UnusedRolloutAnalyzer(),
-        gradient_estimator=UnusedGradientEstimator(),
-        policy_optimizer=UnusedPolicyOptimizer(),
-        policy_updater=UnusedPolicyUpdater(),
         policy_trainer=policy_trainer,
+        experience_learner=RemoteExperienceLearner(
+            client=policy_trainer.client,
+            poll_interval_seconds=config.commit_poll_interval_seconds,
+            show_progress=True,
+            event_recorder=policy_trainer.event_recorder,
+        ),
     )
 
 
@@ -842,11 +846,13 @@ class CachedEpochZeroTrainRolloutExecutor:
                 metadata["train_rollout_cache_path"] = str(self._path(case))
                 cached.metadata = metadata
                 results[index] = cached
-                await self._emit_rollout_complete(
-                    rollout=cached,
-                    index=index,
-                    context=context,
-                )
+                if self.on_rollout_complete is not None:
+                    await call_hook(
+                        self.on_rollout_complete,
+                        rollout=cached,
+                        index=index,
+                        context=context,
+                    )
 
         if misses:
             miss_rollouts = await self.delegate.execute(
@@ -857,11 +863,13 @@ class CachedEpochZeroTrainRolloutExecutor:
             for (index, case), rollout in zip(misses, miss_rollouts, strict=True):
                 self._write(case, rollout)
                 results[index] = rollout
-                await self._emit_rollout_complete(
-                    rollout=rollout,
-                    index=index,
-                    context=context,
-                )
+                if self.on_rollout_complete is not None:
+                    await call_hook(
+                        self.on_rollout_complete,
+                        rollout=rollout,
+                        index=index,
+                        context=context,
+                    )
 
         return [rollout for rollout in results if rollout is not None]
 
@@ -904,23 +912,6 @@ class CachedEpochZeroTrainRolloutExecutor:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    async def _emit_rollout_complete(
-        self,
-        *,
-        rollout: Rollout,
-        index: int,
-        context: ExecutionContext,
-    ) -> None:
-        if self.on_rollout_complete is None:
-            return
-        result = self.on_rollout_complete(
-            rollout=rollout,
-            index=index,
-            context=context,
-        )
-        if inspect.isawaitable(result):
-            await result
-
 
 def _require_benchmark_service_url(config: BatchTrainEvalConfig) -> str:
     if not config.benchmark_service_url:
@@ -929,36 +920,6 @@ def _require_benchmark_service_url(config: BatchTrainEvalConfig) -> str:
             "--benchmark-service-url"
         )
     return config.benchmark_service_url
-
-
-class UnusedRolloutAnalyzer:
-    async def analyze(self, rollout: Rollout, context: Any = None) -> RolloutAnalysis:
-        raise RuntimeError("eval uses rollout.evaluation; training is handled by policy_trainer")
-
-
-class UnusedGradientEstimator:
-    async def estimate(
-        self, analysis: RolloutAnalysis, experience_set: ExperienceSet, context: Any
-    ):
-        raise RuntimeError("policy_trainer handles training; gradient estimator must not run")
-
-
-class UnusedPolicyOptimizer:
-    async def plan(self, gradients: list[Any], policy_set: ExperienceSet, context: Any):
-        raise RuntimeError("policy_trainer handles training; policy optimizer must not run")
-
-
-class UnusedPolicyUpdater:
-    async def apply(
-        self,
-        plan: PolicyUpdatePlan,
-        policy_set: ExperienceSet,
-        context: Any,
-        *,
-        transaction_handle: Any = None,
-    ):
-        del transaction_handle
-        raise RuntimeError("policy_trainer handles training; policy updater must not run")
 
 
 def _write_report(report: BatchTrainEvalReport, config: BatchTrainEvalConfig) -> None:

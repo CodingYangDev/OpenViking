@@ -3,66 +3,61 @@ enabled: true
 stage: user
 peer_enabled: false
 operation_mode: upsert
-directory: "viking://resources/ss_memory/projects"
+directory: "viking://user/{{ user_space }}/memories/ss/projects"
 filename_template: "{{ project_id }}/project.md"
 description: |
-  SS 项目级记忆。正文只能来自 role=user 的明确表达。记录在同一项目内跨多个 Plot
-  或 Clip 生效的持久规则，包括整体创作方向、通用制作规范、角色与道具标准，以及
-  仍然有效的项目工作约定。project_id 必须来自 SS_CONTEXT。
+  SS 项目记忆：只记录用户明确声明在当前项目内跨多个 Plot 生效、且后续仍需复用的规则。
 
-  创建门槛（必须满足）：
-  - 用户原话明确作用于当前项目、多个 Plot、一个 Plot 范围或重复出现的项目实体。
-  - 不得因为全量抽取同时看到了某个 Plot，就把该 Plot 的剧情、时长、对白、分镜或
-    局部修改上卷到 ss_project。
-  - 移除 Plot/Clip 局部事实和工具元数据后，如果没有项目级事实，必须 no-op。
-  - 已被覆盖的旧要求和临时工作状态不能继续作为有效项目记忆。
+  先逐条分类，分类与作用层级相互独立。下列标签只用于内部筛选和评测，禁止写入 content：
+  - [额外配置]（保留）：用户明确表达、当前回复完成后仍有用、且不属于对象已有数据的要求。
+  - [基础配置]（不保留）：Project、Plot、Clip、角色、场景、道具、素材或当前 Prompt 中已有的信息。
+  - [单次行为]（不保留）：开始生成、重跑、查看、继续、发送确认卡等一次性动作。
+  - [结果评价]（不保留）：只有评价而没有可执行方向；同句中的明确方向须拆成独立 [额外配置]。
+  - [任务输入]（不保留）：完整剧本、分镜、Prompt、时间轴、附件转写或既有输出本身；可从中另行提炼未来仍有用的明确要求。
+  - [已失效]（不保留）：被同层级更晚的明确指令替代的旧要求。
+  - [模型推断]（不保留）：用户未明确表达、被补充、扩大对象或提升范围的内容。
+  - [非用户来源]（不保留）：System、Assistant、工具结果和路由元数据中的内容；它们只能辅助消解指代与路由。
+  - [上下文不足]（不保留）：无法从完整可用上下文唯一确定作用对象或范围的内容。
 
-  作用域与层级：
-  - ss_project 是同 project_id 下所有 ss_plot 的父级；ss_plot 再作为 ss_clip 的父级。
-  - “所有 Plot 都要生成转场空镜”只在 ss_project 写一次，不能为每个 Plot/Clip
-    批量创建占位文件。
-  - 一个 Plot 的剧情、空间、表演、总节奏或跨 Plot 衔接写入 ss_plot。
-  - 一个具体 Clip 的版本、时长、参考、局部修改和相邻 Clip 衔接写入 ss_clip。
-  - 跨项目协作偏好写入 ss_user。
-  同一事实只写入一个层级，明确的窄作用域优先。
+  共同规则：
+  - 每条候选必须拆成一个原子事实并完成上述分类；只有 [额外配置] 可以写入 Memory，同一事实只写一处。
+  - 不得通过给内容加上“[额外配置]”字样绕过筛选；必须先判断其真实类别。
+  - 事实必须由用户明确表达。允许压缩措辞，但不得补充要求、扩大对象或改变范围。
+  - 用户以“好的、确认、用2”等明确采纳 Assistant 提议时，可用被唯一指向的提议还原内容；纯执行确认仍是 [单次行为]。
+  - 作用层级只按用户当时表达所指向的对象和完整可用上下文判断，不能由分类标签决定。
+  - 可用显式 ID、资源归属、当前焦点、对象清单、前序对话、确认卡或工具操作解析真实对象；只能使用唯一匹配的真实 ID，禁止生成 placeholder。
+  - 同一规则在多个 Plot 重复出现不能自动提升为 Project；同层级相同配置合并并聚合证据。
+  - 同层级冲突时只保留最新明确要求；窄范围配置只在自身范围内覆盖宽范围默认值。
+  - “角色A参考素材X”“当前分辨率720”“拆成两个20秒片段”属于 [基础配置]；“梳理、检查、生成、重写、发确认卡”属于 [单次行为]，均不得写入。
+
+  Project 准入门槛（必须全部满足）：
+  - 只有用户原话明确表达项目级范围，才允许写入 ss_project。
+  - 用户原话明确使用“全片”“整个项目”“所有场/Clip”“每个场景”“后续所有视频”“所有某角色”等跨 Plot 范围，或明确列出多个 Plot。
+  - 删除当前 Plot/Clip 上下文后，该要求仍然成立。
+  - 该内容被分类为 [额外配置]，不是基础配置、单次行为、结果评价、任务输入、已失效内容或模型推断。
+  - 只有用户原话明确要求全片、整个项目、所有场/Clip 或跨多个 Plot 生效，才可写 Project；不能从当前项目、重复出现、批次内容或工具操作范围推断。
+  - 任一条件不满足，ss_project 必须 no-op。
+
+  禁止写入：
+  - 单个 Clip 的时长、版本、参考、动作、画面、声音或局部修改；唯一 Clip 路由 -> Clip。
+  - 单个 Plot 的剧情、空间、表演、总节奏或多个子 Clip 的共同要求；唯一 Plot focus/引用 -> Plot。
+  - 能定位到 Plot/Clip 的事实只能写 ss_plot/ss_clip，禁止复制或上卷到 Project。
+  - 从多个局部事实归纳出的全局风格或通用规则；没有子级文件也不能用 Project 兜底。
+  - Assistant 独立提出且未经用户明确采纳的镜头数、时长、声音、场景设计或执行方案。
+  - “好的”“继续”“请执行”“已提交”等仅确认执行或状态的内容。
+
+  示例：“全片每场留转场空镜” -> Project；“这场光线太暗” -> Plot；“这段延长到18秒” -> Clip。
+  project_id 只从同一条 User Message 的 [SS_TURN_CONTEXT] 解析。
+
+  格式：content 只含“- ”列表；一行一个最终约束，尽量不超过 40 字；不写标签、标题、解释、过程、行号或 Tab，保留必要 ID、数值、范围与否定。
 fields:
   - name: project_id
     type: string
     merge_op: immutable
-    description: 来自 SS_CONTEXT 的稳定项目 ID，不从显示名称推断。
-  - name: creative_direction
+    description: 同一条 User Message 的 [SS_TURN_CONTEXT] 中的稳定项目 ID。
+  - name: content
     type: string
     merge_op: patch
-    description: 用户确认的项目整体风格与创作意图，保留具体参考对象。
-  - name: shared_rules
-    type: string
-    merge_op: patch
-    description: |
-      跨多个 Plot 生效的制作规则，保留适用范围、条件、例外、时间、语言、连续性和写实要求。
-  - name: entity_constraints
-    type: string
-    merge_op: patch
-    description: |
-      项目级角色、声音、身份、服装、道具和选定参考标准，优先使用稳定业务对象 ID。
-  - name: workflow_constraints
-    type: string
-    merge_op: patch
-    description: |
-      当前仍有效的项目工作约定，排除已完成任务和“我暂时离开时自动确认”等临时授权。
-content_template: |-
-  ## 创作方向
-  {{ creative_direction }}
-
-  ## 通用制作规则
-  {{ shared_rules }}
-
-  ## 角色与道具标准
-  {{ entity_constraints }}
-
-  ## 有效工作约定
-  {{ workflow_constraints }}
+    description: 仅写通过全部 Project 准入条件的 [额外配置] 正文，不写分类标签；否则 no-op。禁止写入、复制、概括或汇总任何 Plot/Clip 局部事实；每行一个简短“- ”约束。
 embedding_template: |-
-  {{ creative_direction }}
-  {{ shared_rules }}
-  {{ entity_constraints }}
-  {{ workflow_constraints }}
+  {{ content }}

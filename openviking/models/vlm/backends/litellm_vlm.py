@@ -3,7 +3,6 @@
 """LiteLLM VLM Provider implementation with multi-provider support."""
 
 import base64
-import json
 import os
 import time
 from pathlib import Path
@@ -15,13 +14,13 @@ os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 import litellm
 from litellm import acompletion, completion
 
-from openviking.telemetry import tracer
+from openviking.telemetry import get_current_telemetry_stage, tracer
 from openviking.utils.message_format import format_messages, sanitize_openai_messages
 from openviking.utils.model_retry import retry_async, retry_sync
 from openviking.utils.multimodal import redact_image_data_urls
 from openviking_cli.utils import get_logger
 
-from ..base import ToolCall, VLMBase, VLMResponse
+from ..base import VLMBase, VLMResponse
 
 logger = get_logger(__name__)
 
@@ -356,20 +355,6 @@ class LiteLLMVLMProvider(VLMBase):
     def _effective_thinking(self, thinking: Optional[bool]) -> bool:
         return bool(self._thinking if thinking is None else thinking)
 
-    def _parse_tool_calls(self, message) -> List[ToolCall]:
-        """Parse tool calls from LiteLLM response message."""
-        tool_calls = []
-        if hasattr(message, "tool_calls") and message.tool_calls:
-            for tc in message.tool_calls:
-                args = tc.function.arguments
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {"raw": args}
-                tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
-        return tool_calls
-
     def _build_vlm_response(self, response, has_tools: bool) -> Union[str, VLMResponse]:
         """Build response from LiteLLM response. Returns str or VLMResponse based on has_tools."""
         if isinstance(response, str):
@@ -379,14 +364,7 @@ class LiteLLMVLMProvider(VLMBase):
         message = choice.message
 
         if has_tools:
-            usage = {}
-            if hasattr(response, "usage") and response.usage:
-                usage = {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                    "prompt_tokens_details": getattr(response.usage, "prompt_tokens_details", None),
-                }
+            usage = self._response_usage(response)
 
             return VLMResponse(
                 content=message.content,
@@ -448,7 +426,8 @@ class LiteLLMVLMProvider(VLMBase):
             response = completion(**kwargs)
             elapsed = time.perf_counter() - t0
             self._update_token_usage_from_response(response, duration_seconds=elapsed)
-            tracer.info(f"response={response}")
+            if get_current_telemetry_stage() != "memory_extract":
+                tracer.info(f"response={response}")
             if tools:
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))
@@ -484,7 +463,8 @@ class LiteLLMVLMProvider(VLMBase):
             response = await acompletion(**kwargs)
             elapsed = time.perf_counter() - t0
             self._update_token_usage_from_response(response, duration_seconds=elapsed)
-            tracer.info(f"response={response}")
+            if get_current_telemetry_stage() != "memory_extract":
+                tracer.info(f"response={response}")
             if tools:
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))

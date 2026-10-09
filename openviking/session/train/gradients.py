@@ -43,4 +43,6 @@ class PatchSemanticGradient:
 
     @property
     def target_uri(self) -> str | None:
-        return self.after_file.uri or (self.before_file.uri if self.before_file is not None else None)
+        return self.after_file.uri or (
+            self.before_file.uri if self.before_file is not None else None
+        )

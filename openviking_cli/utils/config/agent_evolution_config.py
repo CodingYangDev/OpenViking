@@ -10,9 +10,10 @@ from .runtime_field import RuntimeField
 
 
 class DagDeciderConfig(BaseModel):
-    """Decision policy for Experience DAG runtime nodes."""
+    """Experience relevance selection and DAG node decision policy."""
 
     provider: Literal["vlm", "jev"] = RuntimeField(default="vlm")
+    relevance_threshold: float = RuntimeField(default=0.7, ge=0, le=1)
     noul_true_threshold: float = RuntimeField(default=0.7, ge=0, le=1)
     noul_false_threshold: float = RuntimeField(default=0.3, ge=0, le=1)
     choice_confidence_threshold: float = RuntimeField(default=0.5, ge=0, le=1)

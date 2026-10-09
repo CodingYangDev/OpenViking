@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
 from openviking.session.memory.dataclass import MemoryFile, ResolvedOperation, ResolvedOperations
-from openviking.session.memory.experience_dag import DEFAULT_BRANCH_CHOICE, Dag, DagInstance
-from openviking.session.memory.experience_dag_compiler import compile_dag
+from openviking.session.memory.experience.compiler import compile_dag
+from openviking.session.memory.experience.dag import DEFAULT_BRANCH_CHOICE, Dag, DagInstance
 from openviking.session.memory.extract_loop import ExtractLoop
-from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 
 SOURCE = """dag = workflow("Check an order")
@@ -133,7 +131,9 @@ confirm.if_false(stop)"""
         "node = ask('x')",
         "dag = workflow('x')\nnode = ask('x')\nnode.then(unknown)",
         "dag = workflow('x')\nnode = ask('x')\nnode.case('x', node)",
+        "dag = workflow('x')\nnode = call('ask_for_advice')",
         "dag = workflow('x')\nnode = call('search_exp')",
+        "dag = workflow('x')\nnode = call('search_advice')",
         "dag = workflow('x')\nnode = call('search_experience')",
         "dag = workflow('x')\nnode = call('read_experience')",
         "dag = workflow('x')\nnode = check('x')\nnode.if_true(node)\nnode.if_true(node)",
@@ -228,7 +228,8 @@ order = tell("Finish")"""
     assert restored.links == file.links
 
 
-def test_invalid_experience_does_not_block_valid_experience_operation():
+@pytest.mark.asyncio
+async def test_invalid_experience_does_not_block_valid_experience_operation():
     loop = object.__new__(ExtractLoop)
     valid = operation(SOURCE, name="valid")
     invalid = operation(
@@ -238,26 +239,37 @@ def test_invalid_experience_does_not_block_valid_experience_operation():
         upsert_operations=[valid, invalid], delete_file_contents=[], errors=[]
     )
 
-    errors = loop._compile_experience_operations(batch)
-    loop._discard_invalid_experience_operations(batch, errors)
+    from openviking.session.memory.memory_type_registry import (
+        MemoryTypeRegistry,
+        resolve_memory_templates_dir,
+    )
+    from openviking.session.memory.memory_updater import ExtractContext
+
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_yaml(str(resolve_memory_templates_dir() / "experiences.yaml"))
+    loop.context_provider = SimpleNamespace(get_memory_schemas=lambda _: registry.list_all())
+    loop.ctx = None
+    loop._extract_context = ExtractContext([])
+    errors = await loop._validate_content_gates(batch)
+    loop._discard_invalid_content_operations(batch, errors)
 
     assert [item.memory_fields["experience_name"] for item in batch.upsert_operations] == ["valid"]
     assert dag(batch.upsert_operations[0].memory_fields["content"])
 
 
-@pytest.mark.asyncio
-async def test_invalid_source_blocks_upsert_and_delete():
-    updater = object.__new__(MemoryUpdater)
-    updater._registry = SimpleNamespace()
-    updater._get_viking_fs = lambda: AsyncMock()
-    updater._apply_upsert = AsyncMock()
-    batch = ResolvedOperations(
-        upsert_operations=[operation("dag = workflow('x')")],
-        delete_file_contents=[MemoryFile(uri="viking://user/u/memories/experiences/old.md")],
-        errors=[],
-    )
-
-    result = await updater.apply_operations(batch, ctx=SimpleNamespace())
-
-    assert result.errors
-    updater._apply_upsert.assert_not_awaited()
+def test_execution_order_survives_later_completion_of_lower_node_id():
+    run = instance("""dag = workflow("independent reminders")
+later = check("later request")
+early = check("opening request")
+later_note = tell("later reminder")
+early_note = tell("opening reminder")
+later.then(later_note)
+early.then(early_note)""")
+    run.merge_slot_values({"early": True, "early_note": True})
+    run.advance()
+    assert run.executed_nodes == [2, 4]
+    run = DagInstance.model_validate_json(run.model_dump_json())
+    run.merge_slot_values({"later": True, "later_note": True})
+    run.advance()
+    assert run.executed_nodes == [2, 4, 1, 3]
+    assert run.state == "completed"

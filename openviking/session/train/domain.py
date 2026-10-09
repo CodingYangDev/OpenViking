@@ -67,9 +67,8 @@ class PolicySet:
     async def lock(self):
         """Acquire a tree lock for the whole policy root directory.
 
-        Policy updates serialize on this lock so concurrent realtime/batch
-        training jobs plan and apply against a freshly reloaded policy set.
-        ``timeout=None`` means wait indefinitely until the lock is available.
+        Protect snapshot reads and validated policy writes. Model planning and
+        evaluation run outside this lock; commit-time validation rejects stale plans.
         """
 
         if self.viking_fs is None:
@@ -115,7 +114,7 @@ class Trajectory:
     uri: str
     content: str
     outcome: TrajectoryOutcome | str
-    retrieval_anchor: str
+    retrieval_anchor: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -189,8 +188,8 @@ class RubricEvaluation:
 class RolloutAnalysis:
     """Session evidence and optional independent policy gradients.
 
-    Direct Experience learning carries the original rollout. Evaluation may be unknown;
-    the generic framework's legacy trajectory collection stays empty in Agent Evolution.
+    Trajectories carry ordered compact steps from the original rollout.
+    External evaluation may be unknown and stays separate from reminder delivery.
     """
 
     evaluation: RubricEvaluation | None
@@ -232,6 +231,9 @@ class PolicyUpdatePlan:
 
     items: list[PolicyPlanItem] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Complete policy read set used by the optimizer, including absent targets.
+    # None means the whole policy snapshot; writes are always checked as well.
+    read_policy_uris: list[str] | None = None
 
 
 @dataclass(slots=True)

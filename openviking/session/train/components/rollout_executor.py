@@ -58,8 +58,7 @@ class SingleTurnLLMRolloutExecutor:
                 )
             if not account_id:
                 raise RuntimeError(
-                    "SingleTurnLLMRolloutExecutor requires account_id when using "
-                    "a VLM resolver"
+                    "SingleTurnLLMRolloutExecutor requires account_id when using a VLM resolver"
                 )
             vlm = await self.vlm_resolver.get_vlm(str(account_id))
         rollouts: list[Rollout] = []

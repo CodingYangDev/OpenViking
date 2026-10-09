@@ -72,9 +72,7 @@ def generate_api_key(account_id: str, user_id: str, seed: Optional[str] = None) 
     account_segment = _encode_segment(account_id)
     user_segment = _encode_segment(user_id)
     secret = (
-        derive_seeded_api_key_secret(user_id, seed)
-        if seed is not None
-        else secrets.token_hex(32)
+        derive_seeded_api_key_secret(user_id, seed) if seed is not None else secrets.token_hex(32)
     )
     secret_segment = _encode_segment(secret)
     return f"{account_segment}.{user_segment}.{secret_segment}"
@@ -125,9 +123,7 @@ class NewAPIKeyManager:
         """Return a cheap change signature for the on-disk key store."""
         return await self._legacy.compute_store_signature()
 
-    async def refresh_identity_registry_if_changed(
-        self, account_id: str | None = None
-    ) -> bool:
+    async def refresh_identity_registry_if_changed(self, account_id: str | None = None) -> bool:
         """Refresh account/user registry state for a management read when needed."""
         return await self._legacy.refresh_identity_registry_if_changed(account_id)
 
@@ -611,9 +607,7 @@ class NewAPIKeyManager:
     async def add_group_member(self, account_id: str, group_id: str, user_id: str) -> bool:
         return await self._legacy.add_group_member(account_id, group_id, user_id)
 
-    async def remove_group_member(
-        self, account_id: str, group_id: str, user_id: str
-    ) -> bool:
+    async def remove_group_member(self, account_id: str, group_id: str, user_id: str) -> bool:
         return await self._legacy.remove_group_member(account_id, group_id, user_id)
 
     async def delete_group(self, account_id: str, group_id: str) -> None:

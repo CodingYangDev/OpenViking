@@ -4,6 +4,7 @@
 import json
 import warnings
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -11,6 +12,7 @@ from openviking.session.memory.dataclass import MemoryField, MemoryTypeSchema
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.merge_op.base import FieldType
 from openviking.session.memory_policy import MemoryPolicy
+from openviking.session.session import Session, SessionMeta, _apply_agent_evolution_setting
 from openviking_cli.exceptions import InvalidArgumentError
 
 
@@ -21,6 +23,105 @@ def test_memory_policy_defaults_to_self_and_peer():
     assert policy.peer_enabled is True
     assert policy.memory_types is None
     assert policy.working_memory_enabled is True
+    assert policy.extract_max_iterations == 3
+    assert policy.extract_thinking is False
+
+
+@pytest.mark.parametrize("thinking", [False, True])
+def test_memory_policy_extract_thinking_round_trip(thinking):
+    policy = MemoryPolicy.from_dict({"extract_thinking": thinking})
+
+    assert policy.extract_thinking is thinking
+    assert MemoryPolicy.from_dict(policy.to_dict()).extract_thinking is thinking
+    if thinking:
+        assert policy.to_dict()["extract_thinking"] is True
+    else:
+        assert "extract_thinking" not in policy.to_dict()
+
+
+@pytest.mark.parametrize("thinking", [None, 0, 1, "true", "false", [], {}])
+def test_memory_policy_rejects_nonboolean_extract_thinking(thinking):
+    with pytest.raises(InvalidArgumentError, match="extract_thinking must be a boolean"):
+        MemoryPolicy.from_dict({"extract_thinking": thinking})
+    with pytest.raises(InvalidArgumentError, match="extract_thinking must be a boolean"):
+        MemoryPolicy(extract_thinking=thinking)
+
+
+def test_memory_policy_thinking_survives_disabled_agent_evolution():
+    policy = MemoryPolicy.from_dict({"memory_types": ["profile"], "extract_thinking": True})
+
+    effective = _apply_agent_evolution_setting(policy, agent_evolution_enabled=False)
+
+    assert effective.extract_thinking is True
+    assert effective.memory_types == {"profile"}
+
+
+@pytest.mark.asyncio
+async def test_session_thinking_uses_commit_session_user_precedence():
+    provider = AsyncMock(return_value={"extract_thinking": True})
+    session = Session(viking_fs=None, memory_policy_provider=provider)
+    assert (await session._resolve_memory_policy()).extract_thinking is True
+
+    session.meta.memory_policy = MemoryPolicy.from_dict({"extract_thinking": True}).to_dict()
+    restored = SessionMeta.from_dict(session.meta.to_dict())
+    assert restored.memory_policy["extract_thinking"] is True
+    assert (await session._resolve_memory_policy()).extract_thinking is True
+    assert (
+        await session._resolve_memory_policy({"extract_thinking": False})
+    ).extract_thinking is False
+
+    session.meta.memory_policy = MemoryPolicy.default().to_dict()
+    assert (await session._resolve_memory_policy()).extract_thinking is False
+    provider.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize("iterations", [1, 3, 6, 20])
+def test_memory_policy_extract_max_iterations_round_trip(iterations):
+    policy = MemoryPolicy.from_dict({"extract_max_iterations": iterations})
+
+    assert policy.extract_max_iterations == iterations
+    assert MemoryPolicy.from_dict(policy.to_dict()).extract_max_iterations == iterations
+    if iterations == 3:
+        assert "extract_max_iterations" not in policy.to_dict()
+    else:
+        assert policy.to_dict()["extract_max_iterations"] == iterations
+
+
+@pytest.mark.parametrize("iterations", [None, True, False, 0, -1, 1.5, "6", [], {}])
+def test_memory_policy_rejects_invalid_extract_max_iterations(iterations):
+    with pytest.raises(
+        InvalidArgumentError, match="extract_max_iterations must be a positive integer"
+    ):
+        MemoryPolicy.from_dict({"extract_max_iterations": iterations})
+    with pytest.raises(
+        InvalidArgumentError, match="extract_max_iterations must be a positive integer"
+    ):
+        MemoryPolicy(extract_max_iterations=iterations)
+
+
+def test_memory_policy_iteration_budget_survives_disabled_agent_evolution():
+    policy = MemoryPolicy.from_dict({"memory_types": ["profile"], "extract_max_iterations": 7})
+
+    effective = _apply_agent_evolution_setting(policy, agent_evolution_enabled=False)
+
+    assert effective.extract_max_iterations == 7
+    assert effective.memory_types == {"profile"}
+
+
+@pytest.mark.asyncio
+async def test_session_iteration_budget_uses_commit_session_user_precedence():
+    provider = AsyncMock(return_value={"extract_max_iterations": 6})
+    session = Session(viking_fs=None, memory_policy_provider=provider)
+    assert (await session._resolve_memory_policy()).extract_max_iterations == 6
+
+    session.meta.memory_policy = MemoryPolicy.from_dict({"extract_max_iterations": 8}).to_dict()
+    assert (await session._resolve_memory_policy()).extract_max_iterations == 8
+    assert (
+        await session._resolve_memory_policy({"extract_max_iterations": 10})
+    ).extract_max_iterations == 10
+    restored = SessionMeta.from_dict(session.meta.to_dict())
+    assert restored.memory_policy["extract_max_iterations"] == 8
+    provider.assert_awaited_once_with()
 
 
 def test_memory_policy_can_disable_peer_memory():
@@ -106,7 +207,10 @@ def test_memory_policy_rejects_invalid_memory_types():
     incomplete_policy = MemoryPolicy.from_dict(
         {"memory_types": ["profile", "cases", "trajectories"]}
     )
-    assert incomplete_policy.memory_types == {"profile"}
+    assert incomplete_policy.memory_types == {"profile", "cases", "trajectories"}
+
+    trajectory_policy = MemoryPolicy.from_dict({"memory_types": ["trajectories"]})
+    assert trajectory_policy.memory_types == {"cases", "trajectories"}
 
 
 async def test_initialize_memory_files_respects_memory_type_filter(monkeypatch):

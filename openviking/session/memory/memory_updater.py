@@ -20,16 +20,18 @@ from openviking.core.context import ContextLevel
 from openviking.message import Message
 from openviking.message.part import TextPart
 from openviking.server.identity import RequestContext
+from openviking.session.archive_store import is_storage_not_found
 from openviking.session.memory.dataclass import (
     MemoryFile,
     MemoryOperationSkipCode,
+    MemoryTypeSchema,
     ResolvedOperation,
     ResolvedOperations,
     SkippedMemoryOperation,
     StoredLink,
 )
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
-from openviking.session.memory.merge_op import MergeOpFactory
+from openviking.session.memory.merge_op import MergeOpFactory, PatchOp
 from openviking.session.memory.page_id_map import PageIdMap
 from openviking.session.memory.utils.memory_file_utils import (
     MemoryFileUtils,
@@ -42,6 +44,8 @@ from openviking.session.memory.utils.resource_refs import (
 )
 from openviking.session.memory.utils.template_utils import TemplateUtils
 from openviking.session.memory.utils.uri import render_template
+from openviking.session.memory.validation.content import get_content_gate
+from openviking.session.memory.validation.create import validate_create_operations
 from openviking.storage.abstract_overview import freshness_metadata, render_abstract_overview
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
@@ -268,6 +272,13 @@ class ExtractContext:
                 peer_id=getattr(message, "peer_id", None),
                 parts=[TextPart(chunk)],
                 created_at=message.created_at,
+                turn_id=message.turn_id,
+                message_kind=message.message_kind,
+                source_message_ids=(
+                    list(message.source_message_ids)
+                    if message.source_message_ids is not None
+                    else None
+                ),
             )
             chunk_messages.append(
                 (
@@ -754,6 +765,57 @@ def _same_batch_delete_conflict_key(uri: str) -> str:
     return str(uri or "").rstrip("/").casefold()
 
 
+async def prepare_memory_fields(
+    schema: MemoryTypeSchema,
+    updates: Dict[str, Any],
+    previous: Optional[MemoryFile],
+    *,
+    uri: Optional[str],
+) -> Dict[str, Any]:
+    """Merge schema fields, then invoke the registered type-owned content gate.
+
+    Ungated types retain their existing lenient merge behavior. Gated content may
+    not hide a failed patch behind the old value and report it as a valid update.
+    """
+    gate = get_content_gate(schema.memory_type)
+    metadata = dict(updates)
+    for field in schema.fields:
+        current = (
+            None
+            if previous is None
+            else (
+                previous.plain_content()
+                if field.name == "content"
+                else previous.extra_fields.get(field.name)
+            )
+        )
+        if field.name not in updates:
+            if gate is not None and previous is not None:
+                metadata[field.name] = current
+            continue
+        merge_op = MergeOpFactory.from_field(field)
+        try:
+            metadata[field.name] = await (
+                merge_op.apply_exact(current, updates[field.name])
+                if gate is not None and isinstance(merge_op, PatchOp)
+                else merge_op.apply(current, updates[field.name])
+            )
+        except Exception as exc:
+            if gate is not None:
+                raise
+            tracer.info(
+                "[memory_updater] Skipping field update after merge_op failure: "
+                f"uri={uri}, field={field.name}, error={exc}"
+            )
+            if current is None:
+                metadata.pop(field.name, None)
+            else:
+                metadata[field.name] = current
+    if gate is not None:
+        metadata["content"] = gate(metadata.get("content"))
+    return metadata
+
+
 class MemoryUpdater:
     """
     Applies MemoryOperations to storage.
@@ -862,6 +924,48 @@ class MemoryUpdater:
         isolation_handler: MemoryIsolationHandler = None,
         search_tags_by_uri: Dict[str, List[str]] = None,
     ) -> MemoryUpdateResult:
+        viking_fs = self._get_viking_fs()
+        lease = self._transaction_handle
+        owns_lease = False
+        if lease is None and any(
+            op.uris and (op.create_only or get_content_gate(op.memory_type) is not None)
+            for op in operations.upsert_operations
+        ):
+            # Reuse the same complete write-set lock as the streaming entrypoint.
+            # Local import avoids the existing updater/streaming module cycle.
+            from openviking.session.memory.streaming_memory_updater import (
+                _acquire_stable_operation_lease,
+            )
+
+            lease = await _acquire_stable_operation_lease(operations, viking_fs, ctx)
+            if lease is None:
+                raise RuntimeError("Memory create/content validation requires a write-set pathlock")
+            owns_lease = True
+        try:
+            # Check every create before applying any operation, while holding the
+            # same lease that protects the writes. A race must never become upsert.
+            await validate_create_operations(operations, viking_fs, ctx)
+            return await self._apply_operations(
+                operations,
+                ctx,
+                extract_context,
+                isolation_handler,
+                search_tags_by_uri,
+                lease_ref=lease,
+            )
+        finally:
+            if owns_lease:
+                await viking_fs._async_agfs.pathlock_release(lease)
+
+    async def _apply_operations(
+        self,
+        operations: ResolvedOperations,
+        ctx: RequestContext,
+        extract_context: ExtractContext = None,
+        isolation_handler: MemoryIsolationHandler = None,
+        search_tags_by_uri: Dict[str, List[str]] = None,
+        lease_ref: Any = None,
+    ) -> MemoryUpdateResult:
         result = MemoryUpdateResult()
         viking_fs = self._get_viking_fs()
 
@@ -880,19 +984,6 @@ class MemoryUpdater:
         if operations.has_errors():
             for error in operations.errors:
                 result.add_error("unknown", ValueError(error))
-            return result
-
-        # A malformed replacement must not allow a following supersedes/delete
-        # to remove the valid original experience.
-        from openviking.session.memory.experience_dag_compiler import compile_dag
-
-        for operation in operations.upsert_operations:
-            if operation.memory_type == "experiences" and "content" in operation.memory_fields:
-                try:
-                    compile_dag(operation.memory_fields["content"])
-                except (ValueError, TypeError, AttributeError) as exc:
-                    result.add_error(operation.uris[0] if operation.uris else "experiences", exc)
-        if result.errors:
             return result
 
         applicable_upserts: List[ResolvedOperation] = []
@@ -939,14 +1030,36 @@ class MemoryUpdater:
         # Distribute resolved_links to corresponding upsert operations
         self._distribute_links_to_operations(operations)
 
-        # Apply unified operations - _apply_edit returns True if edited, False if written
-        for resolved_op in applicable_upserts:
+        # Validate every gated candidate before any write or dependent delete. The
+        # same write-set lease protects fresh reads, validation, and persistence.
+        prepared: Dict[int, List[Tuple[str, str]]] = {}
+        staged: Dict[str, MemoryFile] = {}
+        gate_failed = False
+        for index, resolved_op in enumerate(applicable_upserts):
+            if get_content_gate(resolved_op.memory_type) is None:
+                continue
+            try:
+                if lease_ref is None:
+                    raise RuntimeError("Content validation requires a write-set pathlock")
+                prepared[index] = await self._prepare_upsert(
+                    resolved_op, ctx, extract_context=extract_context, staged=staged
+                )
+            except Exception as exc:
+                gate_failed = True
+                for uri in resolved_op.uris:
+                    result.add_error(uri, exc)
+        if gate_failed:
+            return result
+
+        # Apply unified operations using the already validated bytes where gated.
+        for index, resolved_op in enumerate(applicable_upserts):
             try:
                 await self._apply_upsert(
                     resolved_op,
                     ctx,
                     extract_context=extract_context,
-                    lease_ref=self._transaction_handle,
+                    lease_ref=lease_ref,
+                    **({"prepared_contents": prepared[index]} if index in prepared else {}),
                 )
                 # Add all uris to result (uris is List[str])
                 if resolved_op.is_edit():
@@ -971,7 +1084,7 @@ class MemoryUpdater:
             operations,
             result,
             ctx,
-            lease_ref=self._transaction_handle,
+            lease_ref=lease_ref,
         )
 
         # Apply delete operations (delete_file_contents is List[MemoryFile])
@@ -1002,13 +1115,13 @@ class MemoryUpdater:
                 )
                 continue
             try:
-                await self._apply_delete(delete_uri, ctx, lease_ref=self._transaction_handle)
+                await self._apply_delete(delete_uri, ctx, lease_ref=lease_ref)
                 result.add_deleted(delete_uri)
             except Exception as e:
                 tracer.error(f"Failed to delete memory {delete_uri}", e)
                 result.add_error(delete_uri, e)
 
-        await self._sync_resource_refs_for_result(result, ctx, lease_ref=self._transaction_handle)
+        await self._sync_resource_refs_for_result(result, ctx, lease_ref=lease_ref)
 
         # Vectorize written and edited memories
         uri_memory_type_map = {}
@@ -1033,7 +1146,7 @@ class MemoryUpdater:
                 result,
                 ctx,
                 deleted_uris=set(result.deleted_uris),
-                lease_ref=self._transaction_handle,
+                lease_ref=lease_ref,
             )
 
         tracer.info(f"Memory operations applied: {result.summary()}")
@@ -1059,7 +1172,7 @@ class MemoryUpdater:
                 dir,
                 ctx,
                 extract_context,
-                lease_ref=self._transaction_handle,
+                lease_ref=lease_ref,
             )
 
         return result
@@ -1103,27 +1216,54 @@ class MemoryUpdater:
         ctx: RequestContext,
         extract_context: Any = None,
         lease_ref: Any = None,
+        prepared_contents: Optional[List[Tuple[str, str]]] = None,
     ):
-        """Apply upsert operation from a flat model."""
-        viking_fs = self._get_viking_fs()
+        if get_content_gate(resolved_op.memory_type) is not None and lease_ref is None:
+            raise RuntimeError("Validated content writes require a write-set pathlock")
+        if prepared_contents is not None:
+            for uri, content in prepared_contents:
+                await self._get_viking_fs().write_file(uri, content, ctx=ctx, lease_ref=lease_ref)
+            return
+        # Preserve sequential read/merge/write semantics for ordinary multi-URI operations.
+        for uri in resolved_op.uris:
+            operation = resolved_op.model_copy(update={"uris": [uri]})
+            contents = await self._prepare_upsert(operation, ctx, extract_context=extract_context)
+            for target, content in contents:
+                await self._get_viking_fs().write_file(
+                    target, content, ctx=ctx, lease_ref=lease_ref
+                )
 
+    async def _prepare_upsert(
+        self,
+        resolved_op: ResolvedOperation,
+        ctx: RequestContext,
+        extract_context: Any = None,
+        staged: Optional[Dict[str, MemoryFile]] = None,
+    ) -> List[Tuple[str, str]]:
+        """Materialize each URI independently without writing any candidate yet."""
+        viking_fs = self._get_viking_fs()
+        contents: List[Tuple[str, str]] = []
         memory_type = resolved_op.memory_type
         schema = self._registry.get(memory_type)
         # Process each URI independently
         for uri in resolved_op.uris:
-            # Always read from disk first to get the latest content,
-            # so consecutive patches to the same URI see each other's changes.
+            gate = get_content_gate(memory_type)
             old_content: Optional[MemoryFile] = None
-            try:
-                content = await viking_fs.read_file(uri, ctx=ctx)
-                if content:
-                    old_content = MemoryFileUtils.read(content, uri=uri)
-            except Exception:
-                # File doesn't exist yet, that's okay
-                pass
-            # Fall back to pre-fetched content if disk read failed
-            if old_content is None:
-                old_content = resolved_op.old_memory_file_content
+            if staged is not None and uri in staged:
+                old_content = staged[uri]
+            else:
+                try:
+                    content = await viking_fs.read_file(uri, ctx=ctx)
+                    if content or gate is not None:
+                        old_content = MemoryFileUtils.read(content or "", uri=uri)
+                except Exception as exc:
+                    if gate is not None and not is_storage_not_found(exc):
+                        raise
+                if old_content is None and not resolved_op.create_only:
+                    if gate is None:
+                        old_content = resolved_op.old_memory_file_content
+                    elif resolved_op.old_memory_file_content is not None:
+                        raise ValueError(f"Memory disappeared before content validation: {uri}")
 
             metadata: Dict[str, Any] = dict(resolved_op.memory_fields)
             metadata["memory_type"] = memory_type
@@ -1134,39 +1274,7 @@ class MemoryUpdater:
             source_trace_id = _operation_trace_id(resolved_op)
             if source_trace_id:
                 metadata["last_update_trace_id"] = source_trace_id
-            # Process fields defined in schema (apply merge_op)
-            for field in schema.fields:
-                if field.name in resolved_op.memory_fields:
-                    patch_value = resolved_op.memory_fields[field.name]
-                    # Get current value for this URI
-                    if old_content is None:
-                        current_value = None
-                    else:
-                        if field.name == "content":
-                            current_value = old_content.plain_content()
-                        else:
-                            current_value = old_content.extra_fields.get(field.name)
-                    # Use merge_op to process field value
-                    merge_op = MergeOpFactory.from_field(field)
-                    try:
-                        new_value = await merge_op.apply(current_value, patch_value)
-                    except Exception as e:
-                        tracer.info(
-                            f"[memory_updater] Skipping field update after merge_op failure: uri={uri}, field={field.name}, error={e}"
-                        )
-                        if current_value is None:
-                            metadata.pop(field.name, None)
-                        else:
-                            metadata[field.name] = current_value
-                        continue
-                    metadata[field.name] = new_value
-
-            if memory_type == "experiences":
-                from openviking.session.memory.experience_dag_compiler import compile_dag
-
-                compile_dag(
-                    metadata.get("content") or (old_content.plain_content() if old_content else "")
-                )
+            metadata = await prepare_memory_fields(schema, metadata, old_content, uri=uri)
 
             # Preserve system-managed metadata from the old file that is not
             # covered by the schema. These fields are written by the system,
@@ -1225,12 +1333,10 @@ class MemoryUpdater:
                 ),
                 extract_context=extract_context,
             )
-            await viking_fs.write_file(
-                uri,
-                new_full_content,
-                ctx=ctx,
-                lease_ref=lease_ref,
-            )
+            contents.append((uri, new_full_content))
+            if staged is not None:
+                staged[uri] = MemoryFileUtils.read(new_full_content, uri=uri)
+        return contents
 
     def _distribute_links_to_operations(self, operations: ResolvedOperations) -> None:
         """Distribute resolved_links to corresponding upsert operations by URI.

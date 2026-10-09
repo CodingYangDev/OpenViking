@@ -98,7 +98,6 @@ def make_tau2_rollout_executor(
 Tau2RolloutExecutor = NativeTau2RolloutExecutor
 
 
-
 def _bool_option(value: Any, *, default: bool) -> bool:
     if value is None:
         return default
@@ -112,6 +111,7 @@ def _bool_option(value: Any, *, default: bool) -> bool:
             return False
         raise ValueError(f"Invalid boolean option: {value!r}")
     return bool(value)
+
 
 def _dict_option(value: Any) -> dict[str, Any]:
     if value is None:

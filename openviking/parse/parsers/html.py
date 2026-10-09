@@ -145,9 +145,7 @@ class HTMLParser(BaseParser):
             from bs4 import BeautifulSoup
 
             soup = BeautifulSoup(html, "html.parser")
-            texts = [
-                node.get_text(" ", strip=True) for node in soup.find_all("noscript")
-            ]
+            texts = [node.get_text(" ", strip=True) for node in soup.find_all("noscript")]
             return "\n\n".join(text for text in texts if text)
         except Exception:
             return ""

@@ -13,10 +13,11 @@ from datetime import datetime
 from pathlib import Path
 
 from progress_utils import (
-    ThreadSafeProgressTracker,
-    make_three_state_progress,
+    ProgressTracker,
     should_show_progress,
 )
+
+from openviking.utils.progress import make_three_state_progress
 
 
 def get_evidence_text(evidence_list: list, sample: dict) -> list[str]:
@@ -583,7 +584,7 @@ def main():
 
     if show_progress:
         progress, task_id = make_three_state_progress(description="Eval")
-        progress_tracker = ThreadSafeProgressTracker(progress, task_id, total=remaining_count)
+        progress_tracker = ProgressTracker(progress, task_id, total=remaining_count)
     else:
         progress = None
         progress_tracker = None
@@ -686,7 +687,9 @@ def main():
                 processed_questions.add(question)
                 processed_count += 1
                 if not show_progress:
-                    print(f"Completed {processed_count}/{total_count}, time cost: {round(time_cost, 2)}s")
+                    print(
+                        f"Completed {processed_count}/{total_count}, time cost: {round(time_cost, 2)}s"
+                    )
 
             return True
         except Exception:

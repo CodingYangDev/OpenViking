@@ -57,9 +57,7 @@ class LDAPConfig(BaseModel):
     # Direct bind pattern (alternative to search+bind)
     user_dn_pattern: Optional[str] = None
     # Identity mapping (LDAP-specific defaults: user_id <- uid, role=user)
-    identity: IdentityMappingConfig = Field(
-        default_factory=_ldap_default_identity
-    )
+    identity: IdentityMappingConfig = Field(default_factory=_ldap_default_identity)
 
     @field_validator("host")
     @classmethod

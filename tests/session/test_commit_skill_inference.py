@@ -7,10 +7,10 @@ from openviking.core.skill_loader import SkillLoader
 from openviking.message import Message, TextPart
 from openviking.server.identity import RequestContext, Role
 from openviking.session.compressor_v3 import _v3_extraction_response
-from openviking.session.memory.agent_trajectory_context_provider import (
+from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
+from openviking.session.memory.experience.trajectory_context import (
     AgentTrajectoryContextProvider,
 )
-from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.skill.dedup import dedup_session_skill_operations
 from openviking.session.skill.session_skill_context_provider import (
@@ -109,10 +109,13 @@ async def test_session_skill_context_provider_prefetch_lists_existing_skills():
 
     prefetched = await provider.prefetch()
 
-    assert len(prefetched) == 2
+    assert [message["role"] for message in prefetched] == ["user", "assistant", "tool"]
     assert "Conversation History" in prefetched[0]["content"]
-    assert "code-review" in prefetched[1]["content"]
-    assert "SKILL.md" in prefetched[1]["content"]
+    assert "code-review" in prefetched[2]["content"]
+    assert "SKILL.md" in prefetched[2]["content"]
+    call = prefetched[1]["tool_calls"][0]
+    assert call["function"]["name"] == "eval"
+    assert prefetched[2]["tool_call_id"] == call["id"]
 
 
 @pytest.mark.asyncio
@@ -176,16 +179,23 @@ tags:
     prefetched = await provider.prefetch()
     read_result = await provider.execute_tool(
         SimpleNamespace(
-            name="read",
-            arguments={"uri": "viking://user/default/skills/code-review/SKILL.md"},
+            name="eval",
+            arguments={
+                "code": (
+                    'skill = sdk.read(uri="viking://user/default/skills/code-review/SKILL.md")'
+                )
+            },
         )
     )
 
-    assert len(prefetched) == 2
-    assert "code-review" in prefetched[1]["content"]
-    assert provider.get_tools() == ["read"]
-    assert read_result["name"] == "code-review"
-    assert "先读文件" in read_result["content"]
+    assert [m["role"] for m in prefetched] == ["user", "assistant", "tool"]
+    call = prefetched[1]["tool_calls"][0]
+    assert call["function"]["name"] == "eval"
+    assert prefetched[2]["tool_call_id"] == call["id"]
+    assert "code-review" in prefetched[2]["content"]
+    assert provider.get_tools() == ["eval"]
+    assert read_result["skill"]["name"] == "code-review"
+    assert "先读文件" in read_result["skill"]["content"]
     assert "viking://user/default/skills/code-review/SKILL.md" in provider.read_file_contents
     assert provider._skill_provider.read_file_contents is provider.read_file_contents
     assert provider._skill_provider._ctx is ctx
@@ -380,9 +390,7 @@ tags:
     viking_fs._async_agfs.pathlock_acquire_tree = AsyncMock(return_value={"lease_ref": "test"})
     viking_fs._async_agfs.pathlock_release = AsyncMock()
 
-    async def _fake_extract_skill_privacy_values(
-        *, skill_name, skill_description, content, vlm
-    ):
+    async def _fake_extract_skill_privacy_values(*, skill_name, skill_description, content, vlm):
         assert vlm is account_vlm
         assert skill_name == "code-review"
         assert skill_description == "Review code from evidence"

@@ -40,10 +40,10 @@ from openviking.session.memory.memory_updater import (
     ExtractContext,
     MemoryUpdater,
     MemoryUpdateResult,
+    prepare_memory_fields,
     remap_stored_links,
     write_stored_links,
 )
-from openviking.session.memory.merge_op import MergeOpFactory
 from openviking.session.memory.patch_merge_context_provider import (
     PatchMergeContextProvider,
     PatchMergePatch,
@@ -54,6 +54,7 @@ from openviking.session.memory.utils.streaming_batcher import (
     StreamingBatcher,
     StreamingBatcherConfig,
 )
+from openviking.session.memory.validation.create import validate_create_operations
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
 from openviking.telemetry.tracer import get_trace_id
@@ -523,6 +524,8 @@ class StreamingMemoryUpdater:
         all_ops = _combine_resolved_operations(request.operations for request in requests)
         if all_ops.has_errors():
             return all_ops
+        # Do not let semantic merging turn a rejected create into an update.
+        await validate_create_operations(all_ops, safe_get_viking_fs(), requests[0].ctx)
 
         requests_by_kind: dict[str, list[MemoryUpdateRequest]] = {
             "add": [],
@@ -1027,8 +1030,7 @@ async def merge_one_memory_type_operations(
     )
     if vlm_resolver is None:
         raise RuntimeError(
-            "merge_one_memory_type_operations requires a VLM resolver "
-            "for account-owned work"
+            "merge_one_memory_type_operations requires a VLM resolver for account-owned work"
         )
     vlm_config = await vlm_resolver.get_vlm(ctx.account_id)
     provider = PatchMergeContextProvider(
@@ -1090,6 +1092,13 @@ async def merge_one_memory_type_operations(
     )
     merged, _ = await orchestrator.run()
     merged = merged or ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[])
+    # Runtime-only create intent must survive the second-stage merge, including
+    # renamed targets from an all-create group. It is not an LLM output field.
+    create_uris = {uri for op in operations if op.create_only for uri in op.uris}
+    all_create = bool(operations) and all(op.create_only for op in operations)
+    for op in merged.upsert_operations:
+        if all_create or create_uris.intersection(op.uris):
+            op.create_only = True
     tracer.info(
         "[streaming_memory_updater] llm merge output "
         f"memory_type={memory_type} upserts={len(merged.upsert_operations)} "
@@ -1194,35 +1203,7 @@ async def render_operation_after_file_content(
     source_trace_id = source_trace_id_for_operation(op)
     if source_trace_id:
         metadata["last_update_trace_id"] = source_trace_id
-    for field_def in schema.fields:
-        if field_def.name not in metadata:
-            continue
-        if old_content is None:
-            current_value = None
-        elif field_def.name == "content":
-            current_value = old_content.plain_content()
-        else:
-            current_value = old_content.extra_fields.get(field_def.name)
-        try:
-            metadata[field_def.name] = await MergeOpFactory.from_field(field_def).apply(
-                current_value,
-                metadata[field_def.name],
-            )
-        except Exception as exc:
-            logger.debug(
-                "Failed to preview memory patch field: memory_type=%s field=%s",
-                op.memory_type,
-                field_def.name,
-                exc_info=True,
-            )
-            tracer.info(
-                "[streaming_memory_updater] skipping preview field update after merge_op failure "
-                f"memory_type={op.memory_type} field={field_def.name} error={exc}"
-            )
-            if current_value is None:
-                metadata.pop(field_def.name, None)
-            else:
-                metadata[field_def.name] = current_value
+    metadata = await prepare_memory_fields(schema, metadata, old_content, uri=_first_uri(op.uris))
 
     if old_content and old_content.extra_fields:
         schema_field_names = {field.name for field in schema.fields} | {"content", "memory_type"}

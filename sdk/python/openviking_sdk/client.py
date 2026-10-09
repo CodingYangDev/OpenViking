@@ -1405,16 +1405,26 @@ class AsyncHTTPClient:
         search_options = dict(options or {})
         if image is not None:
             search_options["image"] = image
+        advice_mode = search_options.get("mode") == "advice"
+        if advice_mode and (session_id is not None or target_uri):
+            raise ValueError("Advice search does not accept session_id or target_uri")
+        fixed: Dict[str, Any] = {"limit": limit}
+        if not advice_mode:
+            fixed.update(
+                {
+                    "session_id": session_id,
+                    "target_uri": self._normalize_target_uri(target_uri),
+                }
+            )
         payload = self._search_options_payload(
             query,
             search_options,
             SearchOptions,
-            fixed={
-                "session_id": session_id,
-                "target_uri": self._normalize_target_uri(target_uri),
-                "limit": limit,
-            },
+            fixed=fixed,
         )
+        if advice_mode and "score_threshold" in search_options:
+            # Advice has a non-None default: explicit None must survive body compaction.
+            payload["score_threshold"] = search_options["score_threshold"]
         response = await self._request("POST", "/api/v1/search/search", json=payload)
         return self._handle_response_data(response).get("result", {})
 
@@ -2035,6 +2045,35 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
+    async def learn_experiences(
+        self,
+        *,
+        trajectory_uris: Optional[List[str]] = None,
+        case_names: Optional[List[str]] = None,
+        max_cases: int = 100,
+        retry_failed: bool = False,
+        lease_seconds: int = 900,
+        wait: bool = True,
+    ) -> Dict[str, Any]:
+        """Learn Experiences, or return a task_id with wait=False for progress polling."""
+        payload: Dict[str, Any] = {
+            "max_cases": max_cases,
+            "retry_failed": retry_failed,
+            "lease_seconds": lease_seconds,
+            "wait": wait,
+        }
+        if trajectory_uris is not None:
+            payload["trajectory_uris"] = [VikingURI.normalize(uri) for uri in trajectory_uris]
+        if case_names is not None:
+            payload["case_names"] = list(case_names)
+        response = await self._request(
+            "POST",
+            "/api/v1/agent-evolution/experiences/learn",
+            json=payload,
+            timeout=1800.0,
+        )
+        return self._handle_response(response)
+
     async def resolve_openviking_assets(
         self,
         manifest_yaml: str,
@@ -2074,24 +2113,16 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
-    def queue_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def queue_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_queue_status(format=format))
 
-    def vikingdb_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def vikingdb_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_vikingdb_status(format=format))
 
-    def models_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def models_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_models_status(format=format))
 
-    def get_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def get_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_system_status(format=format))
 
     def is_healthy(self) -> bool:
@@ -3001,6 +3032,27 @@ class SyncHTTPClient:
     ) -> Dict[str, Any]:
         return run_async(self._async_client.get_experience_outcomes(experience_uri, options))
 
+    def learn_experiences(
+        self,
+        *,
+        trajectory_uris: Optional[List[str]] = None,
+        case_names: Optional[List[str]] = None,
+        max_cases: int = 100,
+        retry_failed: bool = False,
+        lease_seconds: int = 900,
+        wait: bool = True,
+    ) -> Dict[str, Any]:
+        return run_async(
+            self._async_client.learn_experiences(
+                trajectory_uris=trajectory_uris,
+                case_names=case_names,
+                max_cases=max_cases,
+                retry_failed=retry_failed,
+                lease_seconds=lease_seconds,
+                wait=wait,
+            )
+        )
+
     def resolve_openviking_assets(
         self,
         manifest_yaml: str,
@@ -3016,24 +3068,16 @@ class SyncHTTPClient:
     ) -> Dict[str, Any]:
         return run_async(self._async_client.preflight_openviking_asset(name, repo_url, options))
 
-    def queue_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def queue_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.queue_status(format=format)
 
-    def vikingdb_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def vikingdb_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.vikingdb_status(format=format)
 
-    def models_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def models_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.models_status(format=format)
 
-    def get_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def get_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.get_status(format=format)
 
     def is_healthy(self) -> bool:

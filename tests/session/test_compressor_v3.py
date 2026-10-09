@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -21,6 +22,7 @@ from openviking.session.compressor_v3 import (
     _experience_snapshot_provenance,
     _report_extraction_telemetry,
     _training_evaluation_from_messages,
+    _training_outcome_from_messages,
     _visible_experience_snapshot_uris,
 )
 from openviking.session.memory.dataclass import (
@@ -31,7 +33,7 @@ from openviking.session.memory.dataclass import (
     SkippedMemoryOperation,
     StoredLink,
 )
-from openviking.session.memory.memory_updater import MemoryUpdateResult
+from openviking.session.memory.memory_updater import MemoryUpdater, MemoryUpdateResult
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.train import (
     Case,
@@ -47,6 +49,7 @@ from openviking.session.train import (
     RubricCriterion,
     RubricEvaluation,
     StreamingPolicyTrainerConfig,
+    Trajectory,
 )
 from openviking.session.train.components.session_commit import (
     _case_spec_message_to_request,
@@ -139,17 +142,67 @@ def test_factory_ignores_deprecated_memory_version():
     )
 
 
-def test_extract_long_term_memories_preserves_legacy_positional_parameter_order():
+def test_extract_long_term_memories_appends_extraction_context_after_legacy_parameters():
     parameter_names = list(
         inspect.signature(SessionCompressorV3.extract_long_term_memories).parameters
     )
 
-    assert parameter_names[-4:] == [
+    assert parameter_names[-7:] == [
         "allow_self_memory",
         "allowed_peer_ids",
         "event_search_tags",
         "peer_memory_enabled",
+        "extraction_context",
+        "extract_max_iterations",
+        "extract_thinking",
     ]
+    assert (
+        inspect.signature(SessionCompressorV3.extract_long_term_memories)
+        .parameters["extract_max_iterations"]
+        .kind
+        == inspect.Parameter.KEYWORD_ONLY
+    )
+    assert (
+        inspect.signature(SessionCompressorV3.extract_long_term_memories)
+        .parameters["extract_thinking"]
+        .kind
+        == inspect.Parameter.KEYWORD_ONLY
+    )
+
+
+@pytest.mark.parametrize("iterations", [None, 9])
+def test_react_iteration_budget_defaults_and_override(iterations):
+    compressor = SessionCompressorV3(vikingdb=None)
+    kwargs = {} if iterations is None else {"max_iterations": iterations}
+
+    loop = compressor._get_or_create_react(
+        ctx=_ctx(),
+        context_provider=SimpleNamespace(),
+        vlm_config=SimpleNamespace(model="test"),
+        **kwargs,
+    )
+
+    assert loop.max_iterations == (3 if iterations is None else iterations)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thinking", [None, False, True])
+async def test_react_thinking_defaults_and_reaches_llm(thinking):
+    vlm = SimpleNamespace(
+        model="test", thinking=True, get_completion_async=AsyncMock(return_value="sdk.commit()")
+    )
+    compressor = SessionCompressorV3(vikingdb=None)
+    kwargs = {} if thinking is None else {"thinking": thinking}
+    loop = compressor._get_or_create_react(
+        ctx=_ctx(), context_provider=SimpleNamespace(), vlm_config=vlm, **kwargs
+    )
+    loop._output_protocol = SimpleNamespace(parse=Mock(return_value=(object(), None)))
+
+    await loop._call_llm([{"role": "user", "content": "extract memory"}])
+
+    expected = False if thinking is None else thinking
+    assert loop.thinking is expected
+    assert vlm.get_completion_async.await_args.kwargs["thinking"] is expected
 
 
 def test_report_extraction_telemetry_handles_placeholder_error_targets():
@@ -470,18 +523,21 @@ async def test_v3_passes_allowed_execution_types_to_agent_training(monkeypatch):
     await compressor.extract_long_term_memories(
         messages=_messages(),
         ctx=_ctx(),
-        allowed_memory_types={"cases", "experiences"},
+        allowed_memory_types={"cases", "trajectories"},
         agent_evolution_enabled=True,
     )
 
     assert compressor.train_from_extracted_cases.await_args.kwargs["allowed_memory_types"] == {
-        "experiences"
+        "trajectories"
     }
 
 
 @pytest.mark.asyncio
-async def test_v3_initializes_only_allowed_memory_files(monkeypatch):
+@pytest.mark.parametrize("iterations", [3, 6])
+@pytest.mark.parametrize("thinking", [False, True])
+async def test_v3_initializes_only_allowed_memory_files(monkeypatch, iterations, thinking):
     initialized_with = []
+    loop_kwargs = []
 
     class DummyRegistry:
         async def initialize_memory_files(self, ctx, allowed_memory_types=None):
@@ -496,7 +552,12 @@ async def test_v3_initializes_only_allowed_memory_files(monkeypatch):
         vikingdb=None,
         vlm_resolver=SimpleNamespace(get_vlm=AsyncMock(return_value=SimpleNamespace(model="test"))),
     )
-    compressor._get_or_create_react = lambda **kwargs: DummyOrchestrator()
+
+    def create_loop(**kwargs):
+        loop_kwargs.append(kwargs)
+        return DummyOrchestrator()
+
+    compressor._get_or_create_react = create_loop
     compressor._write_final_memory_diff = AsyncMock()
     monkeypatch.setattr(
         "openviking.session.compressor_v3.get_viking_fs",
@@ -512,9 +573,13 @@ async def test_v3_initializes_only_allowed_memory_files(monkeypatch):
         ctx=_ctx(),
         allowed_memory_types={"profile"},
         agent_evolution_enabled=False,
+        extract_max_iterations=iterations,
+        extract_thinking=thinking,
     )
 
     assert initialized_with == [{"profile"}]
+    assert loop_kwargs[0]["max_iterations"] == iterations
+    assert loop_kwargs[0]["thinking"] is thinking
 
 
 def test_experience_root_uri_requires_request_user():
@@ -523,9 +588,10 @@ def test_experience_root_uri_requires_request_user():
 
 
 @pytest.mark.asyncio
-async def test_train_from_extracted_cases_submits_streaming_rollout(monkeypatch):
+async def test_train_from_extracted_cases_persists_only_trajectory_phase(monkeypatch):
     submitted_gradients = []
     submitted_analyses = []
+    analyzed_rollouts = []
 
     class FakeTrainer:
         policy_set = ExperienceSet(
@@ -550,41 +616,32 @@ async def test_train_from_extracted_cases_submits_streaming_rollout(monkeypatch)
                 metadata={},
             )
 
+    memory = MemoryFile(
+        uri="viking://user/u/memories/trajectories/duplicate_booking/run.md",
+        content="Factual observation",
+        memory_type="trajectories",
+    )
+
     class FakeAnalyzer:
         async def analyze(self, rollout, context):
+            assert context.memory_registry is not None
+            analyzed_rollouts.append(rollout)
             return RolloutAnalysis(
-                evaluation=RubricEvaluation(
-                    passed=True,
-                    score=1.0,
-                    criterion_results=[],
-                    feedback=[],
-                ),
-                trajectories=[],
-                metadata={"source_session_uri": "viking://user/u/sessions/t1/history/archive_001"},
+                rollout=rollout,
+                evaluation=rollout.evaluation,
+                trajectories=[
+                    Trajectory(
+                        name="run", uri=memory.uri, content=memory.content, outcome="failure"
+                    )
+                ],
+                metadata={
+                    "source_session_uri": "viking://user/u/sessions/t1/history/archive_001",
+                    "trajectory_memory": memory,
+                },
                 gradients=[],
             )
 
-    async def fake_estimate_exp_gradients(self, *args, **kwargs):
-        # Return one dummy gradient so we can verify submission
-        from openviking.session.memory.dataclass import MemoryFile
-        from openviking.session.train import PatchSemanticGradient
-
-        return [
-            PatchSemanticGradient(
-                before_file=None,
-                after_file=MemoryFile(
-                    uri="viking://user/u/memories/experiences/e1.md",
-                    content="new exp",
-                    memory_type="experiences",
-                    extra_fields={"experience_name": "e1"},
-                ),
-                base_version=1,
-                rationale="test",
-                links=[],
-                confidence=0.9,
-                metadata={},
-            )
-        ]
+    extra_extraction = AsyncMock(side_effect=AssertionError("Compressor must not extract twice"))
 
     monkeypatch.setattr(
         "openviking.session.compressor_v3.get_viking_fs",
@@ -596,8 +653,8 @@ async def test_train_from_extracted_cases_submits_streaming_rollout(monkeypatch)
         trainer_factory,
     )
     monkeypatch.setattr(
-        "openviking.session.train.components.gradient_estimator.ExperienceGradientEstimator.estimate",
-        fake_estimate_exp_gradients,
+        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectory",
+        extra_extraction,
     )
     proposal_gate = AsyncMock(
         side_effect=lambda gradients, policy_set, context: (
@@ -627,30 +684,75 @@ async def test_train_from_extracted_cases_submits_streaming_rollout(monkeypatch)
         ),
     )
     cases = [_training_case()]
+    source_rollout = Rollout(
+        case=cases[0],
+        messages=[],
+        policy_snapshot_id="snapshot-1",
+        evaluation=RubricEvaluation(
+            passed=False,
+            score=0.0,
+            criterion_results=[],
+            feedback=["failed"],
+        ),
+        metadata={
+            "dag_runtime": {
+                "events": [
+                    {
+                        "experience_uri": "viking://user/u/memories/experiences/e1.md",
+                        "state": "completed",
+                        "revision": 2,
+                        "slot_values": {"remind": True},
+                        "node_slots": {1: "remind"},
+                        "executed_nodes": [1],
+                        "current_nodes": [],
+                    }
+                ]
+            }
+        },
+    )
+    outcome_request = _evaluation_message_to_request(source_rollout)
+    outcome_message = Message(
+        id="evaluation",
+        role="user",
+        parts=[TextPart(text=outcome_request["parts"][0]["text"])],
+    )
     result = await compressor.train_from_extracted_cases(
         cases=cases,
-        messages=_messages(),
+        messages=[*_messages(), outcome_message],
         ctx=_ctx(),
         session_id="s1",
     )
 
     assert result["case_count"] == 1
     assert result["submitted"] == 1
-    assert result["proposed_exp_gradient_count"] == 1
-    assert result["accepted_exp_gradient_count"] == 1
-    assert result["filtered_exp_gradient_count"] == 0
-    assert trainer_factory.await_args.kwargs.get("policy_update_gate") is None
+    assert result["trajectory_uris"] == [memory.uri]
+    extra_extraction.assert_not_awaited()
+    assert result["experience_learning_deferred"] is True
+    assert result["persisted_experience_count"] == 0
+    trainer_factory.assert_not_awaited()
     proposal_gate.assert_not_awaited()
-    assert len(submitted_gradients) == 1
-    assert len(submitted_gradients[0]) == 1  # one exp gradient per case
+    assert submitted_gradients == []
+    assert submitted_analyses == []
     # Verify analysis was used
-    assert submitted_analyses[0] is not None
-    assert submitted_analyses[0].trajectories == []
     assert cases[0].name == "duplicate_booking"
+    assert [message.id for message in analyzed_rollouts[0].messages] == ["m1", "m2"]
+    assert analyzed_rollouts[0].evaluation == source_rollout.evaluation
+    assert analyzed_rollouts[0].metadata["experience_execution"] == {
+        "viking://user/u/memories/experiences/e1.md": {
+            "experience_name": "e1",
+            "state": "completed",
+            "revision": 2,
+            "slot_values": {"remind": True},
+            "executed_nodes": ["remind"],
+            "current_nodes": [],
+        }
+    }
 
 
 @pytest.mark.asyncio
-async def test_train_from_extracted_cases_skips_experience_updates_when_not_allowed(monkeypatch):
+async def test_train_from_extracted_cases_skips_trajectory_extraction_when_not_allowed(
+    monkeypatch,
+):
     analyzed = []
 
     class FakeTrainer:
@@ -685,7 +787,7 @@ async def test_train_from_extracted_cases_skips_experience_updates_when_not_allo
         AsyncMock(return_value=FakeTrainer()),
     )
     monkeypatch.setattr(
-        "openviking.session.train.components.gradient_estimator.ExperienceGradientEstimator.estimate",
+        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectory",
         estimate,
     )
 
@@ -695,7 +797,7 @@ async def test_train_from_extracted_cases_skips_experience_updates_when_not_allo
         messages=_messages(),
         ctx=_ctx(),
         session_id="s1",
-        allowed_memory_types={"trajectories"},
+        allowed_memory_types={"experiences"},
     )
 
     assert len(analyzed) == 0
@@ -741,7 +843,7 @@ async def test_train_from_extracted_multiple_case_memories_analyzes_bound_rollou
         AsyncMock(return_value=FakeTrainer()),
     )
     monkeypatch.setattr(
-        "openviking.session.train.components.gradient_estimator.ExperienceGradientEstimator.estimate",
+        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectory",
         fake_estimate_exp_gradients,
     )
 
@@ -770,7 +872,7 @@ async def test_train_from_extracted_multiple_case_memories_analyzes_bound_rollou
     )
 
     assert result["case_count"] == 2
-    assert result["submitted"] == 2
+    assert result["submitted"] == 0
     assert [rollout.case.name for rollout in seen_rollouts] == [
         "duplicate_booking",
         "case_b",
@@ -837,7 +939,7 @@ async def test_v3_extract_uses_patch_merge_without_directory_lock(monkeypatch):
     contexts = await compressor.extract_long_term_memories(
         messages=_messages(),
         ctx=_ctx(),
-        allowed_memory_types={"cases", "profile", "experiences"},
+        allowed_memory_types={"cases", "profile", "trajectories"},
     )
 
     assert len(applied_operations) == 1
@@ -948,7 +1050,7 @@ async def test_v3_extract_trains_only_canonical_case_after_patch_merge(monkeypat
     contexts = await compressor.extract_long_term_memories(
         messages=_messages(),
         ctx=_ctx(),
-        allowed_memory_types={"cases", "profile", "experiences"},
+        allowed_memory_types={"cases", "profile", "trajectories"},
     )
 
     assert [context.uri for context in contexts] == [canonical_uri]
@@ -976,6 +1078,195 @@ def _training_case() -> Case:
             ],
         ),
         metadata={"evidence": "The rollout contains duplicate-booking handling evidence."},
+    )
+
+
+@pytest.fixture
+def training_case_lock_fs(monkeypatch):
+    guard = asyncio.Lock()
+    events = []
+    contents = {"viking://user/u/memories/cases/duplicate_booking.md": "before"}
+    waiting = asyncio.Event()
+    active_lease = None
+
+    async def acquire(paths, timeout_secs):
+        nonlocal active_lease
+        if guard.locked():
+            waiting.set()
+        await guard.acquire()
+        active_lease = {"lease_ref": f"lease-{len(events)}"}
+        events.append(("acquire", paths, timeout_secs, active_lease))
+        return active_lease
+
+    async def release(lease):
+        nonlocal active_lease
+        assert lease is active_lease
+        events.append(("release", lease))
+        active_lease = None
+        guard.release()
+
+    async def read(uri, ctx=None):
+        events.append(("read", uri))
+        return contents.get(uri, "")
+
+    fs = SimpleNamespace(
+        _async_agfs=SimpleNamespace(
+            pathlock_acquire_exact_batch=AsyncMock(side_effect=acquire),
+            pathlock_release=AsyncMock(side_effect=release),
+        ),
+        _uri_to_path=lambda uri, ctx=None: uri.replace("viking://", "/local/default/", 1),
+        read_file=AsyncMock(side_effect=read),
+        contents=contents,
+        events=events,
+        guard=guard,
+        waiting=waiting,
+    )
+    monkeypatch.setattr("openviking.session.compressor_v3.get_viking_fs", lambda: fs)
+    return fs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_case", [False, True])
+async def test_training_case_write_locks_read_apply_and_diff(
+    monkeypatch, training_case_lock_fs, existing_case
+):
+    fs = training_case_lock_fs
+    if not existing_case:
+        fs.contents.clear()
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
+    ctx = _ctx()
+    archive_uri = "viking://user/u/sessions/s1/history/archive_001"
+
+    async def apply(updater, operations, applied_ctx, **kwargs):
+        assert applied_ctx is ctx
+        assert updater._transaction_handle is fs.events[0][3]
+        assert fs.guard.locked()
+        op = operations.upsert_operations[0]
+        assert op.is_edit() is existing_case
+        assert (op.old_memory_file_content.content if op.is_edit() else None) == (
+            "before" if existing_case else None
+        )
+        assert op.source.archive_uri == archive_uri
+        assert op.source.extraction_id == "archive_001"
+        fs.events.append(("apply",))
+        return MemoryUpdateResult()
+
+    async def build_diff(**kwargs):
+        assert fs.guard.locked()
+        fs.events.append(("diff",))
+        return {"adds": [], "updates": [], "deletes": []}
+
+    monkeypatch.setattr(MemoryUpdater, "apply_operations", apply)
+    compressor._build_memory_diff = AsyncMock(side_effect=build_diff)
+
+    result = await compressor._write_training_case_memory(
+        case=_training_case(), ctx=ctx, archive_uri=archive_uri
+    )
+
+    uri = result.operations.upsert_operations[0].uris[0]
+    fs._async_agfs.pathlock_acquire_exact_batch.assert_awaited_once_with(
+        sorted([fs._uri_to_path(uri), fs._uri_to_path(uri.rsplit("/", 1)[0] + "/.overview.md")]),
+        timeout_secs=300.0,
+    )
+    assert [event[0] for event in fs.events] == ["acquire", "read", "apply", "diff", "release"]
+    fs._async_agfs.pathlock_release.assert_awaited_once_with(fs.events[0][3])
+    assert not fs.guard.locked()
+    assert result.memory_diff == {"adds": [], "updates": [], "deletes": []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["acquire", "apply", "diff"])
+@pytest.mark.parametrize("exception_type", [RuntimeError, asyncio.CancelledError])
+async def test_training_case_write_releases_lease_on_failure(
+    monkeypatch, training_case_lock_fs, failure_stage, exception_type
+):
+    fs = training_case_lock_fs
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
+    apply = AsyncMock(return_value=MemoryUpdateResult())
+    monkeypatch.setattr(MemoryUpdater, "apply_operations", apply)
+    compressor._build_memory_diff = AsyncMock(return_value={})
+    error = exception_type("interrupted")
+    target = {
+        "acquire": fs._async_agfs.pathlock_acquire_exact_batch,
+        "apply": apply,
+        "diff": compressor._build_memory_diff,
+    }[failure_stage]
+    target.side_effect = error
+
+    with pytest.raises(exception_type) as raised:
+        await compressor._write_training_case_memory(
+            case=_training_case(),
+            ctx=_ctx(),
+            archive_uri="viking://user/u/sessions/s1/history/archive_001",
+        )
+
+    assert raised.value is error
+    assert not fs.guard.locked()
+    if failure_stage == "acquire":
+        fs._async_agfs.pathlock_release.assert_not_awaited()
+        fs.read_file.assert_not_awaited()
+        apply.assert_not_awaited()
+    else:
+        fs._async_agfs.pathlock_release.assert_awaited_once_with(fs.events[0][3])
+    if failure_stage != "diff":
+        compressor._build_memory_diff.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_case", [False, True])
+async def test_training_case_writes_wait_before_reading_shared_state(
+    monkeypatch, training_case_lock_fs, same_case
+):
+    fs = training_case_lock_fs
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
+    started = asyncio.Event()
+    finish_first = asyncio.Event()
+    seen_old_content = []
+
+    async def apply(updater, operations, ctx, **kwargs):
+        assert fs.guard.locked()
+        assert updater._transaction_handle is not None
+        op = operations.upsert_operations[0]
+        seen_old_content.append(op.old_memory_file_content.content if op.is_edit() else None)
+        if len(seen_old_content) == 1:
+            started.set()
+            await finish_first.wait()
+        fs.contents[op.uris[0]] = f"after-{len(seen_old_content)}"
+        return MemoryUpdateResult()
+
+    monkeypatch.setattr(MemoryUpdater, "apply_operations", apply)
+    first = asyncio.create_task(
+        compressor._write_training_case_memory(case=_training_case(), ctx=_ctx(), archive_uri="")
+    )
+    tasks = [first]
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        second_case = _training_case()
+        if not same_case:
+            second_case.name = "another_case"
+        tasks.append(
+            asyncio.create_task(
+                compressor._write_training_case_memory(case=second_case, ctx=_ctx(), archive_uri="")
+            )
+        )
+        await asyncio.wait_for(fs.waiting.wait(), timeout=1.0)
+        assert fs.read_file.await_count == 1
+        assert seen_old_content == ["before"]
+        finish_first.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1.0)
+    finally:
+        finish_first.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert seen_old_content == ["before", "after-1" if same_case else None]
+    assert fs._async_agfs.pathlock_release.await_count == 2
+    assert not fs.guard.locked()
+    paths = [call.args[0] for call in fs._async_agfs.pathlock_acquire_exact_batch.await_args_list]
+    assert set(paths[0]) & set(paths[1]) == (
+        set(paths[0]) if same_case else {"/local/default/user/u/memories/cases/.overview.md"}
     )
 
 
@@ -1025,7 +1316,7 @@ async def test_v3_training_case_spec_fast_path_skips_user_memory_extraction_and_
         ctx=_ctx(),
         session_id="s1",
         archive_uri="viking://user/u/sessions/s1/history/archive_001",
-        allowed_memory_types={"cases", "experiences"},
+        allowed_memory_types={"cases", "trajectories"},
     )
 
     assert [case.name for case in written] == ["duplicate_booking"]
@@ -1054,7 +1345,7 @@ async def test_v3_training_case_spec_does_not_write_case_when_evolution_disabled
         ctx=_ctx(),
         session_id="s1",
         archive_uri="viking://user/u/sessions/s1/history/archive_001",
-        allowed_memory_types={"cases", "experiences"},
+        allowed_memory_types={"cases", "trajectories"},
         agent_evolution_enabled=False,
     )
 
@@ -1108,7 +1399,7 @@ async def test_v3_training_case_spec_fast_path_rejects_invalid_protocol():
         await compressor.extract_long_term_memories(
             messages=[message, *_messages()],
             ctx=_ctx(),
-            allowed_memory_types={"cases", "experiences"},
+            allowed_memory_types={"cases", "trajectories"},
         )
 
 
@@ -1148,7 +1439,7 @@ def test_training_case_spec_message_uses_original_case_name_for_trials():
     assert payload["case"]["metadata"]["rollout_case_name"] == "tau2_airline_train_1_t0"
 
 
-def test_training_case_spec_carries_compact_experience_execution():
+def test_training_outcome_carries_compact_experience_execution():
     experience_uri = "viking://user/u/memories/experiences/cancel.md"
     rollout = Rollout(
         case=_training_case(),
@@ -1172,17 +1463,25 @@ def test_training_case_spec_carries_compact_experience_execution():
             }
         },
     )
-    request = _case_spec_message_to_request(rollout)
-    message = Message(
+    case_request = _case_spec_message_to_request(rollout)
+    case_message = Message(
         id="case-spec",
-        role="user",
-        parts=[TextPart(text=request["parts"][0]["text"])],
+        role="system",
+        parts=[TextPart(text=case_request["parts"][0]["text"])],
     )
-    payload = __import__(
+    case_payload = __import__(
         "openviking.session.compressor_v3", fromlist=["_training_case_spec_payload_from_message"]
-    )._training_case_spec_payload_from_message(message)
+    )._training_case_spec_payload_from_message(case_message)
+    assert "experience_execution" not in case_payload["case"]["metadata"]
 
-    execution = payload["case"]["metadata"]["experience_execution"]
+    outcome_request = _evaluation_message_to_request(rollout)
+    outcome_message = Message(
+        id="evaluation",
+        role="user",
+        parts=[TextPart(text=outcome_request["parts"][0]["text"])],
+    )
+    _evaluation, execution = _training_outcome_from_messages([outcome_message])
+
     assert execution[experience_uri]["executed_nodes"] == ["known"]
     assert execution[experience_uri]["current_nodes"] == ["report"]
     assert "evidence" not in execution[experience_uri]
@@ -1313,7 +1612,7 @@ async def test_v3_fast_path_writes_final_memory_diff_with_case_and_exp(monkeypat
         ctx=_ctx(),
         session_id="s1",
         archive_uri=archive_uri,
-        allowed_memory_types={"cases", "experiences"},
+        allowed_memory_types={"cases", "trajectories"},
     )
 
     assert contexts[0].uri.endswith("/cases/duplicate_booking.md")
@@ -1690,104 +1989,62 @@ async def test_commit_experience_snapshot_skips_when_no_visible_content_changed(
 
 
 @pytest.mark.asyncio
-async def test_direct_case_learning_uses_session_without_trajectory_writes(monkeypatch):
-    from openviking.session.train.components.gradient_estimator import ExperienceGradientEstimator
+async def test_case_learning_records_trajectory_diff_before_synthesis(monkeypatch):
+    from openviking.session.train.components.trajectory_observation import ObservationGradient
 
     archive = "viking://user/u/sessions/s1/history/archive_001"
     root = "viking://user/u/memories/experiences"
-    seen = []
+    memory = MemoryFile(
+        uri="viking://user/u/memories/trajectories/duplicate_booking/run.md",
+        memory_type="trajectories",
+        content='{"uncertainties": ["unknown cause"]}',
+    )
 
-    class Trainer:
-        policy_set = ExperienceSet(root_uri=root, policies=[])
+    async def observe(self, analysis, context):
+        assert context.memory_registry is not None
+        analysis.metadata["trajectory_memory"] = memory
+        analysis.trajectories = [
+            Trajectory(name="run", uri=memory.uri, content=memory.content, outcome="unknown")
+        ]
 
-        async def submit_gradients(self, gradients, *, analysis, rollout, batch_finalizer):
-            assert analysis.trajectories == []
-            assert analysis.rollout is rollout
-            seen.append(gradients)
-            item = PolicyPlanItem(
-                kind="upsert",
-                memory_type="experiences",
-                target_name=gradients[0].target_name,
-                target_uri=gradients[0].target_uri,
-                before_content=None,
-                after_content=gradients[0].after_file.content,
-                links=gradients[0].links,
-            )
-            return RolloutTrainingResult(
-                analyses=[analysis],
-                gradients=gradients,
-                plan=PolicyUpdatePlan(items=[item]),
-                apply_result=PolicyApplyResult(
-                    updated_policy_set=self.policy_set, written_uris=[item.target_uri], errors=[]
-                ),
-            )
-
-    async def propose(self, provider, context):
-        assert provider.source_session_uri == archive
-        return ResolvedOperations(
-            upsert_operations=[
-                ResolvedOperation(
-                    memory_type="experiences",
-                    uris=[provider.target_uri],
-                    memory_fields={
-                        "experience_name": provider.case.name,
-                        "content": 'dag = workflow("cancel duplicate")\nverify = check("duplicate confirmed")',
-                    },
-                )
-            ],
-            delete_file_contents=[],
-            errors=[],
+    async def submit(gradients, *, analysis, rollout, batch_finalizer):
+        assert isinstance(gradients[0], ObservationGradient)
+        return RolloutTrainingResult(
+            analyses=[analysis],
+            gradients=gradients,
+            plan=PolicyUpdatePlan(items=[]),
+            apply_result=PolicyApplyResult(updated_policy_set=ExperienceSet(root, [])),
         )
 
-    fs = SimpleNamespace(
-        ls=AsyncMock(return_value=[]),
-        write_file=AsyncMock(),
-        read_file=AsyncMock(
-            return_value='dag = workflow("cancel duplicate")\nverify = check("duplicate confirmed")'
-        ),
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectory", observe
     )
-    monkeypatch.setattr("openviking.session.compressor_v3.get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(ls=AsyncMock(return_value=[])),
+    )
     monkeypatch.setattr(
         "openviking.session.compressor_v3.get_streaming_policy_trainer",
-        AsyncMock(return_value=Trainer()),
-    )
-    monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", propose)
-    monkeypatch.setattr(
-        "openviking.session.compressor_v3.ExperienceImprovementGate.validate_proposals",
         AsyncMock(
-            side_effect=lambda gradients, policy_set, context: (
-                gradients,
-                {
-                    "experience_improvement_gate": {
-                        "stage": "proposal",
-                        "passed": True,
-                        "accepted_count": len(gradients),
-                        "rejected_count": 0,
-                        "candidates": [],
-                    }
-                },
+            return_value=SimpleNamespace(
+                policy_set=ExperienceSet(root, []), submit_gradients=submit
             )
         ),
     )
     compressor = SessionCompressorV3(vikingdb=None)
     compressor._session_skill_extraction_enabled = lambda: False
-    compressor._link_case_to_training_outputs = AsyncMock()
     result = await compressor.train_from_extracted_cases(
         cases=[_training_case()],
         messages=_messages(),
         ctx=_ctx(),
         archive_uri=archive,
         collect_memory_diff=True,
-        strict_extract_errors=True,
-        allowed_memory_types={"experiences"},
+        allowed_memory_types={"trajectories", "experiences"},
     )
     assert result["submitted"] == 1
-    assert seen[0][0].target_name == _training_case().name
-    assert seen[0][0].links[0].to_uri == archive
-    assert {op["memory_type"] for op in result["memory_diff"]["operations"]["adds"]} == {
-        "experiences"
-    }
-    fs.write_file.assert_not_awaited()
+    assert result["memory_diff"]["operations"]["adds"] == [
+        {"uri": memory.uri, "memory_type": "trajectories", "after": memory.content}
+    ]
 
 
 def test_same_session_multiple_cases_do_not_cross_link():
@@ -1827,26 +2084,49 @@ def test_same_session_multiple_cases_do_not_cross_link():
 
 
 @pytest.mark.asyncio
-async def test_experience_training_errors_fail_commit_instead_of_returning_empty_success(
-    monkeypatch,
-):
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("path", ["ordinary", "training", "fast_path"])
+async def test_extraction_failures_follow_strict_mode(monkeypatch, strict, path):
     from openviking.session.compressor_v3 import ExperienceTrainingError
+    from openviking.telemetry import tracer
 
     compressor = SessionCompressorV3(vikingdb=None)
+    error = (
+        RuntimeError("parse failed")
+        if path == "ordinary"
+        else ExperienceTrainingError("parse failed")
+    )
     compressor._extract_user_memories = AsyncMock(
+        side_effect=error if path == "ordinary" else None,
         return_value=SimpleNamespace(
             contexts=[], cases=[_training_case()], case_uri_by_name={}, memory_diff=None
+        ),
+    )
+    compressor.train_from_extracted_cases = AsyncMock(side_effect=error)
+    compressor._commit_training_case_fast_path = AsyncMock(side_effect=error)
+    if path == "fast_path":
+        monkeypatch.setattr(
+            "openviking.session.compressor_v3._training_case_from_first_message",
+            lambda *args: _training_case(),
         )
+    trace_error = Mock()
+    monkeypatch.setattr(tracer, "error", trace_error)
+    call = compressor.extract_long_term_memories(
+        messages=_messages(),
+        ctx=_ctx(),
+        allowed_memory_types={"cases", "trajectories"},
+        strict_extract_errors=strict,
     )
-    compressor.train_from_extracted_cases = AsyncMock(
-        side_effect=ExperienceTrainingError("merge failed")
-    )
-    with pytest.raises(ExperienceTrainingError, match="merge failed"):
-        await compressor.extract_long_term_memories(
-            messages=_messages(),
-            ctx=_ctx(),
-            allowed_memory_types={"cases", "experiences"},
-            strict_extract_errors=False,
+    if strict:
+        with pytest.raises(type(error)) as raised:
+            await call
+        assert raised.value is error
+    else:
+        assert await call == {"contexts": [], "session_skills": []}
+        trace_error.assert_called_once_with(
+            "V3 memory extraction failed; returning empty result",
+            e=error,
+            console=False,
         )
 
 
@@ -1915,7 +2195,7 @@ async def test_case_link_updates_hold_policy_and_case_locks(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_enabled_skills_run_once_independently_of_case_count(monkeypatch):
-    from openviking.session.train import ExperienceGradientEstimator
+    from openviking.session.train.components.session_analyzer import SessionRolloutAnalyzer
 
     fs = SimpleNamespace(ls=AsyncMock(return_value=[]))
     trainer = SimpleNamespace(policy_set=ExperienceSet("viking://user/u/memories/experiences", []))
@@ -1924,7 +2204,7 @@ async def test_enabled_skills_run_once_independently_of_case_count(monkeypatch):
         "openviking.session.compressor_v3.get_streaming_policy_trainer",
         AsyncMock(return_value=trainer),
     )
-    monkeypatch.setattr(ExperienceGradientEstimator, "estimate", AsyncMock(return_value=[]))
+    monkeypatch.setattr(SessionRolloutAnalyzer, "_extract_trajectory", AsyncMock(return_value=None))
     compressor = SessionCompressorV3(vikingdb=None)
     compressor._session_skill_extraction_enabled = lambda: True
     compressor.extract_session_skills = AsyncMock(
@@ -1937,100 +2217,14 @@ async def test_enabled_skills_run_once_independently_of_case_count(monkeypatch):
         archive_uri="viking://user/u/sessions/s/history/archive_001",
     )
     compressor.extract_session_skills.assert_awaited_once()
-    assert result["submitted"] == 2
+    assert result["submitted"] == 0
     assert result["skill_submitted"] == 1
     assert result["skill_uris"] == ["skill-uri"]
 
 
 @pytest.mark.asyncio
-async def test_rejected_session_proposal_is_not_submitted_to_patch_merge(monkeypatch):
-    from openviking.session.train import ExperienceGradientEstimator, PatchSemanticGradient
-
-    root = "viking://user/u/memories/experiences"
-    uri = f"{root}/{_training_case().name}.md"
-
-    class Trainer:
-        policy_set = ExperienceSet(root, [])
-        submit_gradients = AsyncMock(side_effect=AssertionError("rejected proposal reached merge"))
-
-    proposal = PatchSemanticGradient(
-        before_file=None,
-        after_file=MemoryFile(
-            uri=uri,
-            content='dag = workflow("candidate")\nstep = tell("candidate")',
-            memory_type="experiences",
-            extra_fields={"experience_name": _training_case().name},
-        ),
-        base_version=None,
-        rationale="test",
-        links=[
-            StoredLink(
-                from_uri=uri,
-                to_uri="viking://user/u/sessions/s/history/archive_001",
-                link_type="derived_from",
-            )
-        ],
-        confidence=0.8,
-    )
-    monkeypatch.setattr(
-        "openviking.session.compressor_v3.get_streaming_policy_trainer",
-        AsyncMock(return_value=Trainer()),
-    )
-    monkeypatch.setattr(
-        ExperienceGradientEstimator,
-        "estimate",
-        AsyncMock(return_value=[proposal]),
-    )
-    gate_metadata = {
-        "experience_improvement_gate": {
-            "stage": "proposal",
-            "passed": False,
-            "accepted_count": 0,
-            "rejected_count": 1,
-            "candidates": [
-                {
-                    "target_uri": uri,
-                    "target_name": _training_case().name,
-                    "passed": False,
-                    "reason": "proposal does not improve its source Session",
-                    "replays": [],
-                }
-            ],
-        }
-    }
-    monkeypatch.setattr(
-        "openviking.session.compressor_v3.ExperienceImprovementGate.validate_proposals",
-        AsyncMock(return_value=([], gate_metadata)),
-    )
-    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=AsyncMock())
-    compressor._session_skill_extraction_enabled = lambda: False
-    monkeypatch.setattr(
-        "openviking.session.compressor_v3.get_openviking_config",
-        lambda: SimpleNamespace(
-            agent_evolution=SimpleNamespace(
-                experience_gate_enabled=True,
-                dag_decider=None,
-            ),
-            jev=None,
-        ),
-    )
-    compressor.rollout_analyzer.analyze.return_value = RolloutAnalysis(
-        evaluation=RubricEvaluation(False, 0.0, [], ["failed"]),
-        metadata={"source_session_uri": "viking://user/u/sessions/s/history/archive_001"},
-    )
-
-    result = await compressor.train_from_extracted_cases(
-        cases=[_training_case()],
-        messages=_messages(),
-        ctx=_ctx(),
-        archive_uri="viking://user/u/sessions/s/history/archive_001",
-        collect_memory_diff=True,
-    )
-
-    Trainer.submit_gradients.assert_not_awaited()
-    assert result["proposed_exp_gradient_count"] == 1
-    assert result["accepted_exp_gradient_count"] == 0
-    assert result["filtered_exp_gradient_count"] == 1
-    skipped = result["memory_diff"]["skipped_operations"]
-    assert skipped[0]["reason_code"] == "experience_gate_rejected"
-    assert skipped[0]["uri"] == uri
+async def test_lenient_extraction_does_not_swallow_cancellation():
+    compressor = SessionCompressorV3(vikingdb=None)
+    compressor._extract_user_memories = AsyncMock(side_effect=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await compressor.extract_long_term_memories(messages=_messages(), ctx=_ctx())

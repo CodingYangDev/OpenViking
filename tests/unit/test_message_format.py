@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import json
+
 from openviking.utils.message_format import format_messages, sanitize_openai_messages
 
 
@@ -96,3 +98,63 @@ def test_sanitize_openai_messages_preserves_nonempty_multimodal_assistant_conten
     }
 
     assert sanitize_openai_messages([message]) == [message]
+
+
+def test_native_eval_pair_survives_sanitization_and_pretty_formatting():
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-eval-1",
+                    "type": "function",
+                    "function": {
+                        "name": "eval",
+                        "arguments": '{"code": "mem = sdk.read_ss_user()"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-eval-1",
+            "content": '{"mem": {"error": "File not found"}}',
+        },
+    ]
+    sanitized = sanitize_openai_messages(messages)
+    assert sanitized == messages
+    rendered = format_messages(sanitized)
+    assert "[assistant tool_call] (id=call-eval-1, name=eval)" in rendered
+    assert '"code": "mem = sdk.read_ss_user()"' in rendered
+    assert "[tool] (id=call-eval-1)" in rendered
+    assert '"error": "File not found"' in rendered
+    assert "[user]" not in rendered
+    assert "eval_result" not in rendered
+
+
+def test_pretty_formatter_preserves_python_native_tool_content_as_code():
+    code = "memory = sdk.existing(memory_type='preferences', content='Use Vim')"
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "read-1",
+                    "type": "function",
+                    "function": {
+                        "name": "eval",
+                        "arguments": json.dumps(
+                            {"code": "memory = sdk.read_preferences(topic='editor')"}
+                        ),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "read-1", "content": code},
+    ]
+    rendered = format_messages(sanitize_openai_messages(messages))
+    assert "[assistant tool_call] (id=read-1, name=eval)" in rendered
+    assert f"[tool] (id=read-1)\n{code}" in rendered
+    assert "[user]" not in rendered

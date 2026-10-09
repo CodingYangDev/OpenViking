@@ -163,10 +163,7 @@ async def get_compile(
 ):
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
-        detail=(
-            "This endpoint is no longer supported. "
-            "Poll GET /api/v1/tasks/{task_id} instead."
-        ),
+        detail=("This endpoint is no longer supported. Poll GET /api/v1/tasks/{task_id} instead."),
     )
 
 
@@ -178,8 +175,7 @@ async def cancel_compile(
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=(
-            "This endpoint is no longer supported. "
-            "Use POST /api/v1/tasks/{task_id}/cancel instead."
+            "This endpoint is no longer supported. Use POST /api/v1/tasks/{task_id}/cancel instead."
         ),
     )
 

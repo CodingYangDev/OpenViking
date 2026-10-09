@@ -128,9 +128,7 @@ def _apply_ingest_options(
             embedding_msg.context_data.get("search_tags"), incoming_tags
         )
     embedding_msg.context_data["search_tags"] = incoming_tags
-    embedding_msg.context_data.setdefault("_upsert_options", {})["search_tag_mode"] = (
-        tag_mode
-    )
+    embedding_msg.context_data.setdefault("_upsert_options", {})["search_tag_mode"] = tag_mode
 
 
 async def _enqueue_embedding_message(

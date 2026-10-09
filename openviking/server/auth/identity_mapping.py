@@ -8,7 +8,7 @@ import logging
 import re
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 from openviking.server.identity import Role
 
@@ -140,18 +140,30 @@ class IdentityMapper:
                         v = claims.get(claim)
                         if v is not None:
                             value = str(v)
-                            logger.debug("Found value from claim '%s': %s", claim, value[:50] if len(value) > 50 else value)
+                            logger.debug(
+                                "Found value from claim '%s': %s",
+                                claim,
+                                value[:50] if len(value) > 50 else value,
+                            )
                             break
             elif hasattr(source, "claim") and source.claim:
                 v = claims.get(source.claim)
                 if v is not None:
                     value = str(v)
-                    logger.debug("Found value from claim '%s': %s", source.claim, value[:50] if len(value) > 50 else value)
+                    logger.debug(
+                        "Found value from claim '%s': %s",
+                        source.claim,
+                        value[:50] if len(value) > 50 else value,
+                    )
         elif source.source == "attribute" and attributes is not None:
             if hasattr(source, "attribute") and source.attribute:
                 value = attributes.get(source.attribute)
                 if value:
-                    logger.debug("Found value from attribute '%s': %s", source.attribute, value[:50] if len(value) > 50 else value)
+                    logger.debug(
+                        "Found value from attribute '%s': %s",
+                        source.attribute,
+                        value[:50] if len(value) > 50 else value,
+                    )
         elif source.source == "dn_attribute" and dn is not None:
             # Extract attribute from DN (e.g., "ou=engineering,dc=example,dc=com" -> "engineering")
             if hasattr(source, "attribute") and source.attribute:
@@ -168,7 +180,9 @@ class IdentityMapper:
                 if isinstance(part, dict) and "literal" in part:
                     parts.append(str(part["literal"]))
                 else:
-                    part_source = MappingSource.model_validate(part) if isinstance(part, dict) else part
+                    part_source = (
+                        MappingSource.model_validate(part) if isinstance(part, dict) else part
+                    )
                     part_value = self._extract_value(part_source, claims, attributes, dn, groups)
                     if part_value is not None:
                         parts.append(part_value)
@@ -234,10 +248,8 @@ class IdentityMapper:
             logger.debug("Available attributes for account_id mapping: %s", list(attributes.keys()))
         if dn:
             logger.debug("DN available for account_id mapping: %s", dn)
-        
-        value = self._extract_value(
-            self.config.account_id, claims, attributes, dn, groups
-        )
+
+        value = self._extract_value(self.config.account_id, claims, attributes, dn, groups)
         if value is None:
             raise ValueError(
                 f"Could not map account_id from external identity. "
@@ -260,10 +272,8 @@ class IdentityMapper:
             logger.debug("Available claims for user_id mapping: %s", list(claims.keys()))
         if attributes:
             logger.debug("Available attributes for user_id mapping: %s", list(attributes.keys()))
-        
-        value = self._extract_value(
-            self.config.user_id, claims, attributes, dn, groups
-        )
+
+        value = self._extract_value(self.config.user_id, claims, attributes, dn, groups)
         if value is None:
             raise ValueError(
                 f"Could not map user_id from external identity. "

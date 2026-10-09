@@ -15,6 +15,7 @@ from openviking.session.memory.merge_policy import MEMORY_MERGE_POLICY
 from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
 )
+from openviking.session.memory.tools import add_tool_call_pair_to_messages
 from openviking.session.memory.utils.language import resolve_output_language_from_text
 
 if TYPE_CHECKING:
@@ -185,13 +186,21 @@ canonical replacement; if it is only a duplicate new proposal, omit it.
 
     async def prefetch(self) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
-        call_id = 0
         file_uris = await self._resolve_prefetch_file_uris()
-        for uri in file_uris:
-            call_id = await self._append_structured_read_result(
-                messages,
-                call_id,
-                uri,
+        self._allowed_memory_read_uris.update(file_uris)
+        for batch_start in range(0, len(file_uris), 20):
+            batch = file_uris[batch_start : batch_start + 20]
+            code = "\n".join(
+                f"prefetched_memory_{batch_start + index} = sdk.read(uri={uri!r})"
+                for index, uri in enumerate(batch, start=1)
+            )
+            result = await self._eval_memory(code)
+            add_tool_call_pair_to_messages(
+                messages=messages,
+                call_id=None,
+                tool_name="eval",
+                params={"code": code},
+                result=result,
             )
 
         messages.append(

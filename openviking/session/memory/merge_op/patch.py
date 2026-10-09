@@ -106,6 +106,35 @@ class PatchOp(MergeOpBase):
             return current_value
         return patch_value
 
+    async def apply_exact(self, current_value: Any, patch_value: Any) -> Any:
+        """Apply a patch with the same exact/unique anchors required by extraction.
+
+        Used at validated-content boundaries so fuzzy matching cannot silently rebase
+        an edit onto different data after a concurrent update.
+        """
+        from openviking.session.memory.merge_op.patch_handler import unescape_markers
+
+        if self._field_type != FieldType.STRING:
+            return await self.apply(current_value, patch_value)
+        if isinstance(patch_value, dict):
+            patch_value = StrPatch.model_validate(patch_value)
+        if not isinstance(patch_value, StrPatch) or current_value is None:
+            return await self.apply(current_value, patch_value)
+        working = current_value
+        for index, block in enumerate(patch_value.blocks, start=1):
+            search = unescape_markers(block.search)
+            if not search or working.count(search) != 1:
+                raise ValueError(
+                    f"Patch block {index} must match exactly once in the current content"
+                )
+            if block.search == block.replace:
+                continue
+            updated = await self.apply(working, StrPatch(blocks=[block]))
+            if updated == working:
+                raise ValueError(f"Patch block {index} did not apply to the current content")
+            working = updated
+        return working
+
     def _extract_replace_when_no_original(self, patch_value: Any) -> Any:
         """
         Extract replace value from patch when there's no original content.

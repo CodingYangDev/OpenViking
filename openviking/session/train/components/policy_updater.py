@@ -277,13 +277,13 @@ def _plan_to_resolved_operations(
                     "experience_name": updated.name,
                     "content": updated.content,
                     "status": updated.status,
-                    # Session archives are immutable provenance endpoints. Store forward
-                    # links on the Experience without writing backlinks into raw archives.
+                    # Store forward provenance links without writing backlinks into immutable
+                    # Trajectories or source Session archives.
                     "links": [
                         *updated.links,
                         *[
                             link.model_dump()
-                            for link in _source_session_links(exp_uri=uri, links=item.links)
+                            for link in _source_evidence_links(exp_uri=uri, links=item.links)
                         ],
                     ],
                 },
@@ -342,7 +342,7 @@ def _policy_to_memory_file(policy: Policy | None) -> MemoryFile | None:
     )
 
 
-def _source_session_links(
+def _source_evidence_links(
     *,
     exp_uri: str,
     links: list[StoredLink],
@@ -350,7 +350,11 @@ def _source_session_links(
     result: list[StoredLink] = []
     seen: set[tuple[str, str | None]] = set()
     for link in links or []:
-        if link.link_type != "derived_from" or not link.to_uri or not is_session_uri(link.to_uri):
+        if (
+            link.link_type != "derived_from"
+            or not link.to_uri
+            or not (is_session_uri(link.to_uri) or "/memories/trajectories/" in link.to_uri)
+        ):
             continue
         key = (link.to_uri, link.match_text)
         if key in seen:

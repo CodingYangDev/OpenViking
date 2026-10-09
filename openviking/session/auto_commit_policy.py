@@ -103,9 +103,7 @@ class AutoCommitPolicy:
                 maximum=MAX_MESSAGE_COUNT_THRESHOLD,
             ),
             min_commit_interval_seconds=_coerce_int(
-                data.get(
-                    "min_commit_interval_seconds", default.min_commit_interval_seconds
-                ),
+                data.get("min_commit_interval_seconds", default.min_commit_interval_seconds),
                 field="min_commit_interval_seconds",
                 minimum=0,
                 maximum=MAX_IDLE_TIMEOUT_SECONDS,

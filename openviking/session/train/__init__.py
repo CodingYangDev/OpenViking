@@ -18,9 +18,7 @@ from openviking.session.train.components.event_recorder import (
     JsonlEventRecorder,
     JsonlPipelineEventHook,
 )
-from openviking.session.train.components.experience_improvement_gate import (
-    ExperienceImprovementGate,
-)
+from openviking.session.train.components.experience_learner import RemoteExperienceLearner
 from openviking.session.train.components.gradient_estimator import (
     ExperienceGradientContext,
     ExperienceGradientEstimator,
@@ -96,12 +94,15 @@ from openviking.session.train.domain import (
     Trajectory,
     TrajectoryOutcome,
 )
+from openviking.session.train.gates import ExperienceImprovementGate
 from openviking.session.train.gradients import PatchSemanticGradient
 from openviking.session.train.interfaces import (
     CaseLoader,
+    ExperienceLearner,
     GradientEstimator,
     PolicyOptimizationPipeline,
     PolicyOptimizer,
+    PolicyProposalGate,
     PolicySnapshotter,
     PolicyTrainer,
     PolicyUpdateGate,
@@ -138,6 +139,7 @@ __all__ = [
     "PatchMergePolicyOptimizer",
     "PatchMergePolicyOptimizerContext",
     "PolicyTrainer",
+    "ExperienceLearner",
     "PipelineLifecycleHook",
     "PipelineReportBuilder",
     "PipelineReportHook",
@@ -145,6 +147,7 @@ __all__ = [
     "NoopPipelineLifecycleHook",
     "emit_run_summary",
     "SessionCommitPolicyTrainer",
+    "RemoteExperienceLearner",
     "ExperienceSetLoader",
     "SkillSetLoader",
     "SkillPolicyUpdater",
@@ -175,6 +178,7 @@ __all__ = [
     "PolicyPlanItemKind",
     "PolicyOptimizationPipeline",
     "PolicyOptimizer",
+    "PolicyProposalGate",
     "PolicyUpdateGate",
     "PolicySnapshotter",
     "PolicyStatus",

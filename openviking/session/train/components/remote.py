@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -25,6 +25,9 @@ from openviking.session.train.domain import (
     ExperienceSet,
     Rollout,
 )
+from openviking.session.train.utils import call_hook
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -49,7 +52,9 @@ class RemoteCaseLoader:
 
         remaining = self.limit
         cursor: str | None = None
-        async with httpx.AsyncClient(base_url=self.service_url.rstrip("/"), timeout=self.timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            base_url=self.service_url.rstrip("/"), timeout=self.timeout_seconds
+        ) as client:
             while True:
                 request_limit = self.batch_size or remaining
                 if request_limit is None:
@@ -84,7 +89,9 @@ class RemoteCaseLoader:
                     return
 
     async def split_exists(self) -> bool:
-        async with httpx.AsyncClient(base_url=self.service_url.rstrip("/"), timeout=self.timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            base_url=self.service_url.rstrip("/"), timeout=self.timeout_seconds
+        ) as client:
             response = await client.post(
                 "/v1/cases/query",
                 json={
@@ -139,15 +146,19 @@ class RemoteRolloutExecutor:
             default=self.progress_label,
         )
         timeout = httpx.Timeout(self.request_timeout_seconds)
-        async with httpx.AsyncClient(base_url=self.service_url.rstrip("/"), timeout=timeout) as client:
+        async with httpx.AsyncClient(
+            base_url=self.service_url.rstrip("/"), timeout=timeout
+        ) as client:
 
             async def _execute(case: Case, index: int) -> Rollout:
                 rollout = await self._execute_one(client, case, policy_set, context)
-                await self._emit_rollout_complete(
-                    rollout=rollout,
-                    index=index,
-                    context=context,
-                )
+                if self.on_rollout_complete is not None:
+                    await call_hook(
+                        self.on_rollout_complete,
+                        rollout=rollout,
+                        index=index,
+                        context=context,
+                    )
                 return rollout
 
             return await run_with_progress(
@@ -158,23 +169,6 @@ class RemoteRolloutExecutor:
                 description=f"Running {len(case_list)} rollouts, concurrency={self.concurrency}",
                 concurrency=self.concurrency,
             )
-
-    async def _emit_rollout_complete(
-        self,
-        *,
-        rollout: Rollout,
-        index: int,
-        context: ExecutionContext,
-    ) -> None:
-        if self.on_rollout_complete is None:
-            return
-        result = self.on_rollout_complete(
-            rollout=rollout,
-            index=index,
-            context=context,
-        )
-        if inspect.isawaitable(result):
-            await result
 
     async def _execute_one(
         self,
@@ -187,6 +181,7 @@ class RemoteRolloutExecutor:
             "/v1/rollouts/execute",
             json={
                 "case": case_to_dict(case),
+                "execution_timeout_seconds": self.execution_timeout_seconds,
                 "policy_set": policy_set_to_dict(policy_set),
                 "execution_context": {
                     "policy_snapshot_id": context.policy_snapshot_id,
@@ -197,7 +192,27 @@ class RemoteRolloutExecutor:
         )
         response.raise_for_status()
         execution_id = _require_execution_id(response.json(), case=case)
-        return await self._poll_execution(client, execution_id, case=case)
+        try:
+            # A stalled polling HTTP request must not extend the execution budget.
+            return await asyncio.wait_for(
+                self._poll_execution(client, execution_id, case=case),
+                timeout=self.execution_timeout_seconds,
+            )
+        except (TimeoutError, asyncio.CancelledError) as failure:
+            try:
+                response = await asyncio.wait_for(
+                    client.post(f"/v1/rollouts/executions/{execution_id}/cancel"),
+                    timeout=min(5.0, self.request_timeout_seconds),
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                logger.warning("Could not cancel rollout %s: %s", execution_id, type(exc).__name__)
+            if isinstance(failure, TimeoutError):
+                raise TimeoutError(
+                    f"rollout execution {execution_id} timed out for case {case.name} "
+                    f"after {self.execution_timeout_seconds}s"
+                ) from failure
+            raise
 
     async def _poll_execution(
         self,
@@ -218,7 +233,12 @@ class RemoteRolloutExecutor:
             try:
                 response = await client.get(f"/v1/rollouts/executions/{execution_id}")
                 transient_errors = 0
-            except (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException) as exc:
+            except (
+                httpx.ReadError,
+                httpx.ConnectError,
+                httpx.RemoteProtocolError,
+                httpx.TimeoutException,
+            ) as exc:
                 transient_errors += 1
                 last_transient_error = exc
                 if asyncio.get_running_loop().time() >= deadline:
@@ -231,10 +251,7 @@ class RemoteRolloutExecutor:
                 continue
             if response.status_code == 404:
                 missing_execution_errors += 1
-                if (
-                    loop.time() >= deadline
-                    or loop.time() >= missing_execution_deadline
-                ):
+                if loop.time() >= deadline or loop.time() >= missing_execution_deadline:
                     raise RuntimeError(
                         f"rollout execution {execution_id} was not found while polling "
                         f"case {case.name}; observed {missing_execution_errors} 404 response(s) "
@@ -262,7 +279,9 @@ class RemoteRolloutExecutor:
             if status == "completed":
                 rollout_data = data.get("rollout")
                 if not isinstance(rollout_data, dict):
-                    raise RuntimeError(f"rollout execution {execution_id} completed without rollout")
+                    raise RuntimeError(
+                        f"rollout execution {execution_id} completed without rollout"
+                    )
                 return rollout_from_dict(rollout_data)
             if status == "failed":
                 raise RuntimeError(

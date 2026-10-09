@@ -807,9 +807,7 @@ async def test_wm_creation_detects_language_from_multiline_user_message(client, 
             _text_message(
                 "multiline-user",
                 "user",
-                "Task details:\n"
-                "当前生产环境已经完成部署。\n"
-                "请用中文总结当前状态和后续风险。",
+                "Task details:\n当前生产环境已经完成部署。\n请用中文总结当前状态和后续风险。",
             )
         ]
     )
@@ -1743,7 +1741,9 @@ async def test_queue_enqueue_failure_marks_archive_failed_and_keeps_raw_durable(
         await session.commit_async()
 
     states = await session._archives.scan_states()
-    context = await session.get_session_context()
+    fresh = client(session_id=session.session_id)
+    await fresh.load()
+    context = await fresh.get_session_context()
     failed = json.loads(
         await session._viking_fs.read_file(
             f"{states[0].archive_uri}/.failed.json",
@@ -1752,11 +1752,11 @@ async def test_queue_enqueue_failure_marks_archive_failed_and_keeps_raw_durable(
     )
     assert states[0].state == "failed"
     assert failed["stage"] == "queue_enqueue"
-    # Raw stays durable on disk, and this message is also still live in root
-    # because the failed commit never trimmed it.
+    # Root state was persisted before enqueue. The failed archive keeps the raw
+    # messages durable, but they are not automatically replayed as live messages.
     raw = await session._archives.read_messages(states[0].archive_uri)
     assert [message.content for message in raw] == ["do not lose me"]
-    assert [message["parts"][0]["text"] for message in context["messages"]] == ["do not lose me"]
+    assert context["messages"] == []
     assert context["stats"]["failedArchives"] == 1
 
 
@@ -1799,7 +1799,7 @@ async def test_phase1_root_rewrite_failure_marks_orphan_archive_failed(
     assert [message["parts"][0]["text"] for message in context["messages"]] == ["retained tail"]
 
 
-async def test_phase1_enqueues_before_root_rewrite_and_publishes_ready_last(
+async def test_phase1_persists_root_before_enqueue_and_publishes_ready_last(
     client,
     monkeypatch,
 ):
@@ -1828,8 +1828,8 @@ async def test_phase1_enqueues_before_root_rewrite_and_publishes_ready_last(
     session.add_message("user", [TextPart("wait for predecessor")])
     second = await session.commit_async()
     assert observations == [
-        (["archive me"], "preparing"),
-        (["wait for predecessor"], "preparing"),
+        ([], "preparing"),
+        ([], "preparing"),
     ]
     assert (await session._read_phase1_meta(result["archive_uri"]))["status"] == "ready"
     assert (await session._read_phase1_meta(second["archive_uri"]))["status"] == "ready"

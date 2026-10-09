@@ -82,12 +82,13 @@ class SkillsLoader:
 
         return None
 
-    def load_skills_for_context(self, skill_names: list[str]) -> str:
+    def load_skills_for_context(self, skill_names: list[str], *, required: bool = False) -> str:
         """
         Load specific skills for inclusion in agent context.
 
         Args:
             skill_names: List of skill names to load.
+            required: Fail if a selected Skill is missing or empty.
 
         Returns:
             Formatted skills content.
@@ -95,6 +96,8 @@ class SkillsLoader:
         parts = []
         for name in skill_names:
             content = self.load_skill(name)
+            if required and not content:
+                raise FileNotFoundError(f"Required skill is missing or empty: {name}")
             if content:
                 content = self._strip_frontmatter(content)
                 parts.append(f"### Skill: {name}\n\n{content}")

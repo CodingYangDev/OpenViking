@@ -130,14 +130,16 @@ collection = get_or_create_local_collection(meta_data=collection_meta_data)
 data_list = []
 categories = ["tech", "science", "art", "sports", "music"]
 for i in range(1, 101):
-    data_list.append({
-        "id": i,
-        "embedding": [random.random() for _ in range(128)],
-        "text": f"This is document number {i}",
-        "category": categories[i % 5],
-        "score": round(random.uniform(0.5, 1.0), 2),
-        "priority": random.randint(1, 10)
-    })
+    data_list.append(
+        {
+            "id": i,
+            "embedding": [random.random() for _ in range(128)],
+            "text": f"This is document number {i}",
+            "category": categories[i % 5],
+            "score": round(random.uniform(0.5, 1.0), 2),
+            "priority": random.randint(1, 10),
+        }
+    )
 
 # Step 4: 插入数据
 result = collection.upsert_data(data_list)
@@ -146,10 +148,7 @@ print(f"Successfully inserted {len(result.ids)} documents")
 # Step 5: 创建索引
 index_meta_data = {
     "IndexName": "demo_index",
-    "VectorIndex": {
-        "IndexType": "flat",
-        "Distance": "ip"
-    },
+    "VectorIndex": {"IndexType": "flat", "Distance": "ip"},
     "ScalarIndex": ["category", "priority"],
 }
 collection.create_index("demo_index", index_meta_data)
@@ -158,9 +157,7 @@ print("Index created successfully")
 # Step 6: 向量搜索
 query_vector = [random.random() for _ in range(128)]
 search_result = collection.search_by_vector(
-    index_name="demo_index",
-    dense_vector=query_vector,
-    limit=5
+    index_name="demo_index", dense_vector=query_vector, limit=5
 )
 
 print("\n=== Search Results ===")
@@ -173,13 +170,15 @@ search_result = collection.search_by_vector(
     dense_vector=query_vector,
     limit=5,
     filters={"op": "must", "field": "category", "conds": ["tech", "science"]},
-    output_fields=["text", "category", "score"]
+    output_fields=["text", "category", "score"],
 )
 
 print("\n=== Filtered Search Results (tech or science) ===")
 for item in search_result.data:
-    print(f"ID: {item.id}, Category: {item.fields.get('category')}, "
-          f"Score: {item.score:.4f}, Text: {item.fields.get('text')}")
+    print(
+        f"ID: {item.id}, Category: {item.fields.get('category')}, "
+        f"Score: {item.score:.4f}, Text: {item.fields.get('text')}"
+    )
 
 # Step 8: 清理资源
 collection.close()
@@ -218,10 +217,7 @@ import os
 persist_path = "./vectordb_data/my_persistent_collection"
 os.makedirs(persist_path, exist_ok=True)
 
-collection = get_or_create_local_collection(
-    meta_data=meta_data,
-    path=persist_path
-)
+collection = get_or_create_local_collection(meta_data=meta_data, path=persist_path)
 print(f"Persistent collection created at: {persist_path}")
 
 # 关闭集合
@@ -237,14 +233,12 @@ print("Collection reopened with all data restored")
 ```python
 # 自定义 TTL 清理和索引维护间隔
 config = {
-    "ttl_cleanup_seconds": 10,        # TTL 清理间隔 10 秒
-    "index_maintenance_seconds": 60   # 索引维护间隔 60 秒
+    "ttl_cleanup_seconds": 10,  # TTL 清理间隔 10 秒
+    "index_maintenance_seconds": 60,  # 索引维护间隔 60 秒
 }
 
 collection = get_or_create_local_collection(
-    meta_data=meta_data,
-    path="./vectordb_data/",
-    config=config
+    meta_data=meta_data, path="./vectordb_data/", config=config
 )
 print(f"Collection created with custom config: TTL cleanup every {config['ttl_cleanup_seconds']}s")
 ```
@@ -255,23 +249,15 @@ print(f"Collection created with custom config: TTL cleanup every {config['ttl_cl
 # 添加新字段
 collection.update(
     fields=[
-        {
-            "FieldName": "timestamp",
-            "FieldType": "int64",
-            "DefaultValue": 0
-        },
-        {
-            "FieldName": "tags",
-            "FieldType": "text",
-            "DefaultValue": ""
-        }
+        {"FieldName": "timestamp", "FieldType": "int64", "DefaultValue": 0},
+        {"FieldName": "tags", "FieldType": "text", "DefaultValue": ""},
     ]
 )
 
 # 验证新字段
 meta = collection.get_meta_data()
 print(f"Collection now has {len(meta['Fields'])} fields")
-for field in meta['Fields']:
+for field in meta["Fields"]:
     print(f"  - {field['FieldName']}: {field['FieldType']}")
 ```
 
@@ -289,22 +275,22 @@ data_list = [
         "vector": [0.1] * 128,
         "text": "First document",
         "timestamp": int(time.time()),
-        "tags": "important"
+        "tags": "important",
     },
     {
         "id": 2,
         "vector": [0.2] * 128,
         "text": "Second document",
         "timestamp": int(time.time()),
-        "tags": "review"
+        "tags": "review",
     },
     {
         "id": 3,
         "vector": [0.3] * 128,
         "text": "Third document",
         "timestamp": int(time.time()),
-        "tags": "archive"
-    }
+        "tags": "archive",
+    },
 ]
 
 # 插入数据
@@ -318,7 +304,7 @@ update_data = [
         "vector": [0.15] * 128,
         "text": "Updated first document",
         "timestamp": int(time.time()),
-        "tags": "updated"
+        "tags": "updated",
     }
 ]
 result = collection.upsert_data(update_data)
@@ -337,7 +323,7 @@ ttl_data = [
         "vector": [1.0] * 128,
         "text": "Temporary document",
         "timestamp": int(time.time()),
-        "tags": "temp"
+        "tags": "temp",
     }
 ]
 
@@ -408,21 +394,15 @@ print(f"Items after delete_all: {len(fetch_result.items)}")
 # 创建基本向量索引
 basic_index_meta = {
     "IndexName": "basic_index",
-    "VectorIndex": {
-        "IndexType": "flat",
-        "Distance": "ip"
-    }
+    "VectorIndex": {"IndexType": "flat", "Distance": "ip"},
 }
 collection.create_index("basic_index", basic_index_meta)
 
 # 创建带标量索引的向量索引
 scalar_index_meta = {
     "IndexName": "scalar_index",
-    "VectorIndex": {
-        "IndexType": "flat",
-        "Distance": "l2"
-    },
-    "ScalarIndex": ["category", "priority", "timestamp"]
+    "VectorIndex": {"IndexType": "flat", "Distance": "l2"},
+    "ScalarIndex": ["category", "priority", "timestamp"],
 }
 collection.create_index("scalar_index", scalar_index_meta)
 
@@ -432,8 +412,8 @@ hybrid_index_meta = {
     "VectorIndex": {
         "IndexType": "flat_hybrid",
         "Distance": "ip",
-        "SearchWithSparseLogitAlpha": 1.0
-    }
+        "SearchWithSparseLogitAlpha": 1.0,
+    },
 }
 collection.create_index("hybrid_index", hybrid_index_meta)
 
@@ -451,7 +431,7 @@ for idx_name in indexes:
 collection.update_index(
     index_name="basic_index",
     scalar_index=["text", "tags"],
-    description="Updated basic index with text and tags fields"
+    description="Updated basic index with text and tags fields",
 )
 
 # 获取索引元数据
@@ -482,26 +462,29 @@ import random
 
 # 准备测试数据
 test_data = [
-    {"id": i, "vector": [random.random() for _ in range(128)],
-     "text": f"Document {i}", "category": ["tech", "science", "art"][i % 3]}
+    {
+        "id": i,
+        "vector": [random.random() for _ in range(128)],
+        "text": f"Document {i}",
+        "category": ["tech", "science", "art"][i % 3],
+    }
     for i in range(1, 51)
 ]
 collection.upsert_data(test_data)
 
 # 创建索引
-collection.create_index("test_index", {
-    "IndexName": "test_index",
-    "VectorIndex": {"IndexType": "flat", "Distance": "ip"},
-    "ScalarIndex": ["category"]
-})
+collection.create_index(
+    "test_index",
+    {
+        "IndexName": "test_index",
+        "VectorIndex": {"IndexType": "flat", "Distance": "ip"},
+        "ScalarIndex": ["category"],
+    },
+)
 
 # 执行向量搜索
 query_vector = [random.random() for _ in range(128)]
-result = collection.search_by_vector(
-    index_name="test_index",
-    dense_vector=query_vector,
-    limit=10
-)
+result = collection.search_by_vector(index_name="test_index", dense_vector=query_vector, limit=10)
 
 print("=== Top 10 Similar Documents ===")
 for i, item in enumerate(result.data, 1):
@@ -517,13 +500,15 @@ result = collection.search_by_vector(
     dense_vector=query_vector,
     limit=5,
     filters={"op": "must", "field": "category", "conds": ["tech"]},
-    output_fields=["text", "category"]
+    output_fields=["text", "category"],
 )
 
 print("\n=== Tech Category Results ===")
 for item in result.data:
-    print(f"ID: {item.id}, Category: {item.fields['category']}, "
-          f"Text: {item.fields['text']}, Score: {item.score:.4f}")
+    print(
+        f"ID: {item.id}, Category: {item.fields['category']}, "
+        f"Text: {item.fields['text']}, Score: {item.score:.4f}"
+    )
 ```
 
 #### 4.3 范围过滤搜索
@@ -531,8 +516,12 @@ for item in result.data:
 ```python
 # 添加带优先级的数据
 priority_data = [
-    {"id": i, "vector": [random.random() for _ in range(128)],
-     "text": f"Priority doc {i}", "priority": i}
+    {
+        "id": i,
+        "vector": [random.random() for _ in range(128)],
+        "text": f"Priority doc {i}",
+        "priority": i,
+    }
     for i in range(1, 21)
 ]
 collection.upsert_data(priority_data)
@@ -543,13 +532,12 @@ result = collection.search_by_vector(
     dense_vector=query_vector,
     limit=10,
     filters={"op": "range", "field": "priority", "gte": 5, "lte": 15},
-    output_fields=["text", "priority"]
+    output_fields=["text", "priority"],
 )
 
 print("\n=== Priority Range [5, 15] Results ===")
 for item in result.data:
-    print(f"ID: {item.id}, Priority: {item.fields['priority']}, "
-          f"Score: {item.score:.4f}")
+    print(f"ID: {item.id}, Priority: {item.fields['priority']}, Score: {item.score:.4f}")
 ```
 
 #### 4.4 分页搜索
@@ -557,11 +545,7 @@ for item in result.data:
 ```python
 # 第一页（前 10 条）
 page1 = collection.search_by_vector(
-    index_name="test_index",
-    dense_vector=query_vector,
-    limit=10,
-    offset=0,
-    output_fields=["text"]
+    index_name="test_index", dense_vector=query_vector, limit=10, offset=0, output_fields=["text"]
 )
 
 print("\n=== Page 1 (offset=0, limit=10) ===")
@@ -570,11 +554,7 @@ for item in page1.data:
 
 # 第二页（10-20 条）
 page2 = collection.search_by_vector(
-    index_name="test_index",
-    dense_vector=query_vector,
-    limit=10,
-    offset=10,
-    output_fields=["text"]
+    index_name="test_index", dense_vector=query_vector, limit=10, offset=10, output_fields=["text"]
 )
 
 print("\n=== Page 2 (offset=10, limit=10) ===")
@@ -588,12 +568,7 @@ for item in page2.data:
 
 ```python
 # 使用 ID=5 的向量搜索相似文档
-result = collection.search_by_id(
-    index_name="test_index",
-    id=5,
-    limit=5,
-    output_fields=["text"]
-)
+result = collection.search_by_id(index_name="test_index", id=5, limit=5, output_fields=["text"])
 
 print("\n=== Similar to Document ID=5 ===")
 for item in result.data:
@@ -605,22 +580,19 @@ for item in result.data:
 ```python
 # 随机获取 10 条文档
 result = collection.search_by_random(
-    index_name="test_index",
-    limit=10,
-    output_fields=["text", "category"]
+    index_name="test_index", limit=10, output_fields=["text", "category"]
 )
 
 print("\n=== Random 10 Documents ===")
 for item in result.data:
-    print(f"ID: {item.id}, Category: {item.fields.get('category')}, "
-          f"Text: {item.fields['text']}")
+    print(f"ID: {item.id}, Category: {item.fields.get('category')}, Text: {item.fields['text']}")
 
 # 带过滤的随机搜索
 result = collection.search_by_random(
     index_name="test_index",
     limit=5,
     filters={"op": "must", "field": "category", "conds": ["science"]},
-    output_fields=["text"]
+    output_fields=["text"],
 )
 
 print("\n=== Random 5 Science Documents ===")
@@ -637,13 +609,12 @@ result = collection.search_by_scalar(
     field="priority",
     order="desc",
     limit=5,
-    output_fields=["text", "priority"]
+    output_fields=["text", "priority"],
 )
 
 print("\n=== Top 5 by Priority (Descending) ===")
 for item in result.data:
-    print(f"ID: {item.id}, Priority: {item.fields['priority']}, "
-          f"Score: {item.score}")
+    print(f"ID: {item.id}, Priority: {item.fields['priority']}, Score: {item.score}")
 
 # 按优先级升序排列，带过滤
 result = collection.search_by_scalar(
@@ -652,13 +623,12 @@ result = collection.search_by_scalar(
     order="asc",
     limit=5,
     filters={"op": "range", "field": "priority", "gte": 5},
-    output_fields=["text", "priority"]
+    output_fields=["text", "priority"],
 )
 
 print("\n=== Top 5 by Priority (Ascending, priority >= 5) ===")
 for item in result.data:
-    print(f"ID: {item.id}, Priority: {item.fields['priority']}, "
-          f"Score: {item.score}")
+    print(f"ID: {item.id}, Priority: {item.fields['priority']}, Score: {item.score}")
 ```
 
 ### 6. 数据聚合分析
@@ -667,10 +637,7 @@ for item in result.data:
 
 ```python
 # 获取索引中的总文档数
-agg_result = collection.aggregate_data(
-    index_name="test_index",
-    op="count"
-)
+agg_result = collection.aggregate_data(index_name="test_index", op="count")
 
 print(f"\n=== Total Document Count ===")
 print(f"Total: {agg_result.total_count}")
@@ -680,11 +647,7 @@ print(f"Total: {agg_result.total_count}")
 
 ```python
 # 按类别分组统计
-agg_result = collection.aggregate_data(
-    index_name="test_index",
-    op="count",
-    field="category"
-)
+agg_result = collection.aggregate_data(index_name="test_index", op="count", field="category")
 
 print("\n=== Count by Category ===")
 for group in agg_result.groups:
@@ -699,7 +662,7 @@ agg_result = collection.aggregate_data(
     index_name="test_index",
     op="count",
     field="category",
-    filters={"op": "range", "field": "priority", "gte": 10}
+    filters={"op": "range", "field": "priority", "gte": 10},
 )
 
 print("\n=== Count by Category (priority >= 10) ===")
@@ -712,10 +675,7 @@ for group in agg_result.groups:
 ```python
 # 统计每个类别的文档数，只返回数量 >= 5 的类别
 agg_result = collection.aggregate_data(
-    index_name="test_index",
-    op="count",
-    field="category",
-    cond={"gt": 5}
+    index_name="test_index", op="count", field="category", cond={"gt": 5}
 )
 
 print("\n=== Categories with Count > 5 ===")
@@ -734,7 +694,7 @@ auto_id_meta = {
     "Fields": [
         {"FieldName": "content", "FieldType": "text"},
         {"FieldName": "embedding", "FieldType": "vector", "Dim": 64},
-    ]
+    ],
 }
 
 auto_collection = get_or_create_local_collection(meta_data=auto_id_meta)
@@ -743,7 +703,7 @@ auto_collection = get_or_create_local_collection(meta_data=auto_id_meta)
 data = [
     {"content": "Document A", "embedding": [random.random() for _ in range(64)]},
     {"content": "Document B", "embedding": [random.random() for _ in range(64)]},
-    {"content": "Document C", "embedding": [random.random() for _ in range(64)]}
+    {"content": "Document C", "embedding": [random.random() for _ in range(64)]},
 ]
 
 result = auto_collection.upsert_data(data)
@@ -773,7 +733,7 @@ normalized_meta = {
     ],
     "VectorIndex": {
         "NormalizeVector": True  # 启用向量归一化
-    }
+    },
 }
 
 norm_collection = get_or_create_local_collection(meta_data=normalized_meta)
@@ -783,18 +743,14 @@ raw_vector = [i * 0.1 for i in range(128)]
 norm_collection.upsert_data([{"id": 1, "vector": raw_vector}])
 
 # 创建索引
-norm_collection.create_index("norm_index", {
-    "IndexName": "norm_index",
-    "VectorIndex": {"IndexType": "flat", "Distance": "ip"}
-})
+norm_collection.create_index(
+    "norm_index",
+    {"IndexName": "norm_index", "VectorIndex": {"IndexType": "flat", "Distance": "ip"}},
+)
 
 # 搜索时向量也会自动归一化
 query = [i * 0.05 for i in range(128)]
-result = norm_collection.search_by_vector(
-    index_name="norm_index",
-    dense_vector=query,
-    limit=1
-)
+result = norm_collection.search_by_vector(index_name="norm_index", dense_vector=query, limit=1)
 
 print("Vector normalization enabled")
 print(f"Search result score: {result.data[0].score:.4f}")
@@ -842,18 +798,14 @@ filters = {"op": "range", "field": "discount", "lt": 0.5}
 
 ```python
 # 大于等于（ISO 时间字符串）
-filters = {
-    "op": "time_range",
-    "field": "created_at",
-    "gte": "2026-02-01T00:00:00"
-}
+filters = {"op": "time_range", "field": "created_at", "gte": "2026-02-01T00:00:00"}
 
 # 时间范围（闭区间）
 filters = {
     "op": "time_range",
     "field": "created_at",
     "gte": "2026-02-01T00:00:00",
-    "lte": "2026-02-07T23:59:59"
+    "lte": "2026-02-07T23:59:59",
 }
 ```
 
@@ -870,7 +822,7 @@ filters = {
     "op": "geo_range",
     "field": "f_geo_point",
     "center": "116.412138,39.914912",
-    "radius": "10km"
+    "radius": "10km",
 }
 ```
 
@@ -881,25 +833,16 @@ filters = {
 result = collection.search_by_vector(
     index_name="test_index",
     dense_vector=query_vector,
-    filters={
-        "op": "must",
-        "field": "category",
-        "conds": ["tech", "science"]
-    },
-    limit=10
+    filters={"op": "must", "field": "category", "conds": ["tech", "science"]},
+    limit=10,
 )
 
 # 示例2: 查找特定分数范围的文档
 result = collection.search_by_vector(
     index_name="test_index",
     dense_vector=query_vector,
-    filters={
-        "op": "range",
-        "field": "score",
-        "gte": 0.7,
-        "lte": 0.95
-    },
-    limit=10
+    filters={"op": "range", "field": "score", "gte": 0.7, "lte": 0.95},
+    limit=10,
 )
 ```
 

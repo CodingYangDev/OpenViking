@@ -45,9 +45,10 @@ class EmbeddingMsgConverter:
 
         # Account identity is required at the queue boundary. Do not silently
         # route a malformed or legacy message to the default Account.
-        if not isinstance(context_data.get("account_id"), str) or not context_data[
-            "account_id"
-        ].strip():
+        if (
+            not isinstance(context_data.get("account_id"), str)
+            or not context_data["account_id"].strip()
+        ):
             raise ValueError("Embedding context requires account_id")
         uri = context_data.get("uri", "")
         owner_fields = None

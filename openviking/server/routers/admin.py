@@ -148,9 +148,7 @@ def _authorize_account_config_patch(
     restricted = _ROOT_ONLY_ACCOUNT_CONFIG_SECTIONS.intersection(settings)
     if restricted and ctx.role != Role.ROOT:
         fields = ", ".join(sorted(restricted))
-        raise PermissionDeniedError(
-            f"Only ROOT can modify account configuration fields: {fields}"
-        )
+        raise PermissionDeniedError(f"Only ROOT can modify account configuration fields: {fields}")
 
 
 def _visible_account_config(
@@ -284,9 +282,7 @@ async def _account_settings_result(
     """
     enabled = await get_service().sessions.get_agent_evolution_enabled(account_id)
     legacy_overrides = {
-        key: overrides[key]
-        for key in ("agent_evolution", "acl")
-        if key in overrides
+        key: overrides[key] for key in ("agent_evolution", "acl") if key in overrides
     }
     return {
         "account_id": account_id,
@@ -402,9 +398,7 @@ async def _rollback_account_creation(
         )
 
 
-async def _check_user_exists(
-    request: Request, account_id: str, user_id: str, manager=None
-) -> None:
+async def _check_user_exists(request: Request, account_id: str, user_id: str, manager=None) -> None:
     manager = manager or _get_api_key_manager(request)
     if not manager.has_user(account_id, user_id):
         raise NotFoundError(user_id, "user")
@@ -664,9 +658,7 @@ async def get_account_configuration(
     """Return this account layer's explicit runtime configuration."""
     _check_account_access(ctx, account_id)
     await _check_account_exists(request, account_id)
-    settings = await _get_runtime_config_manager().get_settings(
-        ConfigScope.account(account_id)
-    )
+    settings = await _get_runtime_config_manager().get_settings(ConfigScope.account(account_id))
     return Response(
         status="ok",
         result={
@@ -799,9 +791,7 @@ async def patch_account_configuration(
         await _get_runtime_config_manager().patch_account(account_id, body.settings)
     except (ConfigPatchError, ValueError) as exc:
         raise InvalidArgumentError(str(exc)) from exc
-    settings = await _get_runtime_config_manager().get_settings(
-        ConfigScope.account(account_id)
-    )
+    settings = await _get_runtime_config_manager().get_settings(ConfigScope.account(account_id))
     return Response(
         status="ok",
         result={

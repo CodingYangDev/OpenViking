@@ -55,6 +55,7 @@ class MemoryTelemetryMeter:
 class TelemetryRuntime:
     meter_instance: MemoryTelemetryMeter = field(default_factory=MemoryTelemetryMeter)
 
+
 _RUNTIME = TelemetryRuntime()
 
 

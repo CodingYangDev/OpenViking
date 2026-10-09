@@ -139,18 +139,13 @@ response = requests.post(
         "CollectionName": "test_collection",
         "ProjectName": "default",
         "Description": "Test collection",
-        "Fields": json.dumps([
-            {
-                "FieldName": "id",
-                "FieldType": "int64",
-                "IsPrimaryKey": True
-            },
-            {
-                "FieldName": "text",
-                "FieldType": "string"
-            }
-        ])
-    }
+        "Fields": json.dumps(
+            [
+                {"FieldName": "id", "FieldType": "int64", "IsPrimaryKey": True},
+                {"FieldName": "text", "FieldType": "string"},
+            ]
+        ),
+    },
 )
 print(response.json())
 ```

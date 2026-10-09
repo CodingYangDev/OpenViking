@@ -18,12 +18,16 @@ from openviking.session.train.components.dataset_service import (
     jsonable,
 )
 from openviking.session.train.components.reporter import NoopPipelineLifecycleHook
+from openviking.session.train.components.session_commit import build_commit_messages
 from openviking.session.train.domain import (
     PipelineEpochResult,
     PipelineEvaluationResult,
     Rollout,
     RolloutAnalysis,
 )
+from openviking_cli.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -187,7 +191,12 @@ class RolloutArtifactRecorder(NoopPipelineLifecycleHook):
             await self._write_train_commit_artifacts(group_records)
 
     def record_train_commit_result(self, event: str, **fields: Any) -> None:
-        if event not in {"train_commit_submitted", "train_commit_done", "train_commit_failed"}:
+        if event not in {
+            "train_commit_submitted",
+            "train_commit_done",
+            "train_commit_failed",
+            "train_commit_skipped",
+        }:
             return
         train_dir = self._train_rollout_dir_from_event_fields(fields)
         commit_dir = self._commit_rollout_dir_from_event_fields(fields)
@@ -241,9 +250,7 @@ class RolloutArtifactRecorder(NoopPipelineLifecycleHook):
         for the full pipeline to finish, which is important for long runs and
         crash recovery.
         """
-        commit_results = list(
-            epoch_result.apply_result.metadata.get("commit_results", []) or []
-        )
+        commit_results = list(epoch_result.apply_result.metadata.get("commit_results", []) or [])
         await self.record_train_epoch(
             epoch=epoch_result.epoch,
             analyses=epoch_result.analyses,
@@ -260,9 +267,7 @@ class RolloutArtifactRecorder(NoopPipelineLifecycleHook):
         context: Any,
     ) -> None:
         """Lifecycle hook: write eval rollout artifacts immediately after each eval pass."""
-        label = str(
-            evaluation_result.metadata.get("rollout_stage") or "test_rollout"
-        )
+        label = str(evaluation_result.metadata.get("rollout_stage") or "test_rollout")
         self.record_eval(
             label=label,
             epoch=evaluation_result.epoch,
@@ -280,7 +285,9 @@ class RolloutArtifactRecorder(NoopPipelineLifecycleHook):
             run_dir=str(self.run_dir),
             rollouts_root=str(self.rollouts_root),
             case_groups=case_groups,
-            latest_failed_rollout=str(self._latest_failed_rollout) if self._latest_failed_rollout else None,
+            latest_failed_rollout=str(self._latest_failed_rollout)
+            if self._latest_failed_rollout
+            else None,
         )
         self.run_dir.mkdir(parents=True, exist_ok=True)
         index_path = self.run_dir / "rollouts_index.json"
@@ -339,9 +346,19 @@ class RolloutArtifactRecorder(NoopPipelineLifecycleHook):
         rollout = record.rollout
         _write_json(rollout_dir / "status.json", _status_payload(record))
         _write_json(rollout_dir / "rollout.json", _rollout_payload(record))
-        _write_json(rollout_dir / "messages.json", [message.to_dict() for message in rollout.messages])
+        _write_json(
+            rollout_dir / "messages.json", [message.to_dict() for message in rollout.messages]
+        )
         _write_json(rollout_dir / "tool_calls.json", _tool_calls(rollout))
         _write_json(rollout_dir / "evaluation.json", evaluation_to_dict(record.evaluation))
+        initial_request = rollout.metadata.get("initial_llm_request")
+        request_path = rollout_dir / "initial_llm_request.json"
+        if initial_request is not None and not request_path.exists():
+            try:
+                _write_json(request_path, initial_request)
+            except OSError as exc:
+                # Optional diagnostics must not abort training; never log request content.
+                logger.warning("Initial LLM request artifact write failed (%s)", type(exc).__name__)
         (rollout_dir / "memory_context.md").write_text(_memory_context(rollout), encoding="utf-8")
         task_case_skill = _task_case_experience_skill(rollout)
         if task_case_skill:
@@ -351,7 +368,7 @@ class RolloutArtifactRecorder(NoopPipelineLifecycleHook):
             )
         (rollout_dir / "prompt_for_llm.md").write_text(_prompt_for_llm(record), encoding="utf-8")
         # Full commit messages (as sent to session.commit)
-        commit_msgs = _build_commit_messages(rollout)
+        commit_msgs = build_commit_messages(rollout)
         _write_json(rollout_dir / "commit_messages.json", commit_msgs)
         (rollout_dir / "commit_messages.md").write_text(
             _format_commit_messages_markdown(commit_msgs), encoding="utf-8"
@@ -498,14 +515,16 @@ class RolloutArtifactRecorder(NoopPipelineLifecycleHook):
         if split is None or task_no is None or task_id is None or epoch is None or index is None:
             return None
         group_id = (
-            f"{_safe_fragment(split)}_task_"
-            f"{_safe_fragment(str(task_no))}_"
-            f"{_safe_fragment(task_id)}"
+            f"{_safe_fragment(split)}_task_{_safe_fragment(str(task_no))}_{_safe_fragment(task_id)}"
         )[:120]
         return self.rollouts_root / group_id / f"epoch_{epoch}" / phase / f"trial_{index}"
 
     def _write_group_readme(self, group_dir: Path, group_entry: dict[str, Any]) -> None:
-        failed = [item for item in group_entry["rollouts"] if not item.get("passed") or item.get("commit_error")]
+        failed = [
+            item
+            for item in group_entry["rollouts"]
+            if not item.get("passed") or item.get("commit_error")
+        ]
         lines = [
             f"# Rollout artifact group: {group_entry['case_group_id']}",
             "",
@@ -591,6 +610,8 @@ def _commit_result_from_event(event: str, fields: dict[str, Any]) -> dict[str, A
         "task_status": fields.get("task_status"),
         "score": fields.get("score"),
         "error": fields.get("error"),
+        "skip_reason": fields.get("skip_reason"),
+        "execution_error": fields.get("execution_error"),
         "event": event,
         "artifact_state": _artifact_state_from_commit_event(event),
     }
@@ -603,6 +624,8 @@ def _artifact_state_from_commit_event(event: str) -> str:
         return "commit_done"
     if event == "train_commit_failed":
         return "commit_failed"
+    if event == "train_commit_skipped":
+        return "commit_skipped"
     return "rollout_done"
 
 
@@ -611,6 +634,8 @@ def _artifact_state_from_commit_result(commit_result: dict[str, Any] | None) -> 
         return "rollout_done"
     if commit_result.get("error"):
         return "commit_failed"
+    if commit_result.get("task_status") == "skipped":
+        return "commit_skipped"
     return "commit_done"
 
 
@@ -657,7 +682,9 @@ def _rollout_payload(record: _RolloutRecord) -> dict[str, Any]:
     return {
         "case": case_to_dict(rollout.case),
         "policy_snapshot_id": rollout.policy_snapshot_id,
-        "metadata": jsonable(rollout.metadata),
+        "metadata": jsonable(
+            {key: value for key, value in rollout.metadata.items() if key != "initial_llm_request"}
+        ),
         "evaluation": evaluation_to_dict(record.evaluation),
     }
 
@@ -702,26 +729,30 @@ def _tool_calls(rollout: Rollout) -> list[dict[str, Any]]:
 
 def _prompt_for_llm(record: _RolloutRecord) -> str:
     status = _status_payload(record)
-    return "\n".join(
-        [
-            "# Analyze this rollout",
-            "",
-            "Read all files in this directory, especially:",
-            "- memory_context.md: memory injected into the agent prompt at rollout time",
-            "- messages.json and tool_calls.json: trajectory",
-            "- evaluation.json: failure signal",
-            "- memory_diff.json: training memory update result when present",
-            "",
-            "## Status",
-            "",
-            "```json",
-            json.dumps(jsonable(status), ensure_ascii=False, indent=2),
-            "```",
-            "",
-            "Please identify whether the failure is caused by missing memory, "
-            "wrong memory, ignored memory, bad tool use, or task ambiguity.",
-        ]
-    ) + "\n"
+    return (
+        "\n".join(
+            [
+                "# Analyze this rollout",
+                "",
+                "Read all files in this directory, especially:",
+                "- memory_context.md: memory injected into the agent prompt at rollout time",
+                "- initial_llm_request.json (when present): first Agent-to-provider messages and tools, credential-redacted",
+                "- messages.json and tool_calls.json: trajectory",
+                "- evaluation.json: failure signal",
+                "- memory_diff.json: training memory update result when present",
+                "",
+                "## Status",
+                "",
+                "```json",
+                json.dumps(jsonable(status), ensure_ascii=False, indent=2),
+                "```",
+                "",
+                "Please identify whether the failure is caused by missing memory, "
+                "wrong memory, ignored memory, bad tool use, or task ambiguity.",
+            ]
+        )
+        + "\n"
+    )
 
 
 def _memory_context(rollout: Rollout) -> str:
@@ -742,9 +773,7 @@ def _task_case_experience_skill(rollout: Rollout) -> str:
 
 def _case_group_id(rollout: Rollout) -> str:
     split = _safe_fragment(_split(rollout) or "split")
-    task_no = _safe_fragment(
-        str(_task_no(rollout) if _task_no(rollout) is not None else "x")
-    )
+    task_no = _safe_fragment(str(_task_no(rollout) if _task_no(rollout) is not None else "x"))
     task_id = _safe_fragment(
         str(_task_id(rollout) or _original_case_name(rollout) or rollout.case.name)
     )
@@ -830,25 +859,6 @@ def _safe_fragment(value: Any) -> str:
     return text or "unknown"
 
 
-def _build_commit_messages(rollout: Rollout) -> list[dict[str, Any]]:
-    """Build the full message list as sent to session.commit.
-
-    Matches the message assembly in session_commit._commit_one:
-      [case_spec] + rollout.messages + [evaluation]
-    """
-    from openviking.session.train.components.session_commit import (
-        _case_spec_message_to_request,
-        _evaluation_message_to_request,
-        _message_to_request,
-    )
-
-    messages: list[dict[str, Any]] = [_case_spec_message_to_request(rollout)]
-    for msg in rollout.messages:
-        messages.append(_message_to_request(msg))
-    messages.append(_evaluation_message_to_request(rollout))
-    return messages
-
-
 def _format_commit_messages_markdown(messages: list[dict[str, Any]]) -> str:
     """Format commit messages as a readable Markdown document."""
     lines: list[str] = ["# Commit Messages", ""]
@@ -929,7 +939,9 @@ def _format_memory_diff_markdown(memory_diff: dict[str, Any]) -> str:
     operations = operations if isinstance(operations, dict) else {}
     for item in operations.get("adds", []) or []:
         if isinstance(item, dict):
-            lines.extend(_memory_diff_file_section("add", item.get("uri"), "", item.get("after", "")))
+            lines.extend(
+                _memory_diff_file_section("add", item.get("uri"), "", item.get("after", ""))
+            )
     for item in operations.get("updates", []) or []:
         if isinstance(item, dict):
             lines.extend(

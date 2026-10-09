@@ -70,6 +70,7 @@ class PatchMergePolicyOptimizer:
         if not patch_gradients:
             return PolicyUpdatePlan(
                 items=[],
+                read_policy_uris=[],
                 metadata={
                     "optimizer": "patch_merge",
                     "memory_type": self.memory_type,
@@ -91,7 +92,7 @@ class PatchMergePolicyOptimizer:
                 gradients=group, policy_set=policy_set, context=context
             )
             if self.memory_type == "experiences":
-                group_items = _case_experience_plan_items(operations, group, policy_set)
+                group_items = case_experience_plan_items(operations, group, policy_set)
             else:
                 group_items = _operations_to_plan_items(
                     operations=operations,
@@ -106,6 +107,7 @@ class PatchMergePolicyOptimizer:
 
         return PolicyUpdatePlan(
             items=items,
+            read_policy_uris=sorted(groups) if self.memory_type == "experiences" else None,
             metadata={
                 "optimizer": "patch_merge",
                 "memory_type": self.memory_type,
@@ -199,7 +201,7 @@ class PatchMergePolicyOptimizer:
         return operations
 
 
-def _case_experience_plan_items(
+def case_experience_plan_items(
     operations: Any, gradients: list[SemanticGradient], policy_set: PolicySet
 ) -> list[PolicyPlanItem]:
     if any(
@@ -238,7 +240,7 @@ def _case_experience_plan_items(
     links: dict[str, StoredLink] = {}
     source_sessions: dict[str, dict[str, Any]] = (
         {
-            str(source["source_session_uri"]): dict(source)
+            str(source["source_session_uri"]): _compact_source_session(source)
             for source in (current.metadata.get("source_sessions") or [])
             if isinstance(source, dict) and source.get("source_session_uri")
         }
@@ -252,9 +254,9 @@ def _case_experience_plan_items(
         for source in gradient.metadata.get("proposal_source_sessions") or []:
             source_uri = str(source.get("source_session_uri") or "")
             if source_uri:
-                source_sessions[source_uri] = dict(source)
+                source_sessions[source_uri] = _compact_source_session(source)
     if not links:
-        raise ValueError("Case Experience merge has no source Session provenance")
+        raise ValueError("Case Experience merge has no source Trajectory provenance")
     return [
         PolicyPlanItem(
             kind="upsert",
@@ -274,6 +276,11 @@ def _case_experience_plan_items(
             },
         )
     ]
+
+
+def _compact_source_session(source: dict[str, Any]) -> dict[str, Any]:
+    keys = {"source_session_uri", "case_name", "case_uri", "passed", "score"}
+    return {key: value for key, value in source.items() if key in keys}
 
 
 def _constant_prefetch(messages: list[dict[str, Any]]):

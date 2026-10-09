@@ -3,18 +3,21 @@
 """Shared model-facing policy for safe memory reorganization."""
 
 MEMORY_MERGE_POLICY = """
+## Memory Write Decision
+- Per target, write only for schema-admissible additions, corrections,
+  explicit revocations, or schema-required cleanup; otherwise no-op.
+  Mentions or action requests alone do not justify writes.
+
 ## Memory Reorganization Safety
-- Search similarity, a shared category, or an overlapping topic only identifies candidates for
-  review. It is never sufficient evidence that two memories have the same identity.
-- Merge memories only when they have the same identity under the active memory schema. For
-  real-world entities or events, require the same object or occurrence, or an explicit alias. For
-  preferences, both the owner and the behavioral choice dimension must match.
-- Keep distinct people, pets, works, artworks, products, possessions, places, events, and
-  preferences separate even when they share attributes, participants, categories, or themes.
-- Before deleting or replacing a source memory, account for every substantive atomic fact in it.
-  Preserve each non-duplicate fact exactly once in a surviving destination. If identity is uncertain
-  or any fact lacks one clear destination, keep the source separate.
-- When a memory is too large or mixes multiple identities or choice dimensions, split it. Compact
-  only duplicate wording; never satisfy a size target by dropping, weakening, or generalizing a
-  concrete fact. Suggested length limits are readability targets, not permission to lose facts.
+- Merge only the same schema-defined identity: the same entity/event,
+  or the same owner and behavioral choice dimension.
+  Similarity or shared topics are insufficient.
+- Before deleting or replacing, preserve each still-valid distinct fact
+  exactly once in a surviving schema-valid destination.
+  If identity, validity, or destination is uncertain, keep the source.
+- Split only into distinct schema-valid identities; never invent identities
+  to meet length targets. Keep one identity in one object,
+  using sections when needed.
+- Compact duplicate wording only; never drop, weaken, or generalize
+  valid facts to shorten content.
 """.strip()

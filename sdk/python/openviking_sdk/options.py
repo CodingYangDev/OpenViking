@@ -30,7 +30,9 @@ class FindOptions(_ExtraOptions, total=False):
 
 
 class SearchOptions(FindOptions, total=False):
-    pass
+    mode: Literal["list", "context", "advice"]
+    state: List[Dict[str, Any]]
+    experience_names: List[str]
 
 
 class SearchContextOptions(_ExtraOptions, total=False):
@@ -117,12 +119,14 @@ class CreateSessionOptions(_ExtraOptions, total=False):
     memory_policy: Dict[str, Any]
     auto_commit_policy: Optional[Dict[str, Any]]
     memory_extraction_config: Dict[str, Any]
+    extraction_context: Optional[str]
     telemetry: Any
 
 
 class UpdateSessionConfigOptions(_ExtraOptions, total=False):
     auto_commit_policy: Optional[Dict[str, Any]]
     memory_extraction_config: Dict[str, Any]
+    extraction_context: Optional[str]
     telemetry: Any
 
 

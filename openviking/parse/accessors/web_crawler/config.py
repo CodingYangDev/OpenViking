@@ -26,7 +26,9 @@ class CrawlConfig:
 
     def __post_init__(self) -> None:
         if self.depth < -1:
-            raise ValueError("depth must be >= -1 (use -1 for unlimited) for recursive web crawling.")
+            raise ValueError(
+                "depth must be >= -1 (use -1 for unlimited) for recursive web crawling."
+            )
         if self.max_pages < 1 and self.max_pages != -1:
             raise ValueError("max_pages must be -1 (unlimited) or >= 1 for recursive web crawling.")
         if self.concurrency < 1:

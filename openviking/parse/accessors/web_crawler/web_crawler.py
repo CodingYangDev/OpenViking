@@ -67,8 +67,7 @@ def _build_settings(config: CrawlConfig):
             "TELNETCONSOLE_ENABLED": False,
             "USER_AGENT": "OpenViking/0.4 (+recursive-web-crawler)",
             "DOWNLOADER_MIDDLEWARES": {
-                "openviking.parse.accessors.web_crawler.middlewares."
-                "RequestValidatorMiddleware": 50,
+                "openviking.parse.accessors.web_crawler.middlewares.RequestValidatorMiddleware": 50,
             },
         }
     )

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
     from openviking.storage.viking_fs import VikingFS
@@ -127,6 +127,10 @@ class ToolContext:
     transaction_handle: Optional[Any] = None
     read_file_contents: Optional[Any] = None  # 用于记录已读取的文件内容
     page_id_map: Optional[Any] = None  # PageIdMap for annotating read results
+    memory_uri_resolver: Optional[Callable[[str, Dict[str, Any]], str]] = None
+    memory_eval_functions: Optional[Dict[str, Any]] = None
+    memory_eval_bindings: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    allowed_memory_read_uris: Optional[set[str]] = None
 
     @property
     def user(self):

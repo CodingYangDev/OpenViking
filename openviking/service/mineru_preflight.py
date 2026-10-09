@@ -13,8 +13,8 @@ import time
 
 import httpx
 
-HEALTH_TIMEOUT = 5.0          # Total polling timeout in seconds.
-HEALTH_POLL_INTERVAL = 0.2    # Delay between polls in seconds.
+HEALTH_TIMEOUT = 5.0  # Total polling timeout in seconds.
+HEALTH_POLL_INTERVAL = 0.2  # Delay between polls in seconds.
 HEALTH_REQUEST_TIMEOUT = 0.5  # Per-request timeout in seconds.
 
 

@@ -501,7 +501,9 @@ class ResourceService:
                     self._runtime_config_manager,
                     ctx.account_id,
                 )
-                app_credentials = self._load_feishu_credentials_for_watch(app_id, app_secret, feishu_config)
+                app_credentials = self._load_feishu_credentials_for_watch(
+                    app_id, app_secret, feishu_config
+                )
                 watch_auth_state = create_feishu_auth_state(
                     token,
                     refresh_token.strip(),

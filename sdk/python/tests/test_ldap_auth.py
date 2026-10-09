@@ -1,14 +1,13 @@
-import pytest
 import base64
 import json
-import os
 from pathlib import Path
 
+import pytest
 from openviking_sdk import AsyncHTTPClient
 from openviking_sdk.config import (
-    resolve_client_config,
     get_basic_auth_header,
     load_ovcli_config,
+    resolve_client_config,
 )
 
 
@@ -54,6 +53,7 @@ class TestClientConfigLDAP:
         """测试环境变量 LDAP 配置"""
         # Isolate from the real user config
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         monkeypatch.delenv("OPENVIKING_CLI_CONFIG_FILE", raising=False)
@@ -74,6 +74,7 @@ class TestClientConfigLDAP:
     def test_explicit_overrides_env(self, monkeypatch):
         """测试显式参数覆盖环境变量"""
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         monkeypatch.delenv("OPENVIKING_CLI_CONFIG_FILE", raising=False)
@@ -104,6 +105,7 @@ class TestClientConfigLDAP:
         # Need to make sure no user config is loaded
         # Patch the default config path to not exist
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         try:
@@ -120,8 +122,9 @@ class TestClientConfigLDAP:
         monkeypatch.delenv("OPENVIKING_USERNAME", raising=False)
         monkeypatch.delenv("OPENVIKING_PASSWORD", raising=False)
         monkeypatch.delenv("OPENVIKING_CLI_CONFIG_FILE", raising=False)
-        
+
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         try:
@@ -208,6 +211,7 @@ class TestAsyncHTTPClientLDAP:
         """测试客户端存储 LDAP 属性"""
         monkeypatch.delenv("OPENVIKING_CLI_CONFIG_FILE", raising=False)
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         try:
@@ -227,6 +231,7 @@ class TestAsyncHTTPClientLDAP:
         """测试默认不使用 LDAP"""
         monkeypatch.delenv("OPENVIKING_CLI_CONFIG_FILE", raising=False)
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         try:
@@ -245,6 +250,7 @@ class TestAsyncHTTPClientLDAP:
         """测试初始化时添加 LDAP header"""
         monkeypatch.delenv("OPENVIKING_CLI_CONFIG_FILE", raising=False)
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         try:
@@ -274,6 +280,7 @@ class TestAsyncHTTPClientLDAP:
         """测试 API Key 模式不添加 Authorization header"""
         monkeypatch.delenv("OPENVIKING_CLI_CONFIG_FILE", raising=False)
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         try:
@@ -299,6 +306,7 @@ class TestAsyncHTTPClientLDAP:
         """测试 LDAP 模式但缺少密码时不添加 header"""
         monkeypatch.delenv("OPENVIKING_CLI_CONFIG_FILE", raising=False)
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         try:
@@ -324,6 +332,7 @@ class TestAsyncHTTPClientLDAP:
         """测试 LDAP header 与其他自定义 header 共存"""
         monkeypatch.delenv("OPENVIKING_CLI_CONFIG_FILE", raising=False)
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         try:
@@ -362,8 +371,9 @@ class TestLDAPEdgeCases:
         monkeypatch.setenv("OPENVIKING_AUTH_MODE", "LDAP")
         monkeypatch.setenv("OPENVIKING_USERNAME", "alice")
         monkeypatch.setenv("OPENVIKING_PASSWORD", "secret")
-        
+
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         try:
@@ -377,6 +387,7 @@ class TestLDAPEdgeCases:
         """测试同时配置 API Key 和 LDAP"""
         monkeypatch.delenv("OPENVIKING_CLI_CONFIG_FILE", raising=False)
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         try:
@@ -399,6 +410,7 @@ class TestLDAPEdgeCases:
         """测试同时配置时 LDAP 添加 Authorization header"""
         monkeypatch.delenv("OPENVIKING_CLI_CONFIG_FILE", raising=False)
         import openviking_sdk.config as config_module
+
         original_default = config_module.DEFAULT_OVCLI_CONF
         config_module.DEFAULT_OVCLI_CONF = Path("/nonexistent/path/ovcli.conf")
         try:

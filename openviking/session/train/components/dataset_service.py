@@ -15,7 +15,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -50,23 +50,33 @@ SENSITIVE_FIELD_NAMES = frozenset(
         "x-api-key",
         "token",
         "secret",
+        "access_token",
+        "refresh_token",
+        "password",
+        "cookie",
+        "set-cookie",
     }
 )
 _SENSITIVE_TEXT_RE = re.compile(
-    r"(?i)(openviking_api_key|root_api_key|api_key|x-api-key|authorization|token|secret)"
-    r"(\s*[:=]\s*)"
-    r"(['\"]?)([^'\"\s,}]+)(\3)"
+    r"(?i)(openviking_api_key|root_api_key|api[_-]?key|x-api-key|authorization|"
+    r"access_token|refresh_token|password|token|secret|(?:set-)?cookie)"
+    r"([\"']?\s*[:=]\s*)"
+    r"(\"[^\"\r\n]*\"|'[^'\r\n]*'|(?:(?:Bearer|Basic)\s+)?[^'\"\s,;}]+)"
+)
+_CREDENTIAL_TOKEN_RE = re.compile(
+    r"(?i)\b(Bearer\s+)[a-zA-Z0-9._~+/=-]+|"
+    r"\b(?:sk-|cr_|ghp_|ntn_|xox[baprs]-)[a-zA-Z0-9._-]+"
 )
 
 
 def _redact_sensitive_text(text: str) -> str:
     def _replace(match: re.Match[str]) -> str:
-        return (
-            f"{match.group(1)}{match.group(2)}"
-            f"{match.group(3)}<redacted>{match.group(5)}"
-        )
+        value = match.group(3)
+        quote = value[0] if value.startswith(("'", '"')) else ""
+        return f"{match.group(1)}{match.group(2)}{quote}<redacted>{quote}"
 
-    return _SENSITIVE_TEXT_RE.sub(_replace, text)
+    text = _SENSITIVE_TEXT_RE.sub(_replace, text)
+    return _CREDENTIAL_TOKEN_RE.sub(lambda match: f"{match.group(1) or ''}<redacted>", text)
 
 
 def redact_sensitive(value: Any) -> Any:
@@ -99,10 +109,41 @@ class CasesQueryRequest(BaseModel):
 
 
 class RolloutExecuteRequest(BaseModel):
+    execution_timeout_seconds: float = Field(default=3600.0, gt=0, allow_inf_nan=False)
     case: dict[str, Any]
     policy_set: dict[str, Any]
     execution_context: dict[str, Any]
     options: dict[str, Any] = Field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _RolloutControl:
+    """Thread-safe cancellation targeting the actual execution loop and task."""
+
+    deadline: float
+    reason: str | None = None
+    _loop: asyncio.AbstractEventLoop | None = None
+    _task: asyncio.Task | None = None
+    _lock: Any = field(default_factory=threading.Lock)
+
+    def bind(self, loop: asyncio.AbstractEventLoop, task: asyncio.Task) -> None:
+        with self._lock:
+            if self.reason is not None:
+                raise asyncio.CancelledError
+            self._loop, self._task = loop, task
+
+    def unbind(self) -> None:
+        with self._lock:
+            self._loop = self._task = None
+
+    def cancel(self, reason: str) -> tuple[bool, bool]:
+        with self._lock:
+            first = self.reason is None
+            if first:
+                self.reason = reason
+                if self._task is not None:
+                    self._loop.call_soon_threadsafe(self._task.cancel)
+            return self._task is not None, first
 
 
 @dataclass(slots=True)
@@ -335,6 +376,8 @@ def create_dataset_service_app(
     app.state.make_case_loader = make_case_loader
     app.state.make_rollout_executor = make_rollout_executor
     app.state.rollout_executions = RolloutExecutionStore()
+    app.state.rollout_tasks = {}
+    app.state.rollout_controls = {}
     app.state.max_rollout_concurrency = max_rollout_concurrency
     app.state.rollout_semaphore = (
         asyncio.Semaphore(max_rollout_concurrency) if max_rollout_concurrency is not None else None
@@ -351,6 +394,10 @@ def create_dataset_service_app(
 
     @app.on_event("shutdown")
     async def shutdown_rollout_thread_pool() -> None:
+        for execution_id in list(app.state.rollout_controls):
+            _cancel_rollout_execution(app, execution_id, "shutdown")
+        if app.state.rollout_tasks:
+            await asyncio.gather(*list(app.state.rollout_tasks.values()), return_exceptions=True)
         pool = app.state.rollout_thread_pool
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
@@ -389,7 +436,12 @@ def create_dataset_service_app(
     async def execute_rollout(request: RolloutExecuteRequest) -> dict[str, Any]:
         case = case_from_dict(request.case)
         execution = await app.state.rollout_executions.create(case_name=case.name)
-        asyncio.create_task(_run_rollout_execution(app, execution.execution_id, request))
+        control = _RolloutControl(time.monotonic() + request.execution_timeout_seconds)
+        app.state.rollout_controls[execution.execution_id] = control
+        task = asyncio.create_task(
+            _run_rollout_execution(app, execution.execution_id, request, control)
+        )
+        app.state.rollout_tasks[execution.execution_id] = task
         return execution_to_dict(execution)
 
     @app.get("/v1/rollouts/executions/{execution_id}")
@@ -402,34 +454,65 @@ def create_dataset_service_app(
             )
         return execution_to_dict(execution)
 
+    @app.post("/v1/rollouts/executions/{execution_id}/cancel")
+    async def cancel_rollout_execution(execution_id: str) -> dict[str, Any]:
+        execution = await app.state.rollout_executions.get(execution_id)
+        if execution is None:
+            raise HTTPException(status_code=404, detail="Rollout execution not found")
+        if execution.status == "running":
+            _cancel_rollout_execution(app, execution_id, "client_cancelled")
+        return execution_to_dict(execution)
+
     return app
+
+
+def _cancel_rollout_execution(app: FastAPI, execution_id: str, reason: str) -> None:
+    control = app.state.rollout_controls.get(execution_id)
+    if control is not None:
+        bound, first = control.cancel(reason)
+        if first and not bound:
+            task = app.state.rollout_tasks[execution_id]
+            # Let a newly scheduled task enter its try/finally before cancelling it.
+            asyncio.get_running_loop().call_soon(task.cancel)
 
 
 async def _run_rollout_execution(
     app: FastAPI,
     execution_id: str,
     request: RolloutExecuteRequest,
+    control: _RolloutControl,
 ) -> None:
     case = case_from_dict(request.case)
+    timer = asyncio.get_running_loop().call_later(
+        max(0.0, control.deadline - time.monotonic()),
+        _cancel_rollout_execution,
+        app,
+        execution_id,
+        "deadline",
+    )
     try:
         semaphore = app.state.rollout_semaphore
         if semaphore is None:
-            rollout = await _execute_rollout_request_hosted(app, request, case)
+            rollout = await _execute_rollout_request_hosted(app, request, case, control)
         else:
             async with semaphore:
-                rollout = await _execute_rollout_request_hosted(app, request, case)
+                rollout = await _execute_rollout_request_hosted(app, request, case, control)
         await app.state.rollout_executions.mark_completed(execution_id, rollout)
-    except Exception as exc:
-        logger.exception(
-            "rollout execution failed execution_id=%s case=%s",
+    except (Exception, asyncio.CancelledError) as exc:
+        error = exc
+        if control.reason == "deadline":
+            error = TimeoutError(f"rollout exceeded {request.execution_timeout_seconds}s")
+        elif isinstance(exc, asyncio.CancelledError):
+            error = asyncio.CancelledError(control.reason or "cancelled")
+        error_text = str(redact_sensitive({"error": f"{type(error).__name__}: {error}"})["error"])
+        logger.error(
+            "rollout execution failed execution_id=%s case=%s error=%s",
             execution_id,
             case.name,
+            error_text,
         )
         try:
-            await app.state.rollout_executions.mark_failed(
-                execution_id,
-                str(redact_sensitive({"error": str(exc)})["error"]),
-            )
+            await app.state.rollout_executions.mark_failed(execution_id, error_text)
         except Exception:
             # Last-ditch: do not let failures in the failure-recording path
             # raise into the event loop (the task was already fire-and-forget).
@@ -437,52 +520,77 @@ async def _run_rollout_execution(
                 "rollout execution mark_failed itself failed execution_id=%s",
                 execution_id,
             )
+    finally:
+        timer.cancel()
+        app.state.rollout_tasks.pop(execution_id, None)
+        app.state.rollout_controls.pop(execution_id, None)
 
 
 async def _execute_rollout_request_hosted(
     app: FastAPI,
     request: RolloutExecuteRequest,
     case: Case,
+    control: _RolloutControl,
 ) -> Rollout:
-    """Execute one rollout either on the ASGI loop or in the service thread pool.
-
-    Some benchmark backends (notably full agent-loop implementations) include
-    blocking synchronous sections that can starve the uvicorn event loop when
-    many rollouts are hosted by the same process.  When a rollout thread pool is
-    configured, the whole rollout coroutine is driven by a fresh event loop in a
-    worker thread so request/polling endpoints remain responsive.
-    """
-
-    pool = getattr(app.state, "rollout_thread_pool", None)
+    pool = app.state.rollout_thread_pool
     if pool is None:
-        return await _execute_rollout_request(app, request, case)
+        return await _execute_rollout_request_scoped(app, request, case, control)
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        pool,
-        _execute_rollout_request_in_thread,
-        app,
-        request,
-        case,
+    future = loop.run_in_executor(
+        pool, _execute_rollout_request_in_thread, app, request, case, control
     )
+    try:
+        # Cancelling the asyncio wrapper alone cannot stop its worker thread.
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        bound, _ = control.cancel(control.reason or "cancelled")
+        if bound:
+            # Wait for the worker coroutine's finally blocks (including simulator
+            # cleanup), rather than reporting a stopped execution prematurely.
+            await asyncio.gather(future, return_exceptions=True)
+        else:
+            future.cancel()  # Remove a job which has not started in the pool.
+        raise
+
+
+async def _execute_rollout_request_scoped(
+    app: FastAPI,
+    request: RolloutExecuteRequest,
+    case: Case,
+    control: _RolloutControl,
+) -> Rollout:
+    loop = asyncio.get_running_loop()
+    remaining = control.deadline - time.monotonic()
+    if remaining <= 0:
+        control.cancel("deadline")
+        raise TimeoutError("Rollout deadline expired before execution")
+    control.bind(loop, asyncio.current_task())
+    timer = loop.call_later(remaining, control.cancel, "deadline")
+    try:
+        result = await _execute_rollout_request(app, request, case)
+        if time.monotonic() >= control.deadline:
+            raise TimeoutError("Rollout deadline expired")
+        return result
+    finally:
+        timer.cancel()
+        control.unbind()
 
 
 def _execute_rollout_request_in_thread(
     app: FastAPI,
     request: RolloutExecuteRequest,
     case: Case,
+    control: _RolloutControl,
 ) -> Rollout:
     loop = getattr(_rollout_worker_state, "loop", None)
     if loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
         _rollout_worker_state.loop = loop
         asyncio.set_event_loop(loop)
-    # Keep the worker-thread event loop alive across rollout executions.  Some
-    # provider stacks schedule async client cleanup tasks (e.g. httpx.aclose)
-    # late in the request lifecycle; using asyncio.run() here would close the
-    # loop immediately after each rollout and those cleanup tasks can then raise
-    # "RuntimeError: Event loop is closed".
     try:
-        result = loop.run_until_complete(_execute_rollout_request(app, request, case))
+        result = loop.run_until_complete(
+            _execute_rollout_request_scoped(app, request, case, control)
+        )
         loop.run_until_complete(asyncio.sleep(0))
         return result
     finally:

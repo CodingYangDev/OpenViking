@@ -15,6 +15,7 @@ from openviking.server.config import AgentEvolutionConfig, ServerConfig, UserCon
 from openviking.server.dependencies import set_service
 from openviking.server.identity import RequestContext, Role
 from openviking.service.core import OpenVikingService
+from openviking.service.search_service import SearchService
 from openviking.service.session_service import SessionService
 from openviking.session import Session
 from openviking_cli.session.user_id import UserIdentifier
@@ -174,6 +175,7 @@ def test_server_agent_evolution_seeds_runtime_cluster_baseline():
     sessions = SessionService()
     service = object.__new__(OpenVikingService)
     service._session_service = sessions
+    service._search_service = SearchService()
 
     service.set_agent_evolution_config(AgentEvolutionConfig(enabled=True))
 
@@ -182,8 +184,8 @@ def test_server_agent_evolution_seeds_runtime_cluster_baseline():
 
 
 async def test_account_enabled_override_keeps_cluster_dag_decider():
-    sessions = SessionService()
-    sessions.set_agent_evolution_config(
+    search = SearchService()
+    search.set_agent_evolution_config(
         AgentEvolutionConfig(
             enabled=True,
             dag_decider=DagDeciderConfig(provider="jev"),
@@ -194,9 +196,9 @@ async def test_account_enabled_override_keeps_cluster_dag_decider():
         enabled=True,
         dag_decider=None,
     )
-    sessions.set_runtime_config_manager(runtime_config)
+    search.set_runtime_config_manager(runtime_config)
 
-    resolved = await sessions.get_dag_decider_config("default")
+    resolved = await search.get_dag_decider_config("default")
 
     assert resolved.provider == "jev"
 
@@ -218,6 +220,7 @@ async def test_server_agent_evolution_updates_initialized_runtime_baseline():
     service._config = base
     service._runtime_config_manager = manager
     service._session_service = SessionService()
+    service._search_service = SearchService()
     service.set_agent_evolution_config(AgentEvolutionConfig(enabled=True))
     try:
         await service.apply_agent_evolution_config()

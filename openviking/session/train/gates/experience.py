@@ -10,14 +10,14 @@ from typing import Any
 
 from openviking.models.jev import JevClient, JevPayloadTooLarge, estimate_jev_input_tokens
 from openviking.service.experience_dag_decider import ExperienceDagDecider
-from openviking.session.memory.experience_dag import (
+from openviking.session.memory.experience.compiler import compile_dag
+from openviking.session.memory.experience.dag import (
     Dag,
     DagAction,
     DagEvidenceRef,
     DagInstance,
     clip_evidence_summary,
 )
-from openviking.session.memory.experience_dag_compiler import compile_dag
 from openviking.session.train.domain import PolicyPlanItem, PolicySet, PolicyUpdatePlan
 from openviking.session.train.interfaces import SemanticGradient
 from openviking.telemetry import tracer
@@ -484,10 +484,7 @@ class ExperienceImprovementGate:
                 results[request.key] = _DagReplayResult(error=str(exc), error_kind="compile")
 
         evidence = _parse_evidence(gate_context.get("evidence"))
-        context = json.dumps(
-            [item.model_dump(mode="json") for item in evidence],
-            ensure_ascii=False,
-        )
+        state = _replay_state(evidence, self.config.max_state_chars)
         seen: dict[str, set[str]] = {key: set() for key in instances}
         try:
             for _ in range(
@@ -509,8 +506,7 @@ class ExperienceImprovementGate:
 
                 values = await self.dag_decider.decide(
                     active,
-                    evidence=evidence,
-                    context=context,
+                    state=state,
                 )
                 changed = False
                 for instance in active:
@@ -961,12 +957,9 @@ def _bounded_success_evidence(value: Any) -> list[dict[str, str]]:
 
 
 def _stored_session_contexts(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stored_keys = {"source_session_uri", "case_name", "case_uri", "passed", "score"}
     return [
-        {
-            key: value
-            for key, value in context.items()
-            if key not in {"evidence", "experience_execution", "error"}
-        }
+        {key: value for key, value in context.items() if key in stored_keys}
         for context in contexts
         if context.get("source_session_uri")
     ]
@@ -1056,3 +1049,46 @@ def _clip(value: str, limit: int) -> str:
         return value
     half = max(1, (limit - 32) // 2)
     return value[:half] + "\n...[truncated]...\n" + value[-half:]
+
+
+def _replay_state(evidence: list[DagEvidenceRef], max_chars: int) -> dict[str, Any]:
+    relevant = [
+        item.model_dump(mode="json")
+        for item in evidence
+        if item.kind
+        in {
+            "user_message",
+            "assistant_message",
+            "assistant_message_delivered",
+            "tool_result",
+        }
+        and item.summary.strip()
+        and item.summary.strip() != "Reflect on the results and decide next steps."
+    ]
+    selected: list[dict[str, Any]] = []
+    used = 0
+    for item in reversed(relevant):
+        size = len(item["summary"])
+        if selected and used + size > max_chars:
+            break
+        if size > max_chars:
+            item = {
+                **item,
+                "summary": clip_evidence_summary(
+                    str(item.get("kind") or ""),
+                    item["summary"],
+                    max_chars,
+                ),
+            }
+            size = len(item["summary"])
+        selected.append(item)
+        used += size
+    selected.reverse()
+    state: dict[str, Any] = {
+        "evidence": selected,
+    }
+    if not selected:
+        state["context"] = json.dumps(
+            [item.model_dump(mode="json") for item in evidence], ensure_ascii=False
+        )[-max_chars:]
+    return state

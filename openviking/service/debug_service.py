@@ -3,6 +3,7 @@
 """
 Debug Service - provides system status query and health check.
 """
+
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -253,9 +254,7 @@ class ObserverService:
         vlm_instance = None
         embedding_instance = None
         scope = "Node aggregate"
-        if self._vlm_resolver is not None and hasattr(
-            self._vlm_resolver, "get_node_token_usage"
-        ):
+        if self._vlm_resolver is not None and hasattr(self._vlm_resolver, "get_node_token_usage"):
             vlm_instance = SimpleNamespace(
                 model="node-aggregate",
                 provider="aggregate",
@@ -411,9 +410,7 @@ class ObserverService:
                 ),
             )
 
-    async def account_system(
-        self, ctx: RequestContext, *, format: str = "table"
-    ) -> SystemStatus:
+    async def account_system(self, ctx: RequestContext, *, format: str = "table") -> SystemStatus:
         queue, vikingdb, models, lock, filesystem = await asyncio.gather(
             self.get_queue_status_async(format=format),
             self.account_vikingdb(ctx, format=format),
@@ -556,7 +553,9 @@ class ObserverService:
             logger.error(f"Error getting filesystem stats: {e}")
             return {}
 
-    def system(self, ctx: Optional[RequestContext] = None, *, format: str = "table") -> SystemStatus:
+    def system(
+        self, ctx: Optional[RequestContext] = None, *, format: str = "table"
+    ) -> SystemStatus:
         """Get system overall status."""
         if ctx is not None:
             return run_async(self.account_system(ctx, format=format))

@@ -4,12 +4,14 @@
 Tests for memory ExtractLoop orchestrator.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import BaseModel, Field
 
+from openviking.session.memory.core import ExtractContextProvider
 from openviking.session.memory.dataclass import (
     MemoryFile,
     MemoryTypeSchema,
@@ -23,6 +25,20 @@ from openviking.session.memory.memory_isolation_handler import MemoryIsolationHa
 from openviking.session.memory.merge_op import SearchReplaceBlock, StrPatch
 from openviking.session.memory.page_id_map import PageIdMap
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
+from openviking.session.memory.tools import add_tool_call_pair_to_messages
+
+
+def test_model_output_trace_is_compact_and_explicit(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "openviking.session.memory.extract_loop.tracer.start_as_current_span",
+        lambda _name: nullcontext(),
+    )
+    monkeypatch.setattr("openviking.session.memory.extract_loop.tracer.info", events.append)
+
+    ExtractLoop._trace_model_output({"content": '{"ss_user":[]}'})
+
+    assert events == ['output={"content":"{\\"ss_user\\":[]}"}']
 
 
 class TestPreFetchFileFiltering:
@@ -174,7 +190,17 @@ class TestExtractLoopFinalJsonRetry:
         )
         context_provider = MagicMock()
         context_provider.get_memory_schemas.return_value = [schema]
-        context_provider.read_file_contents = {}
+        context_provider.read_file_contents = (
+            {
+                target_uri: MemoryFile(
+                    uri=target_uri,
+                    memory_type="preferences",
+                    content="",
+                )
+            }
+            if target_uri
+            else {}
+        )
 
         ctx = MagicMock()
         ctx.user.user_id = "user_a"
@@ -183,6 +209,7 @@ class TestExtractLoopFinalJsonRetry:
         extract_context.page_id_map.resolve.return_value = target_uri
 
         extract_loop = object.__new__(ExtractLoop)
+        extract_loop._output_context = None
         extract_loop.ctx = ctx
         extract_loop.context_provider = context_provider
         extract_loop._extract_context = extract_context
@@ -248,7 +275,7 @@ class TestExtractLoopFinalJsonRetry:
 
     @pytest.mark.asyncio
     async def test_structured_parser_preserves_delete_ids(self):
-        class FakeContextProvider:
+        class FakeContextProvider(ExtractContextProvider):
             read_file_contents = {}
 
             def get_memory_schemas(self, ctx):
@@ -434,7 +461,7 @@ class TestExtractLoopFinalJsonRetry:
                 self.seen_messages.append(list(kwargs["messages"]))
                 return "this is not json"
 
-        class FakeContextProvider:
+        class FakeContextProvider(ExtractContextProvider):
             read_file_contents = {}
 
             def get_memory_schemas(self, ctx):
@@ -517,7 +544,7 @@ class TestExtractLoopFinalJsonRetry:
                 self.seen_messages.append(list(kwargs["messages"]))
                 return ""
 
-        class FakeContextProvider:
+        class FakeContextProvider(ExtractContextProvider):
             read_file_contents = {}
 
             def get_memory_schemas(self, ctx):
@@ -603,7 +630,7 @@ class TestExtractLoopFinalJsonRetry:
                 del kwargs
                 return next(self.responses)
 
-        class FakeContextProvider:
+        class FakeContextProvider(ExtractContextProvider):
             read_file_contents = {}
 
             def get_memory_schemas(self, ctx):
@@ -687,7 +714,7 @@ class TestExtractLoopFinalJsonRetry:
                 self.call_count += 1
                 return next(self.responses)
 
-        class FakeContextProvider:
+        class FakeContextProvider(ExtractContextProvider):
             read_file_contents = {}
 
             def get_memory_schemas(self, ctx):
@@ -755,3 +782,28 @@ class TestExtractLoopFinalJsonRetry:
         assert extract_loop._add_refetch_results_to_messages.await_count == 1
         assert tracer_error.call_count == 0
         assert logger_warning.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_calls_disables_tools_after_not_allowed_result():
+    extract_loop = object.__new__(ExtractLoop)
+    extract_loop.context_provider = MagicMock()
+    tool_result = {"error": "Tool not allowed: search"}
+    extract_loop.context_provider.execute_tool = AsyncMock(return_value=tool_result)
+    tool_pair = []
+    add_tool_call_pair_to_messages(
+        tool_pair, call_id="call-search", tool_name="search", params={}, result=tool_result
+    )
+    extract_loop._output_protocol = MagicMock()
+    extract_loop._output_protocol.render_tool_result_messages.return_value = tool_pair
+    extract_loop._output_context = MagicMock()
+    messages = []
+
+    unavailable = await extract_loop._execute_tool_calls(
+        messages,
+        [SimpleNamespace(id="call-search", name="search", arguments={})],
+        [],
+    )
+
+    assert unavailable is True
+    assert messages == tool_pair

@@ -98,9 +98,7 @@ async def log(
         else None
     )
     try:
-        result = await service.fs.log(
-            branch=branch, limit=limit, paths=canonical_paths, ctx=_ctx
-        )
+        result = await service.fs.log(branch=branch, limit=limit, paths=canonical_paths, ctx=_ctx)
     except AGFSNotFoundError:
         raise NotFoundError(branch, "git_ref")
     except (AGFSClientError, ValueError) as e:
@@ -171,9 +169,7 @@ async def restore(
         # With GitRestoreWritebackPartialError wired up, structured partial
         # failures now go through the branch above; this clause only catches
         # the degraded path.
-        raise InternalError(
-            f"snapshot restore failed: {e}", cause=e
-        ) from e
+        raise InternalError(f"snapshot restore failed: {e}", cause=e) from e
     return Response(status="ok", result=result)
 
 

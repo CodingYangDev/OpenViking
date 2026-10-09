@@ -7,6 +7,7 @@ import json
 import re
 import time
 import uuid
+from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime
@@ -273,6 +274,16 @@ class _PlainTextFinal:
     content: str | None = None
 
 
+class AgentLLMError(RuntimeError):
+    """A model call failed; retain completed work without treating its error as dialogue."""
+
+    def __init__(self, message: str, *, tools_used: list[dict], usage: dict, iteration: int):
+        super().__init__(message)
+        self.tools_used = list(tools_used)
+        self.usage = dict(usage)
+        self.iteration = iteration
+
+
 class AgentIterationLimitExceeded(RuntimeError):
     """A structured task used every available AgentLoop iteration without submitting."""
 
@@ -509,7 +520,17 @@ class AgentLoop:
         session_key: SessionKey,
         publish_events: bool,
     ) -> tuple[Any, bool, bool]:
-        """Call the provider and forward native stream deltas to the bus."""
+        """Use a complete response for quiet work; stream deltas only for live display."""
+        if not publish_events:
+            response = await self.provider.chat(
+                messages=messages,
+                tools=tools,
+                model=self.model,
+                temperature=self.temperature,
+                session_id=session_key.safe_name(),
+            )
+            return response, False, False
+
         streamed_content = False
         streamed_reasoning = False
         response = None
@@ -1357,9 +1378,11 @@ class AgentLoop:
         inject_write_experience: bool = True,
         context_compact_budget: int | None = None,
         status_note_provider: Any | None = None,
-        experience_context_provider: Any | None = None,
+        experience_context_provider: Callable[..., AsyncIterator[str]] | None = None,
+        experience_context_injected: Any | None = None,
         captured_experience_messages: list[dict[str, Any]] | None = None,
         skill_runtime: Any | None = None,
+        on_initial_llm_request: Callable[[list[dict], list[dict]], None] | None = None,
     ) -> tuple[str | None, str | None, list[dict], dict[str, int], int]:
         """
         Run the core agent loop: call LLM, execute tools, repeat until done.
@@ -1367,7 +1390,8 @@ class AgentLoop:
         Args:
             messages: Initial message list
             session_key: Session key for tool execution context
-            publish_events: Whether to publish ITERATION/REASONING/TOOL_CALL events to the bus
+            publish_events: Publish live events and use streaming model calls when true;
+                otherwise request complete non-streaming model responses.
             sender_id: Sender identity forwarded to the tool execution context
             actor_peer_id: Authenticated OpenViking peer identity for tools
             ov_tools_enable: Whether to enable OpenViking tools for this session
@@ -1401,14 +1425,29 @@ class AgentLoop:
                 every model call. Compile uses this to inject the per-iteration budget
                 countdown and read/unread summary; ordinary chat leaves it ``None`` so its
                 behavior is unchanged.
-            experience_context_provider: Optional async callback accepting the current messages
-                and returning fresh server-side experience guidance before each model call.
+            experience_context_provider: Optional async iterator accepting messages and the
+                keyword before_tools. Called before each model decision (False), and with an
+                uncommitted assistant tool proposal (True) before execution. New guidance at
+                the tool boundary defers the entire batch for a fresh model decision.
+            experience_context_injected: Optional async callback invoked after returned experience
+                guidance is inserted into the model-facing messages. When supplied, the provider
+                owns identity-based deduplication; identical display text is not an identity.
             captured_experience_messages: Optional mutable list populated with newly injected
                 Experience Reminder user messages and their position in the tool history.
+            on_initial_llm_request: Optional once-only observer of the effective messages and
+                tools passed to the model provider. The observer must not mutate the request.
 
         Returns:
             tuple of (final_content, final_reasoning_content, tools_used, token_usage, iteration)
         """
+
+        def capture_initial_request(messages: list[dict], tools: list[dict]) -> None:
+            nonlocal on_initial_llm_request
+            callback = on_initial_llm_request
+            on_initial_llm_request = None
+            if callback is not None:
+                callback(messages, tools)
+
         iteration = 0
         active_tools = tool_registry or self.tools
         scoped_openviking_tools = (
@@ -1433,14 +1472,55 @@ class AgentLoop:
         }
         stop_tools = set(stop_tool_names or [])
 
-        def accumulate_token_usage(response: Any) -> None:
-            if not response.usage:
-                return
-            cur_token = response.usage
+        async def inject_experience_context(proposed_message: dict | None = None) -> bool:
+            inserted = False
+            if experience_context_provider is not None:
+                context = messages if proposed_message is None else [*messages, proposed_message]
+                async for note in experience_context_provider(
+                    context, before_tools=proposed_message is not None
+                ):
+                    if not note:
+                        continue
+                    if (
+                        experience_context_injected is not None
+                        or note not in injected_experience_notes
+                    ):
+                        experience_message = {"role": "user", "content": note}
+                        messages.append(experience_message)
+                        inserted = True
+                        injected_experience_notes.add(note)
+                        if captured_experience_messages is not None:
+                            captured_experience_messages.append(
+                                {
+                                    **experience_message,
+                                    "after_tool_count": len(tools_used),
+                                }
+                            )
+                    if experience_context_injected is not None:
+                        try:
+                            await experience_context_injected(note)
+                        except Exception as exc:
+                            # A client persistence failure must not discard already
+                            # inserted guidance or abort the model call.
+                            logger.warning(
+                                "Experience delivery recording failed ({})",
+                                type(exc).__name__,
+                            )
+            return inserted
+
+        def record_model_response(response: Any) -> None:
+            cur_token = response.usage or {}
             token_usage["prompt_tokens"] += cur_token.get("prompt_tokens", 0)
             token_usage["completion_tokens"] += cur_token.get("completion_tokens", 0)
             token_usage["total_tokens"] += cur_token.get("total_tokens", 0)
             token_usage["cache_read_input_tokens"] += cur_token.get("cache_read_input_tokens", 0)
+            if response.finish_reason == "error":
+                raise AgentLLMError(
+                    response.content or "LLM provider returned an error response",
+                    tools_used=tools_used,
+                    usage=token_usage,
+                    iteration=iteration,
+                )
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -1469,19 +1549,7 @@ class AgentLoop:
                 if note:
                     messages.append({"role": "user", "content": note})
 
-            if experience_context_provider is not None:
-                note = await experience_context_provider(messages)
-                if note and note not in injected_experience_notes:
-                    experience_message = {"role": "user", "content": note}
-                    messages.append(experience_message)
-                    injected_experience_notes.add(note)
-                    if captured_experience_messages is not None:
-                        captured_experience_messages.append(
-                            {
-                                **experience_message,
-                                "after_tool_count": len(tools_used),
-                            }
-                        )
+            await inject_experience_context()
 
             tool_definitions = active_tools.get_definitions(
                 ov_tools_enable=ov_tools_enable,
@@ -1493,13 +1561,14 @@ class AgentLoop:
                 for definition in tool_definitions
                 if isinstance(definition, dict)
             }
+            capture_initial_request(messages, tool_definitions)
             response, _streamed_content, streamed_reasoning = await self._chat_with_stream_events(
                 messages=messages,
                 tools=tool_definitions,
                 session_key=session_key,
                 publish_events=publish_events,
             )
-            accumulate_token_usage(response)
+            record_model_response(response)
 
             if publish_events and response.reasoning_content and not streamed_reasoning:
                 await self.bus.publish_outbound(
@@ -1562,6 +1631,12 @@ class AgentLoop:
                     }
                     for tc, args in zip(response.tool_calls, args_list, strict=False)
                 ]
+                if await inject_experience_context(
+                    {"role": "assistant", "tool_calls": tool_call_dicts}
+                ):
+                    # The proposal was never added to history or executed: no orphan tool calls
+                    # and no fabricated success results. Reconsider the whole batch with advice.
+                    continue
                 messages = self.context.add_assistant_message(
                     messages,
                     response.content,
@@ -1571,7 +1646,7 @@ class AgentLoop:
 
                 # Stage 2: activate Skills first, then execute remaining tools.
                 async def execute_single_tool(
-                    idx: int, tool_call, allowed_names=visible_tool_names
+                    idx: int, tool_call, allowed_names=visible_tool_names, current_messages=messages
                 ):
                     """Execute a single tool and track execution time."""
                     tool_execute_start_time = time.time()
@@ -1608,6 +1683,7 @@ class AgentLoop:
                             tool_call.arguments,
                             **execute_kwargs,
                             skill_runtime=skill_runtime,
+                            messages=current_messages,
                         )
                     else:
                         # Keep compatibility with embedders/tests that provide a
@@ -1754,6 +1830,16 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, model_result
                     )
 
+                    if outcome.on_result_added is not None:
+                        try:
+                            await outcome.on_result_added(str(model_result))
+                        except Exception as exc:
+                            logger.warning(
+                                "Tool result acknowledgement failed: tool={} error={}",
+                                tool_call.name,
+                                exc,
+                            )
+
                     execute_success = (
                         _is_stop_tool_result_success(result)
                         if tool_call.name in stop_tools
@@ -1886,6 +1972,8 @@ class AgentLoop:
                         ),
                     }
                 )
+                await inject_experience_context()
+                capture_initial_request(messages, [])
                 (
                     response,
                     _streamed_content,
@@ -1896,7 +1984,7 @@ class AgentLoop:
                     session_key=session_key,
                     publish_events=publish_events,
                 )
-                accumulate_token_usage(response)
+                record_model_response(response)
                 final_content = response.content
                 final_reasoning_content = response.reasoning_content
 

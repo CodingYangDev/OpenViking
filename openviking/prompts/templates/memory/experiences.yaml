@@ -1,8 +1,8 @@
 memory_type: experiences
 description: |
-  A reusable conditional-reminder DAG distilled from agent execution, stored as a complete
-  Python program. It describes when the agent needs a reminder and what the reminder says;
-  it is not a successful action path or an executable SOP.
+  A reusable guidance DAG distilled from agent execution, stored as a complete Python program.
+  It describes context-grounded information requests, tool-step suggestions and reminders;
+  it is not a complete task plan and does not execute tools itself.
 
 directory: "viking://user/{{ user_space }}/memories/experiences"
 filename_template: "{{ experience_name }}.md"
@@ -22,62 +22,104 @@ fields:
   - name: content
     type: string
     description: |
-      Output one complete, standalone Python program as this string field. Do NOT output
-      Markdown or DAG JSON. Persisted content is this Python source and must rebuild the DAG
-      from an empty graph: always start with `dag = workflow("...")` and include every
-      node that the final DAG needs. Existing candidate contents are Python source; rewrite the
-      complete source when updating rather than outputting only a mutation.
-      Full-replacement SDK syntax is mandatory for this field:
-      - Use the system-provided existing-object variable directly. Never call or assign
-        `sdk.existing(...)` yourself.
-      - Replace an existing DAG with exactly
-        `existing_experience.content.update("""<complete DAG source>""")`.
-      - Never pass a complete DAG to `content.edit(...)` or `content.drop(...)`; those methods
-        are snippet patch operations and are invalid for an Experience replacement.
+      There are two Python layers: the final reply is a write-only memory SDK program, while
+      this content field is a string containing one complete, standalone DAG program.
+      DAG source belongs only inside the content string, never at the top level of the reply.
+      Inside the string, do NOT include Markdown or DAG JSON. The stored source must rebuild
+      the DAG from an empty graph: start with `dag = workflow("...")` and include every node
+      that the final DAG needs. After applying any edits, the stored result must still be a
+      complete valid DAG; preserve unaffected rules, node names, and relationships.
+      SDK content editing rules:
+      - For a missing fixed target, use a bare `sdk.create_experiences(experience_name=..., content=...)`
+        call with the exact canonical Case name. Do not assign to the prefetch result variable.
+      - For an existing target, use the system-provided existing-object variable directly.
+        Never call or assign `sdk.existing(...)` yourself.
+      - The native tool reply shows the existing-object binding. Copy its exact left-hand variable
+        name and use `.content.edit(search=..., replace=...)` or `.content.drop(text=...)` for
+        local changes. Never invent or substitute a generic object variable name.
+      - Copy each search/drop snippet exactly from the existing source and ensure it matches
+        uniquely. Use `.content.overwrite("""<complete DAG source>""")` for a full replacement.
+      - Do not repeat `sdk.read(...)` or other read operations in the final write-only program.
+        End a create/update program with `sdk.commit()`; for no change, return only `sdk.commit()`.
       Experience semantics:
-      - An Experience is a set of conditional reminders, not a task plan, tool trace, successful
-        execution path, rubric transcription, or complete SOP.
+      - An Experience is focused conditional guidance, not a full task plan, tool trace,
+        transcription of a successful execution path, rubric transcription, or complete SOP.
       - Capture only a non-obvious risk, boundary, exception, calculation scope, ordering hazard,
-        or decision rule that the Session evidence shows the agent may otherwise miss.
+        or decision distinction that the Session evidence shows the agent needs to re-check.
       - Do not reproduce ordinary task steps that the base policy and tool definitions already
         specify. Do not map every Case requirement or every observed tool call into a node.
-      - A Case Experience may contain multiple independent condition-to-reminder rules. Keep
-        unrelated rules as separate subgraphs instead of connecting them into an artificial path.
+      - A Case Experience may contain multiple independent guidance subgraphs. Keep unrelated
+        concerns separate instead of connecting them into an artificial path.
       New Experience DAGs use only these node factories. The Python variable is the stable slot
       name:
       - check("one observable condition in the current conversation or tool evidence")
-      - tell("one precise reminder to inject into the agent context")
-      The compiler accepts other factories for existing programs, but generated Experiences must
-      not use `ask(...)`, `call(...)`, or `choose(...)`. If information or an action is still
-      needed, remind the agent what to verify or do; do not turn that action into a DAG step.
-      When an existing candidate is an action-path DAG, replace obsolete action nodes with the
-      smallest equivalent condition-to-reminder rules rather than preserving its workflow shape.
+      - ask("one specific question for information needed from the user")
+      - call("tool_name", "guidance for arguments using the current context")
+      - choose("one classification question about the current context")
+      - tell("one focused rule-review reminder to inject into the agent context")
+      Use `ask(...)` and `call(...)` only for information or tool steps supported by the Session
+      evidence. The runtime checks their completion from user replies or successful tool results;
+      incomplete nodes may be returned as suggestions to the agent, not executed by the DAG.
+      Tool names must come from the supplied tool evidence; describe arguments using current
+      context rather than copying concrete entity IDs.
+      Preserve supported `ask(...)` and `call(...)` nodes when updating an Experience; remove
+      obsolete or unsupported steps instead of copying an entire observed workflow.
       Condition rules:
       - Each `check(...)` is a trigger predicate, not an instruction. It must be directly
         decidable from the supplied user messages, assistant messages, or tool results.
+      - Trigger the reminder as soon as its situation is recognizable. A trigger describes why
+        the reminder applies, not whether the agent has already completed the work requested by
+        the reminder. Do not make facts such as "all records have been retrieved", "the total has
+        been calculated", or "the write is about to run" predecessors of a reminder that tells
+        the agent to retrieve, calculate, or prepare before writing.
       - State the applicability boundary explicitly. Split independent conditions into separate
         check nodes. Multiple `.then(reminder)` edges into the same reminder have AND semantics.
       - Conditions describe evidence that already exists, never future steps that the agent is
         expected to perform. Unknown evidence leaves the reminder inactive.
+      - Use `choose(...)` for mutually exclusive cases supported by the current context.
+        Use separate `check(...)` nodes for independent needs that can coexist; do not force
+        them into a single choice.
       Reminder rules:
       - Each `tell(...)` is an instruction shown to the agent when its predecessor conditions are
         satisfied. It is not a claim that the instruction has already been followed.
-      - Every root-to-leaf path must end in a `tell(...)` reminder, and reminder nodes must not
-        have outgoing edges.
-      - Make the reminder actionable and testable: state the exact scope, timing, inclusion or
-        exclusion rule, and failure to avoid. Prefer one coherent correction over a generic
-        request to "be careful" or a summary of the whole Case.
-      - Generalize rollout-specific identifiers and values unless they are invariant parts of the
-        canonical Case. Do not invent rules unsupported by the Session or evaluation evidence.
+      - Every root-to-leaf path must end in a `tell(...)` reminder. A `tell(...)` may have successors;
+        the runtime continues traversing them without waiting for the advice to be followed.
+        Emitting a reminder does not establish user confirmation or successful tool execution.
+        Express any required evidence as separate `check(...)`, `ask(...)` or `call(...)` nodes.
+      - Each reminder focuses attention on concrete rules, facts, or decision distinctions to
+        re-check, rather than prescribing the final action. Identify the evidence-backed risk
+        and the relevant applicability conditions, exceptions, scope, or timing to review.
+      - Current authoritative policy and current user/tool evidence determine the decision.
+        Experience is a review aid, not a new business rule or a substitute for that policy.
+        Do not turn a successful Trajectory's action or outcome into a standing instruction
+        to execute, refuse, or escalate. Leave the final choice to the agent after review.
+      - Do not expand a restriction on one operation to the whole goal. Remind the agent to
+        check the restriction's scope and other allowed approaches against
+        task requirements and constraints; do not decide the plan for it.
+      - Keep the review specific and concise: name what needs checking, not just "be careful"
+        or "review the policy". Do not request a full policy recap, lengthy reasoning, or an
+        extra user-facing review report.
+      - Apply this review-oriented wording when creating or updating reminders. Preserve
+        supported review concerns, not a previous reminder's unexamined action prescription.
+      - Generalize rollout-specific values unless they are invariant parts of the canonical Case.
+        Do not invent rules unsupported by the Session or evaluation evidence.
+      - Never copy concrete user, reservation, payment, flight, order, ticket, account or other
+        entity IDs into a condition or reminder, even if the same ID appears in every Trajectory
+        or in the canonical Case. Refer to the entity by its role in the current request.
       Relationship methods use node object variables, never IDs:
       - source.then(target1, target2) creates one-to-many fan-out.
       - condition.if_true(target), condition.if_false(target) define boolean branches.
+      - selector.case("label", target) routes a `choose(...)` node to a named case.
+      - selector.default(target) optionally routes an explicitly identified alternative outside
+        the declared labels, never for missing or uncertain evidence.
+      - A `choose(...)` node uses case/default relations, not then/if_true/if_false.
       A boolean branch may route to different reminders, and an omitted branch terminates without
       a reminder. Declare all node variables before relation calls. Every program needs exactly one
       `dag = workflow(...)` assignment. The compiler generates internal node IDs and reverse
       dependencies.
-      Only node declarations and these relation calls are allowed. No imports, loops, functions,
-      arbitrary method calls, attribute access, expressions or real tool execution.
+      Inside the stored DAG, only node declarations and these relation calls are allowed.
+      No imports, loops, functions, arbitrary method calls, attribute access, expressions
+      or real tool execution.
       Graphs must be acyclic and nonempty (a single node is allowed), with at most 256 nodes.
       Predecessors have AND semantics: a node with multiple incoming edges waits until every
       predecessor condition is satisfied.
@@ -89,12 +131,7 @@ fields:
       Memory retrieval and lifecycle operations are outside the business DAG. Never create
       nodes for `search_exp`, `search_experience` or `read_experience`.
       Natural-language descriptions must be in {{ language }}; constructor names stay in English.
-      Example content:
-      dag = workflow("Remind the agent about the scope of an upcoming-travel total")
-      total_requested = check("The user asks for the total cost of upcoming travel")
-      reservations_known = check("The context contains every reservation and enough dates and prices to determine which ones are upcoming")
-      remind_total_scope = tell("Calculate the total from the pre-mutation state and include every upcoming reservation, including reservations that the user also plans to modify or cancel; show the included items so the scope is unambiguous")
-      total_requested.then(remind_total_scope)
-      reservations_known.then(remind_total_scope)
+      Use the supplied SDK syntax and real bindings for create/update/no-change. DAG source
+      and patch snippets belong inside string arguments; never return a bare DAG.
 
-    merge_op: replace
+    merge_op: patch

@@ -35,6 +35,7 @@ from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext
 from openviking.server.models import Response
 from openviking.server.telemetry import run_operation
+from openviking.service.experience_runtime import SearchExperienceRequest
 from openviking.telemetry import TelemetryRequest
 from openviking.utils.image_search import is_viking_uri
 from openviking.utils.search_filters import (
@@ -189,13 +190,14 @@ def context_only_fields_error(supplied_fields, as_named_by_caller=None) -> Optio
     used = sorted(set(CONTEXT_ONLY_FIELDS) & set(supplied_fields))
     if not used:
         return None
-    names = sorted({name for field in used for name in ((as_named_by_caller or {}).get(field) or {field})})
-    return (f"{', '.join(names)} require mode='context'; "
-            "set mode='context' or drop these fields")
+    names = sorted(
+        {name for field in used for name in ((as_named_by_caller or {}).get(field) or {field})}
+    )
+    return f"{', '.join(names)} require mode='context'; set mode='context' or drop these fields"
 
 
 class SearchRequest(BaseModel):
-    """Request model for search with session.
+    """Request model for ranked search, context assembly, or stateless advice.
 
     ``mode="list"`` is the historical ranked-hit response. ``mode="context"``
     turns the endpoint into the context assembly face: budgeting, detail tiers,
@@ -223,7 +225,9 @@ class SearchRequest(BaseModel):
     read_content: bool = False
     telemetry: TelemetryRequest = False
 
-    mode: Literal["list", "context"] = "list"
+    mode: Literal["list", "context", "advice"] = "list"
+    state: Optional[List[Dict[str, Any]]] = None
+    experience_names: Optional[List[str]] = None
 
     query_expansion: Literal["off", "auto"] = "auto"
     max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=64, le=32000)
@@ -239,6 +243,11 @@ class SearchRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_mode(self) -> "SearchRequest":
+        if self.mode == "advice":
+            self.advice_request()
+            return self
+        if {"state", "experience_names"} & self.model_fields_set:
+            raise ValueError("state and experience_names require mode='advice'")
         if self.mode == "list":
             error = context_only_fields_error(self.model_fields_set)
             if error:
@@ -251,6 +260,18 @@ class SearchRequest(BaseModel):
             raise ValueError("target_uri is not supported in mode='context'")
         _reject_unknown_quota_and_detail(self.quotas, self.detail)
         return self
+
+    def advice_request(self) -> SearchExperienceRequest:
+        """Reuse the Experience contract, including its mode-specific defaults."""
+        supplied = self.model_fields_set - {"mode", "telemetry"}
+        unsupported = supplied - SearchExperienceRequest.model_fields.keys()
+        if unsupported:
+            raise ValueError(
+                f"Unsupported fields for mode='advice': {', '.join(sorted(unsupported))}"
+            )
+        return SearchExperienceRequest.model_validate(
+            {field: getattr(self, field) for field in supplied}
+        )
 
 
 async def _inline_read_content(
@@ -455,8 +476,20 @@ async def search(
     http_request: Request,
     _ctx: RequestContext = Depends(get_request_context),
 ):
-    """Semantic search with optional session context."""
+    """Ranked search, context assembly, or stateless advice selected by mode."""
     service = get_service()
+    if request.mode == "advice":
+        advice_request = request.advice_request()
+        execution = await run_operation(
+            operation="search.advice",
+            telemetry=request.telemetry,
+            fn=lambda: service.search.advice(advice_request, _ctx),
+        )
+        result = execution.result.model_dump(mode="json")
+        http_request.state.retrieval_result_count = len(result["matched_experience_uris"])
+        return Response(status="ok", result=result, telemetry=execution.telemetry).model_dump(
+            exclude_none=True
+        )
     actual_limit = _resolve_search_limit(request.limit, request.node_limit)
     effective_filter = _resolve_search_filter(
         request.filter,

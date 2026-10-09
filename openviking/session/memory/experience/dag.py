@@ -202,6 +202,14 @@ class Dag(DagModel):
         return dag
 
 
+class DagTriggerCondition(DagModel):
+    """One predicate on an advice's reached path; the list of predicates is conjunctive."""
+
+    description: str
+    operator: Literal["is_true", "is_false", "equals", "not_in"]
+    values: list[str] = Field(default_factory=list)
+
+
 class DagAction(DagModel):
     node_id: int
     slot_name: str
@@ -349,13 +357,12 @@ class DagInstance(DagModel):
         self.dag.validate_graph()
         if self.state == "completed":
             return [], []
-        if self.state == "pending":
-            self.current_nodes = sorted(
-                key for key, node in self.dag.nodes.items() if not node.predecessors
-            )
-            self.state = "running"
+        self.state = "running"
         executed = set(self.executed_nodes)
-        current = set(self.current_nodes)
+        # Recompute reachability from current slot facts, not a previous frontier.
+        # Only nodes visited on this path satisfy an AND predecessor relationship.
+        processed: set[int] = set()
+        current = {key for key, node in self.dag.nodes.items() if not node.predecessors}
         while True:
             finished: set[int] = set()
             candidate_successors: set[int] = set()
@@ -386,15 +393,16 @@ class DagInstance(DagModel):
                 candidate_successors.update(targets)
             if not finished:
                 break
-            completed = executed | finished
+            completed = processed | finished
             successors = {
                 successor
                 for successor in candidate_successors
                 if set(self.dag.nodes[successor].predecessors).issubset(completed)
             }
+            self.executed_nodes.extend(sorted(finished - executed))
             executed.update(finished)
-            current = (current | successors) - executed
-        self.executed_nodes = sorted(executed)
+            processed.update(finished)
+            current = (current | successors) - processed
         self.current_nodes = sorted(current)
         if not current:
             self.state = "completed"
@@ -414,3 +422,53 @@ class DagInstance(DagModel):
                     )
                 )
         return actions, waiting
+
+    def trigger_conditions(self, node_id: int) -> list[DagTriggerCondition]:
+        """Describe only ancestors of an action reached by this advance, in path order.
+
+        Activation already proves all predecessors were visited on the current path.
+        Tell nodes are traversed but never presented as delivery facts or predicates.
+        """
+        visited: set[int] = set()
+        conditions: list[DagTriggerCondition] = []
+
+        def visit(key: int) -> None:
+            for parent_id in sorted(self.dag.nodes[key].predecessors):
+                if parent_id in visited:
+                    continue
+                visited.add(parent_id)
+                visit(parent_id)
+                parent = self.dag.nodes[parent_id]
+                if not isinstance(parent.slot_provider, TellAgent):
+                    conditions.append(
+                        _trigger_condition(parent, self.slot_values[parent.slot_name])
+                    )
+
+        visit(node_id)
+        return conditions
+
+
+def _trigger_condition(node: GeneralNode, value: bool | str) -> DagTriggerCondition:
+    provider = node.slot_provider
+    if isinstance(provider, Check):
+        description = provider.check_info
+    elif isinstance(provider, AskUser):
+        if isinstance(node, ConditionalBranch):
+            description = provider.question
+        elif isinstance(node, IfElseBranch):
+            description = f"The user's answer is affirmative: {provider.question}"
+        else:
+            description = f"The user has supplied the requested information: {provider.question}"
+    else:
+        description = f"The tool step has completed successfully: {node.action_description()}"
+
+    if isinstance(node, ConditionalBranch):
+        return DagTriggerCondition(
+            description=description,
+            operator="not_in" if value == DEFAULT_BRANCH_CHOICE else "equals",
+            values=list(node.branch_mapping) if value == DEFAULT_BRANCH_CHOICE else [str(value)],
+        )
+    return DagTriggerCondition(
+        description=description,
+        operator="is_false" if isinstance(node, IfElseBranch) and value is False else "is_true",
+    )

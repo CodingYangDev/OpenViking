@@ -387,9 +387,7 @@ class SQLiteUsageAuditStore:
         assert self._conn is not None
         day = date.fromisoformat(user_date)
         utc_start, utc_end = _user_day_window_utc(day, tz)
-        rows = self._fetch_hourly_token_rows(
-            account_id, utc_start, utc_end, user_id=user_id
-        )
+        rows = self._fetch_hourly_token_rows(account_id, utc_start, utc_end, user_id=user_id)
         result = {"vlm_input": 0, "vlm_output": 0, "embedding_input": 0}
         for source, token_type, _, _, total in rows:
             key = f"{source}_{token_type}"

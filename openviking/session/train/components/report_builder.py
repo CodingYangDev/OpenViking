@@ -17,6 +17,7 @@ from openviking.session.train.domain import (
     Rollout,
     RolloutAnalysis,
 )
+from openviking.session.train.utils import summarize_session_commits
 
 
 @dataclass(slots=True)
@@ -65,16 +66,12 @@ class PipelineReportBuilder:
         trials = [
             {
                 "trial": trial_index,
-                **self.evaluation_summary_from_analyses(
-                    analyses_by_trial.get(trial_index, [])
-                ),
+                **self.evaluation_summary_from_analyses(analyses_by_trial.get(trial_index, [])),
             }
             for trial_index in range(trial_count)
         ]
         accuracies = [
-            float(item["accuracy"])
-            for item in trials
-            if item.get("accuracy") is not None
+            float(item["accuracy"]) for item in trials if item.get("accuracy") is not None
         ]
         average_rewards = [
             float(item["average_reward"])
@@ -176,7 +173,14 @@ class PipelineReportBuilder:
     ) -> dict[str, Any]:
         train_eval = self.train_evaluation_report(epoch_result.analyses)
         commit_results = list(epoch_result.apply_result.metadata.get("commit_results", []))
-        errors = [error for item in commit_results if (error := item.get("error"))]
+        errors = list(
+            dict.fromkeys(
+                [
+                    *epoch_result.apply_result.errors,
+                    *(error for item in commit_results if (error := item.get("error"))),
+                ]
+            )
+        )
         snapshot_ids = list(epoch_result.policy_snapshot_ids)
         display_eval = rollout_report or train_eval
         return {
@@ -189,7 +193,18 @@ class PipelineReportBuilder:
             "train_eval": train_eval,
             "batch_count": len(snapshot_ids),
             "gradient_count": len(epoch_result.gradients),
-            "committed_rollout_count": len(commit_results),
+            "committed_rollout_count": sum(
+                item.get("task_status") != "skipped" for item in commit_results
+            ),
+            "commit_summary": summarize_session_commits(commit_results),
+            "skipped_rollout_count": sum(
+                item.get("task_status") == "skipped" for item in commit_results
+            ),
+            "experience_learning": epoch_result.apply_result.metadata.get("experience_learning"),
+            "session_commit_cost_seconds": epoch_result.metadata.get("session_commit_cost_seconds"),
+            "experience_learn_cost_seconds": epoch_result.metadata.get(
+                "experience_learn_cost_seconds"
+            ),
             "errors": errors,
             "failed_commit_trace_ids": _failed_commit_trace_ids(commit_results),
             "failed_commit_telemetry_ids": _failed_commit_telemetry_ids(commit_results),
@@ -224,10 +239,16 @@ class PipelineReportBuilder:
         memory_context_count = 0
         memory_tool_call_rollout_count = 0
         memory_tool_call_total = 0
+        advice_recall_total = 0
+        advice_recall_rollout_count = 0
         for rollout in rollouts:
             metadata = rollout.metadata or {}
             if str(metadata.get("memory") or "").strip():
                 memory_context_count += 1
+            recalls = metadata.get("advice_recalls") or []
+            if recalls:
+                advice_recall_rollout_count += 1
+                advice_recall_total += len(recalls)
             tool_call_count = self.memory_tool_call_count(metadata.get("tools_used"))
             if tool_call_count:
                 memory_tool_call_rollout_count += 1
@@ -242,6 +263,8 @@ class PipelineReportBuilder:
                 rollout_count,
             ),
             "memory_tool_call_total": memory_tool_call_total,
+            "advice_recall_rollout_count": advice_recall_rollout_count,
+            "advice_recall_total": advice_recall_total,
         }
 
     def memory_tool_call_count(self, tools_used: Any) -> int:
@@ -252,7 +275,7 @@ class PipelineReportBuilder:
             if not isinstance(tool_info, dict):
                 continue
             tool_name = str(tool_info.get("tool_name") or "")
-            if tool_name.startswith(self.memory_tool_name_prefix):
+            if tool_name == "ask_for_advice" or tool_name.startswith(self.memory_tool_name_prefix):
                 count += 1
         return count
 

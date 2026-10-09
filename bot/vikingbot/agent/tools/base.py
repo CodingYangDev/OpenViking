@@ -1,6 +1,7 @@
 """Base class for agent tools."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,6 +46,10 @@ class ToolContext:
             selected in the browser.
         channel_metadata: Channel-specific metadata from the inbound message. Tools
             that publish outbound messages can reuse this to preserve delivery context.
+        messages: Current model conversation supplied by the agent loop. Tools must
+            treat it as read-only evidence, not replace it with generated arguments.
+        on_result_added: Optional async receipt callback, invoked with the actual
+            model-facing text only after the result has entered model context.
 
     Example:
         >>> context = ToolContext(
@@ -65,6 +70,10 @@ class ToolContext:
     openviking_connection: dict[str, Any] | None = None
     channel_metadata: dict[str, Any] | None = None
     skill_runtime: Any | None = None
+    # Supplied by the agent loop, never by model-generated tool arguments.
+    messages: list[dict[str, Any]] | None = None
+    # Called only after the actual tool result is appended to model context.
+    on_result_added: Callable[[str], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         if self.memory_owner_user_ids is None and self.memory_user_ids is not None:

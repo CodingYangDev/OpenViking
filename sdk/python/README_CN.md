@@ -203,9 +203,7 @@ client.update_session_config(
     session_id="demo-session",
     options={
         "auto_commit_policy": {"message_count_threshold": 25},
-        "memory_extraction_config": {
-            "events": {"tags": ["team=search", "channel=app"]}
-        },
+        "memory_extraction_config": {"events": {"tags": ["team=search", "channel=app"]}},
     },
 )
 # 显式传 None 会禁用自动 commit；省略参数则保持不变。

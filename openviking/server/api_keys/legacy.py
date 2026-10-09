@@ -205,9 +205,7 @@ class LegacyAPIKeyManager:
                 sum(len(info.users) for info in self._accounts.values()),
             )
 
-    async def refresh_identity_registry_if_changed(
-        self, account_id: str | None = None
-    ) -> bool:
+    async def refresh_identity_registry_if_changed(self, account_id: str | None = None) -> bool:
         """Reload registry state only when the management read target has changed."""
         async with self._mutation_lock:
             scope = account_id
@@ -264,9 +262,7 @@ class LegacyAPIKeyManager:
             key_or_hash = user_info.get("key", "")
             if not key_or_hash:
                 continue
-            key_prefix = user_info.get("key_prefix", "") or self._get_key_prefix(
-                key_or_hash
-            )
+            key_prefix = user_info.get("key_prefix", "") or self._get_key_prefix(key_or_hash)
             if key_prefix:
                 prefix_entries.append(
                     (
@@ -344,10 +340,12 @@ class LegacyAPIKeyManager:
                 groups=groups,
                 deletion=info.get("deletion"),
             )
-            user_group_ids.update({
-                (account_id, user_id): group_ids
-                for user_id, group_ids in self._group_memberships(users, groups).items()
-            })
+            user_group_ids.update(
+                {
+                    (account_id, user_id): group_ids
+                    for user_id, group_ids in self._group_memberships(users, groups).items()
+                }
+            )
 
             for user_id, user_info in users.items():
                 key_or_hash = user_info.get("key", "")
@@ -682,7 +680,9 @@ class LegacyAPIKeyManager:
             try:
                 users_data = await self._read_json(path) or {"users": {}}
                 persisted_users = users_data.setdefault("users", {})
-                new_users = sorted(user_id for user_id in user_ids if user_id not in persisted_users)
+                new_users = sorted(
+                    user_id for user_id in user_ids if user_id not in persisted_users
+                )
                 for user_id in new_users:
                     persisted_users[user_id] = {"role": "user"}
                 if new_users:
@@ -696,10 +696,9 @@ class LegacyAPIKeyManager:
 
                 account = self._accounts.get(account_id)
                 if account is None:
-                    created_at = (
-                        (accounts_data.get("accounts", {}).get(account_id) or {}).get("created_at")
-                        or now
-                    )
+                    created_at = (accounts_data.get("accounts", {}).get(account_id) or {}).get(
+                        "created_at"
+                    ) or now
                     account = AccountInfo(
                         created_at=created_at,
                         users={},
@@ -1269,9 +1268,7 @@ class LegacyAPIKeyManager:
             account = self._require_account(account_id)
             await self._load_account_groups_if_needed(account_id, account)
 
-    async def _load_account_groups_if_needed(
-        self, account_id: str, account: AccountInfo
-    ) -> None:
+    async def _load_account_groups_if_needed(self, account_id: str, account: AccountInfo) -> None:
         if account.groups_loaded:
             return
         groups_path = GROUPS_PATH_TEMPLATE.format(account_id=account_id)
@@ -1296,12 +1293,14 @@ class LegacyAPIKeyManager:
         account = self._accounts.get(account_id)
         if account is None:
             return
-        self._user_group_ids.update({
-            (account_id, user_id): group_ids
-            for user_id, group_ids in self._group_memberships(
-                account.users, account.groups
-            ).items()
-        })
+        self._user_group_ids.update(
+            {
+                (account_id, user_id): group_ids
+                for user_id, group_ids in self._group_memberships(
+                    account.users, account.groups
+                ).items()
+            }
+        )
 
     @staticmethod
     def _group_memberships(

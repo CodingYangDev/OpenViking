@@ -82,10 +82,7 @@ def _validate_tos_uri(
         not isinstance(value, str)
         or value != value.strip()
         or not value.startswith("tos://")
-        or any(
-            char in "?#%" or ord(char) < 0x20 or ord(char) == 0x7F
-            for char in value
-        )
+        or any(char in "?#%" or ord(char) < 0x20 or ord(char) == 0x7F for char in value)
     ):
         raise error
 
@@ -201,11 +198,10 @@ class ConnectorDelegate:
 
     @classmethod
     def is_watch_auth_state(cls, auth_state: Optional[Dict[str, Any]]) -> bool:
-        return (
-            isinstance(auth_state, dict)
-            and auth_state.get("provider")
-            in {cls._WATCH_AUTH_PROVIDER, cls._WATCH_PLAINTEXT_AUTH_PROVIDER}
-        )
+        return isinstance(auth_state, dict) and auth_state.get("provider") in {
+            cls._WATCH_AUTH_PROVIDER,
+            cls._WATCH_PLAINTEXT_AUTH_PROVIDER,
+        }
 
     async def restore_watch_request(
         self,

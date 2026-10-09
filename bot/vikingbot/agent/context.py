@@ -106,6 +106,7 @@ class ContextBuilder:
         profile_user_list: list[str] | None = None,
         memory_peer_ids: list[str] | None = None,
         memory_owner_user_ids: list[str] | None = None,
+        only_skills: list[str] | None = None,
     ) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
@@ -116,6 +117,8 @@ class ContextBuilder:
             profile_user_list: Deprecated list of additional peer IDs to fetch profiles for.
             memory_peer_ids: Peer IDs used for memory retrieval; profiles are fetched too.
             memory_owner_user_ids: Deprecated owner-user IDs used for trusted-mode lookup.
+            only_skills: Inline only these Skills, omitting all other local/remote Skills.
+                None preserves normal Skill discovery; an empty list loads no Skills.
 
         Returns:
             Complete system prompt.
@@ -149,38 +152,43 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
-        # Skills - progressive loading
-        # 1. Always-loaded skills: include full content
-        always_skills = self.skills.get_always_skills()
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
-            if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+        if only_skills is not None:
+            content = self.skills.load_skills_for_context(only_skills, required=True)
+            if content:
+                parts.append(f"# Active Skills\n\n{content}")
+        else:
+            # Skills - progressive loading
+            # 1. Always-loaded skills: include full content
+            always_skills = self.skills.get_always_skills()
+            if always_skills:
+                always_content = self.skills.load_skills_for_context(always_skills)
+                if always_content:
+                    parts.append(f"# Active Skills\n\n{always_content}")
 
-        # 2. Available skills: only show summary (agent uses read_file to load)
-        skills_summary = self.skills.build_skills_summary()
-        if skills_summary or self._remote_skills_summary:
-            required_skill_note = ""
-            required_skill_candidates = [
-                "skills/experience_loader/SKILL.md",
-                "skills/task_case_experience/SKILL.md",
-            ]
-            for skill_path in required_skill_candidates:
-                if (self.workspace / skill_path).exists():
-                    required_skill_note = (
-                        "\nRequired skill: before taking any task action, you MUST read "
-                        f"`{skill_path}` and apply its instructions.\n"
-                    )
-                    break
-            local_section = ""
-            if skills_summary:
-                local_section = f"""## Local Skills
+            # 2. Available skills: only show summary (agent uses read_file to load)
+            skills_summary = self.skills.build_skills_summary()
+            if skills_summary or self._remote_skills_summary:
+                required_skill_note = ""
+                required_skill_candidates = [
+                    "skills/experience_loader/SKILL.md",
+                    "skills/task_case_experience/SKILL.md",
+                ]
+                for skill_path in required_skill_candidates:
+                    if (self.workspace / skill_path).exists():
+                        required_skill_note = (
+                            "\nRequired skill: before taking any task action, you MUST read "
+                            f"`{skill_path}` and apply its instructions.\n"
+                        )
+                        break
+                local_section = ""
+                if skills_summary:
+                    local_section = f"""## Local Skills
 
 Read local SKILL.md files with the read_file tool.
 {skills_summary}"""
-            remote_section = ""
-            if self._remote_skills_summary:
-                remote_section = f"""## OpenViking Skills
+                remote_section = ""
+                if self._remote_skills_summary:
+                    remote_section = f"""## OpenViking Skills
 
 These are remote Skill summaries. Read a selected SKILL.md with openviking_multi_read.
 Do not use read_file for their viking:// locations. Text references stay remote; the
@@ -189,7 +197,7 @@ After activation, use the canonical resource URIs appended to SKILL.md. When mul
 remote Skills are active, their tool policies are intersected. Use `workspace:<relative-path>`
 or an absolute path for an ordinary workspace file.
 {self._remote_skills_summary}"""
-            parts.append(f"""# Skills
+                parts.append(f"""# Skills
 
 The following local and remote Skills extend your capabilities.
 {required_skill_note}
@@ -385,6 +393,7 @@ IMPORTANT:
         experience_recall_enable: bool | None = None,
         exp_exclude_uris: list[str] | None = None,
         experience_case_lookup: dict[str, Any] | None = None,
+        only_skills: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -402,6 +411,7 @@ IMPORTANT:
                 from exposing OpenViking tools. Defaults to ov_tools_enable.
             exp_exclude_uris: Optional list of experience URIs that have already been recalled
                 in this session and should be skipped (deduplication).
+            only_skills: Exclusive inline Skill selection; None preserves normal discovery.
 
         Returns:
             List of messages including system prompt.
@@ -415,6 +425,7 @@ IMPORTANT:
             profile_user_list=profile_user_list,
             memory_peer_ids=memory_peer_ids,
             memory_owner_user_ids=memory_owner_user_ids,
+            only_skills=only_skills,
         )
         messages.append({"role": "system", "content": system_prompt})
 

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
 from typing import Any
 
 from openviking.session.train.domain import Rollout, RolloutAnalysis
@@ -21,6 +23,20 @@ def average_score(analyses: list[RolloutAnalysis | None]) -> float | None:
     return sum(scores) / len(scores)
 
 
+def summarize_session_commits(results: list[dict[str, Any]]) -> dict[str, int]:
+    """Count successful commits with/without output, not unique Trajectory files."""
+    completed = [
+        item for item in results if item.get("task_status") != "skipped" and not item.get("error")
+    ]
+    with_traj = sum(any(item.get("trajectory_uris") or []) for item in completed)
+    return {
+        "completed": len(completed),
+        "with_traj": with_traj,
+        "without_traj": len(completed) - with_traj,
+        "errors": sum(bool(item.get("error")) for item in results),
+    }
+
+
 def validate_rollouts_have_cases(rollouts: list[Rollout]) -> None:
     """Raise ``ValueError`` if any rollout is missing its ``case``."""
     missing = [
@@ -28,8 +44,7 @@ def validate_rollouts_have_cases(rollouts: list[Rollout]) -> None:
     ]
     if missing:
         raise ValueError(
-            "rollout training requires Rollout.case for all rollouts; "
-            f"missing indices={missing}"
+            f"rollout training requires Rollout.case for all rollouts; missing indices={missing}"
         )
 
 
@@ -45,3 +60,9 @@ def safe_int(value: Any) -> int | None:
 def first_uri(uris: list[str]) -> str | None:
     """Return the first URI from a list, or ``None`` if empty."""
     return uris[0] if uris else None
+
+
+async def call_hook(hook: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Invoke a sync or async hook, preserving its result and exceptions."""
+    result = hook(*args, **kwargs)
+    return await result if inspect.isawaitable(result) else result

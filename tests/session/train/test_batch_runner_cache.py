@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
 
 from openviking.session.train.batch_runner import (
     BatchTrainEvalConfig,
@@ -542,3 +546,57 @@ async def test_cached_epoch_zero_train_rollout_executor_does_not_reuse_later_epo
     assert len(calls) == 2
     assert first[0].messages[0].content == "1"
     assert second[0].messages[0].content == "2"
+
+
+@pytest.mark.parametrize(
+    "flags,enabled",
+    [
+        ([], True),
+        (["--reuse-train-rollout-cache"], True),
+        (["--no-reuse-train-rollout-cache"], False),
+    ],
+)
+def test_train_rollout_cache_cli_default_and_opt_out(monkeypatch, flags, enabled):
+    from openviking.session.train.batch_runner import _build_pipeline
+    from openviking.session.train.components.remote import RemoteRolloutExecutor
+    from openviking.session.train.run_batch_train_eval import parse_args
+
+    monkeypatch.setattr(sys, "argv", ["train", "--dataset", "tau2", "--domain", "airline", *flags])
+    args = parse_args()
+    assert args.reuse_train_rollout_cache is enabled
+    config = BatchTrainEvalConfig(
+        dataset=args.dataset,
+        domain=args.domain,
+        benchmark_service_url="http://test",
+        reuse_train_rollout_cache=args.reuse_train_rollout_cache,
+    )
+    pipeline = _build_pipeline(config, policy_trainer=Mock())
+    expected = CachedEpochZeroTrainRolloutExecutor if enabled else RemoteRolloutExecutor
+    assert isinstance(pipeline.rollout_executor, expected)
+
+
+def test_train_rollout_cache_config_and_report_default_to_enabled():
+    from openviking.session.train.batch_runner import BatchTrainEvalReport, _build_pipeline
+
+    config = BatchTrainEvalConfig(
+        dataset="tau2", domain="airline", benchmark_service_url="http://test"
+    )
+    assert config.reuse_train_rollout_cache is True
+    assert isinstance(
+        _build_pipeline(config, policy_trainer=Mock()).rollout_executor,
+        CachedEpochZeroTrainRolloutExecutor,
+    )
+    report = BatchTrainEvalReport(
+        dataset="tau2",
+        domain="airline",
+        epochs=1,
+        batch_size=None,
+        concurrency=200,
+        commit_concurrency=200,
+        train_index=None,
+        eval_index=None,
+        policy_root_uri="viking://user/default/memories/experiences",
+        baseline_eval=None,
+    )
+    assert report.reuse_train_rollout_cache is True
+    assert report.to_dict()["reuse_train_rollout_cache"] is True

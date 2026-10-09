@@ -46,6 +46,10 @@ class _MetaVikingFS:
             raise FileNotFoundError(uri)
         return self.files[uri]
 
+    async def exists(self, uri, ctx=None):
+        del ctx
+        return uri in self.files
+
     async def write_file(self, uri, content, ctx=None, lease_ref=None):
         del ctx
         self.files[uri] = content
@@ -58,6 +62,7 @@ async def test_commit_uses_event_tags_from_lock_protected_meta_snapshot(monkeypa
     persisted_meta = SessionMeta(
         session_id="session-1",
         event_search_tags=["channel=app"],
+        extraction_context="persisted routing context",
     )
     viking_fs = _MetaVikingFS(session_uri, persisted_meta)
     session = Session(
@@ -66,6 +71,7 @@ async def test_commit_uses_event_tags_from_lock_protected_meta_snapshot(monkeypa
         session_uri=session_uri,
     )
     session.meta.event_search_tags = ["channel=web"]
+    session.meta.extraction_context = "stale routing context"
     archived_message = Message(
         id="message-1",
         role="user",
@@ -92,6 +98,7 @@ async def test_commit_uses_event_tags_from_lock_protected_meta_snapshot(monkeypa
         await session.commit_async()
 
     assert captured_queue_message["event_search_tags"] == ["channel=app"]
+    assert captured_queue_message["extraction_context"] == "persisted routing context"
     assert viking_fs._async_agfs.acquired == 1
     assert viking_fs._async_agfs.released == 1
 
@@ -108,6 +115,7 @@ async def test_update_config_updates_policy_and_tags_in_one_locked_write():
             "message_count_threshold": 40,
         },
         event_search_tags=["channel=web"],
+        extraction_context="old context",
     )
     viking_fs = _MetaVikingFS(session_uri, persisted_meta)
     session = Session(
@@ -118,6 +126,8 @@ async def test_update_config_updates_policy_and_tags_in_one_locked_write():
 
     await session.update_config(
         event_search_tags=["channel=app"],
+        extraction_context="new context",
+        update_extraction_context=True,
         auto_commit_policy={
             "pending_token_threshold": 8000,
             "message_count_threshold": 25,
@@ -129,6 +139,7 @@ async def test_update_config_updates_policy_and_tags_in_one_locked_write():
 
     saved_meta = SessionMeta.from_dict(json.loads(viking_fs.files[viking_fs.meta_uri]))
     assert saved_meta.event_search_tags == ["channel=app"]
+    assert saved_meta.extraction_context == "new context"
     assert saved_meta.auto_commit_policy["message_count_threshold"] == 25
     assert saved_meta.message_count == 41
     assert saved_meta.pending_tokens == 8200

@@ -16,6 +16,7 @@ _registry.register(TrustedAuthPlugin)
 # Try to register OIDC and LDAP plugins if dependencies are available
 try:
     from openviking.server.auth.plugins.oidc import OIDCAuthPlugin
+
     _registry.register(OIDCAuthPlugin)
     _has_oidc = True
 except ImportError:
@@ -23,6 +24,7 @@ except ImportError:
 
 try:
     from openviking.server.auth.plugins.ldap import LDAPAuthPlugin
+
     _registry.register(LDAPAuthPlugin)
     _has_ldap = True
 except ImportError:

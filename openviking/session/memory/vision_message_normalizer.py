@@ -103,6 +103,13 @@ async def replace_image_parts_with_descriptions(
                     parts=parts,
                     peer_id=message.peer_id,
                     created_at=message.created_at,
+                    turn_id=message.turn_id,
+                    message_kind=message.message_kind,
+                    source_message_ids=(
+                        list(message.source_message_ids)
+                        if message.source_message_ids is not None
+                        else None
+                    ),
                 )
             )
     return prepared_messages

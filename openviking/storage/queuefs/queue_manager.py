@@ -150,9 +150,7 @@ class QueueManager:
         if self._started:
             return
         if self.SEMANTIC in self._queues and self._vlm_resolver is None:
-            raise RuntimeError(
-                "QueueManager requires a VLM resolver before semantic workers start"
-            )
+            raise RuntimeError("QueueManager requires a VLM resolver before semantic workers start")
 
         self._started = True
 

@@ -187,3 +187,63 @@ async def test_openai_async_completion_with_empty_tools_preserves_usage(monkeypa
         "total_tokens": 15,
         "prompt_tokens_details": None,
     }
+
+
+@pytest.mark.parametrize("backend_type", [OpenAIVLM, VolcEngineVLM, LiteLLMVLMProvider])
+@pytest.mark.parametrize("reasoning", [None, 0, 123])
+def test_structured_vlm_response_preserves_reasoning_count_without_copying_thoughts(
+    backend_type, reasoning
+):
+    backend = backend_type({"model": "test-model"})
+    raw = SimpleNamespace(
+        _request_id="sdk-correlation",
+        id="completion-id-not-request-id",
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="answer", tool_calls=None, reasoning_content="PRIVATE_THOUGHTS"
+                ),
+                finish_reason="stop",
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=130,
+            total_tokens=140,
+            prompt_tokens_details=None,
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=reasoning),
+        ),
+    )
+    response = backend._build_vlm_response(raw, has_tools=True)
+    assert response.content == "answer"
+    assert response.usage.get("reasoning_tokens") == reasoning
+    assert ("reasoning_tokens" in response.usage) == (reasoning is not None)
+    assert response.reasoning_content is None
+    assert response.server_request_id == ("sdk-correlation" if backend_type is OpenAIVLM else None)
+    assert response.client_request_id == (
+        "sdk-correlation" if backend_type is VolcEngineVLM else None
+    )
+
+
+@pytest.mark.parametrize("vlm_type", [OpenAIVLM, VolcEngineVLM, LiteLLMVLMProvider])
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ('{"count": 2}', {"count": 2}),
+        ("not json", {"raw": "not json"}),
+        ({"count": 2}, {"count": 2}),
+    ],
+)
+def test_openai_compatible_backends_share_tool_call_parsing(vlm_type, arguments, expected):
+    vlm = vlm_type({"model": "test-model"})
+    message = SimpleNamespace(
+        tool_calls=[
+            SimpleNamespace(
+                id="call-1",
+                function=SimpleNamespace(name="search", arguments=arguments),
+            )
+        ]
+    )
+    calls = vlm._parse_tool_calls(message)
+    assert len(calls) == 1
+    assert (calls[0].id, calls[0].name, calls[0].arguments) == ("call-1", "search", expected)

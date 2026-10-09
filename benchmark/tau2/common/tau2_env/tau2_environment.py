@@ -11,12 +11,14 @@ from functools import wraps
 from typing import Any
 from uuid import uuid4
 
+from openviking.telemetry import tracer
 from openviking.utils.model_retry import is_retryable_rate_limit_error, rate_limit_retry_delay
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
 
 DEFAULT_TAU2_USER_LLM = "openai/doubao-seed-2-0-code-preview-260215"
+_TAU2_REASONING_ONLY_MAX_ATTEMPTS = 3
 
 _TAU2_GENERATE_REFERENCE_MODULES = (
     "tau2.agent.llm_agent",
@@ -34,6 +36,36 @@ def _tau2_rate_limit_retry_delay(attempt: int) -> float:
     return rate_limit_retry_delay(attempt)
 
 
+def _tau2_reasoning_only_diagnostics(response: Any) -> dict[str, Any] | None:
+    """Identify thinking without a usable reply in Tau2's normalized LiteLLM result."""
+    if (
+        (getattr(response, "content", None) or "").strip()
+        or (getattr(response, "audio_content", None) or "").strip()
+        or getattr(response, "tool_calls", None)
+    ):
+        return None
+    raw = getattr(response, "raw_data", None) or {}
+    choices = raw.get("choices") or []
+    if not choices:
+        return None
+    choice = choices[0]
+    message = choice.get("message") or {}
+    if choice.get("finish_reason") == "content_filter" or message.get("refusal"):
+        return None
+    reasoning = message.get("reasoning_content") or ""
+    thinking_blocks = message.get("thinking_blocks") or []
+    if not reasoning.strip() and not thinking_blocks:
+        return None
+    return {
+        "response_id": raw.get("id"),
+        "model": raw.get("model"),
+        "finish_reason": choice.get("finish_reason"),
+        "reasoning_chars": len(reasoning),
+        "thinking_block_count": len(thinking_blocks),
+        "usage": raw.get("usage"),
+    }
+
+
 def _wrap_tau2_generate_with_rate_limit_retry(generate: Callable[..., Any]) -> Callable[..., Any]:
     if getattr(generate, "_openviking_tau2_rate_limit_retry", False):
         return generate
@@ -41,9 +73,10 @@ def _wrap_tau2_generate_with_rate_limit_retry(generate: Callable[..., Any]) -> C
     @wraps(generate)
     def generate_with_rate_limit_retry(*args: Any, **kwargs: Any) -> Any:
         attempt = 1
+        reasoning_only_attempts = 0
         while True:
             try:
-                return generate(*args, **kwargs)
+                response = generate(*args, **kwargs)
             except Exception as exc:
                 if not _is_tau2_retryable_rate_limit_error(exc):
                     raise
@@ -56,6 +89,26 @@ def _wrap_tau2_generate_with_rate_limit_retry(generate: Callable[..., Any]) -> C
                 )
                 time.sleep(delay)
                 attempt += 1
+                continue
+
+            # Retry only the LLM call, before UserSimulator appends its response to history.
+            diagnostics = _tau2_reasoning_only_diagnostics(response)
+            if diagnostics is None:
+                return response
+            reasoning_only_attempts += 1
+            detail = json.dumps(diagnostics, ensure_ascii=False)
+            tracer.info(
+                "tau2 LiteLLM reasoning-only response "
+                f"attempt={reasoning_only_attempts} diagnostics={detail}"
+            )
+            if reasoning_only_attempts >= _TAU2_REASONING_ONLY_MAX_ATTEMPTS:
+                error = ValueError(
+                    "tau2 LiteLLM returned reasoning-only responses without content or tool calls "
+                    f"after {reasoning_only_attempts} attempts; diagnostics={detail}"
+                )
+                tracer.error(str(error), e=error, console=False)
+                raise error
+            time.sleep(_tau2_rate_limit_retry_delay(reasoning_only_attempts))
 
     generate_with_rate_limit_retry._openviking_tau2_rate_limit_retry = True
     generate_with_rate_limit_retry._openviking_original_generate = generate
@@ -63,7 +116,7 @@ def _wrap_tau2_generate_with_rate_limit_retry(generate: Callable[..., Any]) -> C
 
 
 def _install_tau2_litellm_rate_limit_retry() -> None:
-    """Patch tau2-bench's sync LiteLLM generate path with rate-limit retry.
+    """Retry rate limits and bounded reasoning-only replies in Tau2's sync generate path.
 
     AgentGymEnv's user simulator and orchestrator call tau2.utils.llm_utils.generate
     through synchronous module globals imported with ``from ... import generate``.
@@ -206,6 +259,10 @@ class Tau2BenchEnv:
         else:
             self._impl = _NativeTau2BenchEnv(domain, task_id)
 
+    @property
+    def execution_error(self) -> dict[str, str] | None:
+        return self._impl.execution_error
+
     def reset(self):
         self._impl.reset()
         self.env = self._impl.env
@@ -242,6 +299,35 @@ class _GymTau2BenchEnv:
             user_llm=os.getenv("TAU2_USER_LLM") or DEFAULT_TAU2_USER_LLM,
         )
         self.terminated = False
+        self._create_orchestrator = self.env._get_orchestrator
+        self.env._get_orchestrator = self._get_orchestrator
+
+    @property
+    def execution_error(self) -> dict[str, str] | None:
+        return getattr(self.env._orchestrator, "_openviking_execution_error", None)
+
+    def _get_orchestrator(self):
+        orchestrator = self._create_orchestrator()
+        run = orchestrator.run
+        orchestrator._openviking_execution_error = None
+
+        @wraps(run)
+        def run_with_error_tracking(*args, **kwargs):
+            try:
+                return run(*args, **kwargs)
+            except Exception as exc:
+                # Gym catches this exception and otherwise exposes an ordinary zero reward.
+                # Keep the marker on this instance so concurrent rollouts/resets cannot mix it.
+                orchestrator._openviking_execution_error = {
+                    "source": "tau2_simulator",
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                tracer.error("Tau2 simulator execution failed", e=exc, console=False)
+                raise
+
+        orchestrator.run = run_with_error_tracking
+        return orchestrator
 
     def reset(self):
         user_query, info_dict = self.env.reset()
@@ -300,6 +386,9 @@ class _GymTau2BenchEnv:
 
 
 class _NativeTau2BenchEnv:
+    # This adapter has no background simulator whose errors can be swallowed by Gym.
+    execution_error: dict[str, str] | None = None
+
     def __init__(self, domain: str, task_id: str):
         self.domain = domain
         self.task_id = task_id

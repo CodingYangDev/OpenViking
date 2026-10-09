@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 class HealthStatus(str, Enum):
     """Health check status."""
+
     PASS = "pass"
     WARN = "warn"
     FAIL = "fail"
@@ -30,6 +31,7 @@ class HealthStatus(str, Enum):
 @dataclass
 class HealthCheckResult:
     """Result of a single health check."""
+
     name: str
     status: HealthStatus
     message: str
@@ -49,6 +51,7 @@ class HealthCheckResult:
 @dataclass
 class HealthCheckReport:
     """Complete health check report."""
+
     overall_status: HealthStatus
     checks: List[HealthCheckResult]
     auth_mode: str
@@ -85,32 +88,39 @@ class OIDCAuthChecker(AuthHealthChecker):
 
     async def run_checks(self, config: ServerConfig) -> List[HealthCheckResult]:
         from time import time
+
         results: List[HealthCheckResult] = []
 
         if config.oidc is None:
-            results.append(HealthCheckResult(
-                name="OIDC config present",
-                status=HealthStatus.FAIL,
-                message="OIDC config missing, please add server.oidc to your ov.conf",
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="OIDC config present",
+                    status=HealthStatus.FAIL,
+                    message="OIDC config missing, please add server.oidc to your ov.conf",
+                )
+            )
             return results
 
         # Check 1: Issuer is present
         start_time = time()
         if not config.oidc.issuer:
-            results.append(HealthCheckResult(
-                name="OIDC Issuer configured",
-                status=HealthStatus.FAIL,
-                message="OIDC issuer not configured, please set server.oidc.issuer",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="OIDC Issuer configured",
+                    status=HealthStatus.FAIL,
+                    message="OIDC issuer not configured, please set server.oidc.issuer",
+                    duration_seconds=time() - start_time,
+                )
+            )
         else:
-            results.append(HealthCheckResult(
-                name="OIDC Issuer configured",
-                status=HealthStatus.PASS,
-                message=f"Issuer configured successfully: {config.oidc.issuer}",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="OIDC Issuer configured",
+                    status=HealthStatus.PASS,
+                    message=f"Issuer configured successfully: {config.oidc.issuer}",
+                    duration_seconds=time() - start_time,
+                )
+            )
 
         # Check 2: JWKS endpoint is accessible via OIDC Discovery.
         # Per OpenID Connect Discovery 1.0 we must fetch
@@ -123,9 +133,7 @@ class OIDCAuthChecker(AuthHealthChecker):
             if config.oidc.jwks_uri:
                 jwks_uri = config.oidc.jwks_uri
             else:
-                discovery_url = (
-                    f"{config.oidc.issuer.rstrip('/')}/.well-known/openid-configuration"
-                )
+                discovery_url = f"{config.oidc.issuer.rstrip('/')}/.well-known/openid-configuration"
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     disc_response = await client.get(discovery_url)
                     disc_response.raise_for_status()
@@ -133,8 +141,7 @@ class OIDCAuthChecker(AuthHealthChecker):
                 jwks_uri = metadata.get("jwks_uri")
                 if not jwks_uri:
                     raise RuntimeError(
-                        f"OIDC discovery document at {discovery_url} "
-                        "did not contain a jwks_uri"
+                        f"OIDC discovery document at {discovery_url} did not contain a jwks_uri"
                     )
 
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -143,50 +150,61 @@ class OIDCAuthChecker(AuthHealthChecker):
                 jwks = response.json()
                 keys = jwks.get("keys", [])
                 if not keys:
-                    results.append(HealthCheckResult(
-                        name="OIDC provider connection",
-                        status=HealthStatus.WARN,
-                        message="Connected to OIDC provider but no signing keys found",
-                        duration_seconds=time() - start_time,
-                    ))
+                    results.append(
+                        HealthCheckResult(
+                            name="OIDC provider connection",
+                            status=HealthStatus.WARN,
+                            message="Connected to OIDC provider but no signing keys found",
+                            duration_seconds=time() - start_time,
+                        )
+                    )
                 else:
-                    results.append(HealthCheckResult(
-                        name="OIDC provider connection",
-                        status=HealthStatus.PASS,
-                        message=(
-                            f"Successfully connected to OIDC provider via {jwks_uri}, "
-                            f"found {len(keys)} signing keys"
-                        ),
-                        duration_seconds=time() - start_time,
-                    ))
+                    results.append(
+                        HealthCheckResult(
+                            name="OIDC provider connection",
+                            status=HealthStatus.PASS,
+                            message=(
+                                f"Successfully connected to OIDC provider via {jwks_uri}, "
+                                f"found {len(keys)} signing keys"
+                            ),
+                            duration_seconds=time() - start_time,
+                        )
+                    )
         except Exception as e:
-            results.append(HealthCheckResult(
-                name="OIDC provider connection",
-                status=HealthStatus.WARN,
-                message=f"Could not connect to OIDC provider: {str(e)[:200]}",
-                error=e,
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="OIDC provider connection",
+                    status=HealthStatus.WARN,
+                    message=f"Could not connect to OIDC provider: {str(e)[:200]}",
+                    error=e,
+                    duration_seconds=time() - start_time,
+                )
+            )
 
         # Check 3: Identity mapping defaults are reasonable
         start_time = time()
         try:
             from openviking.server.auth.identity_mapping import IdentityMapper
+
             IdentityMapper(config.oidc.identity)
-            results.append(HealthCheckResult(
-                name="OIDC identity mapping config",
-                status=HealthStatus.PASS,
-                message="Identity mapping configuration is valid",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="OIDC identity mapping config",
+                    status=HealthStatus.PASS,
+                    message="Identity mapping configuration is valid",
+                    duration_seconds=time() - start_time,
+                )
+            )
         except Exception as e:
-            results.append(HealthCheckResult(
-                name="OIDC identity mapping config",
-                status=HealthStatus.WARN,
-                message=f"Identity mapping configuration has an issue: {str(e)}",
-                error=e,
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="OIDC identity mapping config",
+                    status=HealthStatus.WARN,
+                    message=f"Identity mapping configuration has an issue: {str(e)}",
+                    error=e,
+                    duration_seconds=time() - start_time,
+                )
+            )
 
         return results
 
@@ -199,37 +217,45 @@ class LDAPAuthChecker(AuthHealthChecker):
 
     async def run_checks(self, config: ServerConfig) -> List[HealthCheckResult]:
         from time import time
+
         results: List[HealthCheckResult] = []
 
         if config.ldap is None:
-            results.append(HealthCheckResult(
-                name="ldap_config_present",
-                status=HealthStatus.FAIL,
-                message="LDAP config is missing",
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="ldap_config_present",
+                    status=HealthStatus.FAIL,
+                    message="LDAP config is missing",
+                )
+            )
             return results
 
         # Check 1: Host is configured
         start_time = time()
         if not config.ldap.host:
-            results.append(HealthCheckResult(
-                name="ldap_host_configured",
-                status=HealthStatus.FAIL,
-                message="LDAP host is not configured",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="ldap_host_configured",
+                    status=HealthStatus.FAIL,
+                    message="LDAP host is not configured",
+                    duration_seconds=time() - start_time,
+                )
+            )
         else:
-            results.append(HealthCheckResult(
-                name="ldap_host_configured",
-                status=HealthStatus.PASS,
-                message=f"LDAP host configured: {config.ldap.host}:{config.ldap.port}",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="ldap_host_configured",
+                    status=HealthStatus.PASS,
+                    message=f"LDAP host configured: {config.ldap.host}:{config.ldap.port}",
+                    duration_seconds=time() - start_time,
+                )
+            )
 
         # Check 2: Can connect and bind
         start_time = time()
         try:
             import ldap
+
             protocol = "ldaps" if config.ldap.use_ssl else "ldap"
             ldap_url = f"{protocol}://{config.ldap.host}:{config.ldap.port}"
 
@@ -244,21 +270,25 @@ class LDAPAuthChecker(AuthHealthChecker):
 
             if config.ldap.bind_dn and config.ldap.bind_password:
                 conn.simple_bind_s(config.ldap.bind_dn, config.ldap.bind_password)
-                results.append(HealthCheckResult(
-                    name="ldap_connection",
-                    status=HealthStatus.PASS,
-                    message=f"Successfully connected and bound as {config.ldap.bind_dn}",
-                    duration_seconds=time() - start_time,
-                ))
+                results.append(
+                    HealthCheckResult(
+                        name="ldap_connection",
+                        status=HealthStatus.PASS,
+                        message=f"Successfully connected and bound as {config.ldap.bind_dn}",
+                        duration_seconds=time() - start_time,
+                    )
+                )
             else:
                 # Just test anonymous bind if no bind dn configured
                 conn.simple_bind_s("", "")
-                results.append(HealthCheckResult(
-                    name="ldap_connection",
-                    status=HealthStatus.PASS,
-                    message="Successfully connected anonymously (no bind dn configured)",
-                    duration_seconds=time() - start_time,
-                ))
+                results.append(
+                    HealthCheckResult(
+                        name="ldap_connection",
+                        status=HealthStatus.PASS,
+                        message="Successfully connected anonymously (no bind dn configured)",
+                        duration_seconds=time() - start_time,
+                    )
+                )
 
             try:
                 conn.unbind()
@@ -266,58 +296,71 @@ class LDAPAuthChecker(AuthHealthChecker):
                 pass
 
         except ImportError:
-            results.append(HealthCheckResult(
-                name="ldap_connection",
-                status=HealthStatus.FAIL,
-                message="python-ldap not installed, cannot test connection",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="ldap_connection",
+                    status=HealthStatus.FAIL,
+                    message="python-ldap not installed, cannot test connection",
+                    duration_seconds=time() - start_time,
+                )
+            )
         except Exception as e:
-            results.append(HealthCheckResult(
-                name="ldap_connection",
-                status=HealthStatus.WARN,
-                message=f"Failed to connect to LDAP: {str(e)[:200]}",
-                error=e,
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="ldap_connection",
+                    status=HealthStatus.WARN,
+                    message=f"Failed to connect to LDAP: {str(e)[:200]}",
+                    error=e,
+                    duration_seconds=time() - start_time,
+                )
+            )
 
         # Check 3: Base DN is configured
         start_time = time()
         if config.ldap.base_dn:
-            results.append(HealthCheckResult(
-                name="ldap_base_dn_configured",
-                status=HealthStatus.PASS,
-                message=f"Base DN configured: {config.ldap.base_dn}",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="ldap_base_dn_configured",
+                    status=HealthStatus.PASS,
+                    message=f"Base DN configured: {config.ldap.base_dn}",
+                    duration_seconds=time() - start_time,
+                )
+            )
         else:
-            results.append(HealthCheckResult(
-                name="ldap_base_dn_configured",
-                status=HealthStatus.FAIL,
-                message="Base DN is not configured",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="ldap_base_dn_configured",
+                    status=HealthStatus.FAIL,
+                    message="Base DN is not configured",
+                    duration_seconds=time() - start_time,
+                )
+            )
 
         # Check 4: Identity mapping is valid
         start_time = time()
         try:
             from openviking.server.auth.identity_mapping import IdentityMapper
+
             # Just initialize the mapper
             IdentityMapper(config.ldap.identity)
-            results.append(HealthCheckResult(
-                name="ldap_mapping_config_valid",
-                status=HealthStatus.PASS,
-                message="Identity mapping configuration is valid",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="ldap_mapping_config_valid",
+                    status=HealthStatus.PASS,
+                    message="Identity mapping configuration is valid",
+                    duration_seconds=time() - start_time,
+                )
+            )
         except Exception as e:
-            results.append(HealthCheckResult(
-                name="ldap_mapping_config_valid",
-                status=HealthStatus.WARN,
-                message=f"Identity mapping configuration check failed: {str(e)}",
-                error=e,
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="ldap_mapping_config_valid",
+                    status=HealthStatus.WARN,
+                    message=f"Identity mapping configuration check failed: {str(e)}",
+                    error=e,
+                    duration_seconds=time() - start_time,
+                )
+            )
 
         return results
 
@@ -330,24 +373,29 @@ class ApiKeyAuthChecker(AuthHealthChecker):
 
     async def run_checks(self, config: ServerConfig) -> List[HealthCheckResult]:
         from time import time
+
         results: List[HealthCheckResult] = []
 
         # Check: Root API key is configured
         start_time = time()
         if config.root_api_key:
-            results.append(HealthCheckResult(
-                name="api_key_root_key_configured",
-                status=HealthStatus.PASS,
-                message="Root API key is configured",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="api_key_root_key_configured",
+                    status=HealthStatus.PASS,
+                    message="Root API key is configured",
+                    duration_seconds=time() - start_time,
+                )
+            )
         else:
-            results.append(HealthCheckResult(
-                name="api_key_root_key_configured",
-                status=HealthStatus.WARN,
-                message="Root API key is not configured (will auto-select dev mode)",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="api_key_root_key_configured",
+                    status=HealthStatus.WARN,
+                    message="Root API key is not configured (will auto-select dev mode)",
+                    duration_seconds=time() - start_time,
+                )
+            )
 
         return results
 
@@ -360,16 +408,19 @@ class TrustedAuthChecker(AuthHealthChecker):
 
     async def run_checks(self, config: ServerConfig) -> List[HealthCheckResult]:
         from time import time
+
         results: List[HealthCheckResult] = []
 
         # Basic config check
         start_time = time()
-        results.append(HealthCheckResult(
-            name="trusted_config_valid",
-            status=HealthStatus.PASS,
-            message="Trusted mode configuration is valid",
-            duration_seconds=time() - start_time,
-        ))
+        results.append(
+            HealthCheckResult(
+                name="trusted_config_valid",
+                status=HealthStatus.PASS,
+                message="Trusted mode configuration is valid",
+                duration_seconds=time() - start_time,
+            )
+        )
 
         return results
 
@@ -382,24 +433,29 @@ class DevAuthChecker(AuthHealthChecker):
 
     async def run_checks(self, config: ServerConfig) -> List[HealthCheckResult]:
         from time import time
+
         results: List[HealthCheckResult] = []
 
         # Check host is localhost
         start_time = time()
         if config.host in ["localhost", "127.0.0.1", "::1"]:
-            results.append(HealthCheckResult(
-                name="dev_host_local",
-                status=HealthStatus.PASS,
-                message=f"Host is set to loopback: {config.host}",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="dev_host_local",
+                    status=HealthStatus.PASS,
+                    message=f"Host is set to loopback: {config.host}",
+                    duration_seconds=time() - start_time,
+                )
+            )
         else:
-            results.append(HealthCheckResult(
-                name="dev_host_local",
-                status=HealthStatus.WARN,
-                message=f"Dev mode should be used with localhost only, current host: {config.host}",
-                duration_seconds=time() - start_time,
-            ))
+            results.append(
+                HealthCheckResult(
+                    name="dev_host_local",
+                    status=HealthStatus.WARN,
+                    message=f"Dev mode should be used with localhost only, current host: {config.host}",
+                    duration_seconds=time() - start_time,
+                )
+            )
 
         return results
 
@@ -443,11 +499,13 @@ async def run_health_check(config: ServerConfig, fail_on_warn: bool = False) -> 
         logger.warning("No health checker registered for auth mode: %s", auth_mode)
         return HealthCheckReport(
             overall_status=HealthStatus.PASS,
-            checks=[HealthCheckResult(
-                name="no_checker",
-                status=HealthStatus.PASS,
-                message=f"No health checker available for mode: {auth_mode}",
-            )],
+            checks=[
+                HealthCheckResult(
+                    name="no_checker",
+                    status=HealthStatus.PASS,
+                    message=f"No health checker available for mode: {auth_mode}",
+                )
+            ],
             auth_mode=auth_mode,
             summary=f"No health checks available for auth mode: {auth_mode}",
         )

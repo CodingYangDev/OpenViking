@@ -8,11 +8,14 @@ import json
 import logging
 import os
 import threading
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from loguru import logger
+
+_trace_only_errors: ContextVar[bool] = ContextVar("trace_only_errors", default=False)
 
 # Try to import opentelemetry - will be None if not installed
 try:
@@ -673,9 +676,19 @@ class tracer:
             pass
 
     @staticmethod
+    @asynccontextmanager
+    async def errors_to_trace():
+        """Keep errors in spans without console output inside this async call tree."""
+        token = _trace_only_errors.set(True)
+        try:
+            yield
+        finally:
+            _trace_only_errors.reset(token)
+
+    @staticmethod
     def error(line: str, e: Optional[Exception] = None, console: bool = True) -> None:
         """Record an error on the current span."""
-        if console:
+        if console and not _trace_only_errors.get():
             if e is not None:
                 logger.opt(depth=1).exception(f"{line}", exc_info=e)
             else:

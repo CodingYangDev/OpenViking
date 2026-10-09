@@ -12,13 +12,47 @@ from openviking.session.memory.extraction_output_protocol.base import (
     ExtractionOutputProtocol,
 )
 from openviking.session.memory.tools import add_tool_call_pair_to_messages
-from openviking.session.memory.utils import parse_json_with_stability
+from openviking.session.memory.utils import (
+    parse_json_with_stability,
+    split_content_lines,
+    strip_line_numbers,
+)
+
+
+def _strip_numbered_read_copy(content: str) -> str:
+    stripped = strip_line_numbers(content)
+    if stripped == content:
+        return content
+
+    line_pairs = zip(split_content_lines(content), split_content_lines(stripped), strict=True)
+    nonempty_pairs = [(original, clean) for original, clean in line_pairs if original]
+    if len(nonempty_pairs) >= 2 and all(original != clean for original, clean in nonempty_pairs):
+        return stripped
+    if nonempty_pairs and all(clean.startswith("- ") for _, clean in nonempty_pairs):
+        return stripped
+    return content
+
+
+def _strip_numbered_read_copies(operations: Any, context: ExtractionOutputContext) -> None:
+    """Keep read-tool display prefixes out of complete memory content values."""
+    for memory_type in getattr(context.operations_model, "_memory_type_fields", ()):
+        for operation in getattr(operations, memory_type, ()) or ():
+            content = getattr(operation, "content", None)
+            if isinstance(content, str):
+                operation.content = _strip_numbered_read_copy(content)
 
 
 class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
     """Preserve the existing JSON prompt and tolerant parsing behavior."""
 
     name = "json"
+
+    def render_prefetch_messages(
+        self, messages: list[dict[str, Any]], context: ExtractionOutputContext
+    ) -> list[dict[str, Any]]:
+        # Register the named results while preserving the original JSON transport verbatim.
+        super().render_prefetch_messages(messages, context)
+        return list(messages)
 
     def render_tool_result_messages(
         self,
@@ -30,7 +64,7 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
         result: Any,
         source: str,
     ) -> list[dict[str, Any]]:
-        del context, source
+        del source
         messages: list[dict[str, Any]] = []
         add_tool_call_pair_to_messages(
             messages,
@@ -39,6 +73,11 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
             params=params,
             result=result,
         )
+        if not (isinstance(result, dict) and isinstance(result.get("error"), str)):
+            bindings = (
+                result if tool_name == "eval" and isinstance(result, dict) else {tool_name: result}
+            )
+            context.memory_eval_bindings.update(bindings)
         return messages
 
     def render_contract(self, context: ExtractionOutputContext) -> str:
@@ -71,11 +110,14 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
     def parse(
         self, content: str, context: ExtractionOutputContext
     ) -> tuple[Any | None, str | None]:
-        return parse_json_with_stability(
+        operations, error = parse_json_with_stability(
             content=content,
             model_class=context.operations_model,
             expected_fields=list(context.operations_model.model_fields),
         )
+        if operations is not None:
+            _strip_numbered_read_copies(operations, context)
+        return operations, error
 
     def render_final_instruction(self, context: ExtractionOutputContext) -> str:
         fields = ["delete_ids", *context.operations_model.model_fields]

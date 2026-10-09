@@ -893,7 +893,7 @@ class DirectoryParser(BaseParser):
         if preserve_structure:
             parent = str(PurePosixPath(classified_file.rel_path).parent)
             dest = (
-                    _normalize_output_target(f"{target_uri}/{parent}", target_writer)
+                _normalize_output_target(f"{target_uri}/{parent}", target_writer)
                 if parent != "."
                 else target_uri
             )
@@ -1010,9 +1010,7 @@ class DirectoryParser(BaseParser):
             try:
                 content = detect_and_convert_encoding(src_file.read_bytes(), src_file)
                 if preserve_structure:
-                    dst_uri = _normalize_output_target(
-                        f"{target_uri}/{rel_path}", target_writer
-                    )
+                    dst_uri = _normalize_output_target(f"{target_uri}/{rel_path}", target_writer)
                 else:
                     dst_uri = _normalize_output_target(
                         f"{target_uri}/{PurePosixPath(rel_path).name}",

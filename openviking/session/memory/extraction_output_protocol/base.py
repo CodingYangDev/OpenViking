@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -32,7 +34,10 @@ class ExtractionOutputContext:
     link_enabled: bool
     role_scope: Any | None = None
     available_tools: tuple[str, ...] = ()
+    # Populated only by a successfully parsed Python create_* program.
+    create_page_ids: set[int] = field(default_factory=set)
     template_context: dict[str, Any] = field(default_factory=dict)
+    memory_eval_bindings: dict[str, Any] = field(default_factory=dict)
 
 
 class ExtractionOutputProtocol(ABC):
@@ -75,6 +80,14 @@ class ExtractionOutputProtocol(ABC):
         this protocol's own output shape (JSON object vs restricted Python SDK).
         """
 
+    def get_memory_eval_bindings(self, context: ExtractionOutputContext) -> dict[str, Any]:
+        """Snapshot server-provided result variables for the read-only eval tool."""
+        return deepcopy(context.memory_eval_bindings)
+
+    def render_binding_index(self) -> str:
+        """Render a current access-expression index, without adding it to message history."""
+        return ""
+
     def render_new_bindings(self, context: ExtractionOutputContext, *, source: str) -> str:
         """Render newly available existing-memory references, if the protocol needs them."""
         del context, source
@@ -98,9 +111,50 @@ class ExtractionOutputProtocol(ABC):
         messages: list[dict[str, Any]],
         context: ExtractionOutputContext,
     ) -> list[dict[str, Any]]:
-        """Render provider-prefetched context in this protocol's model-facing form."""
-        del context
-        return list(messages)
+        rendered: list[dict[str, Any]] = []
+        pending: dict[str, dict[str, Any]] = {}
+        seen_ids: set[str] = set()
+        for message in messages:
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                if pending:
+                    raise ValueError("Prefetch started a tool call before answering prior calls")
+                for call in message["tool_calls"]:
+                    call_id = call["id"]
+                    if call_id in seen_ids:
+                        raise ValueError(f"Duplicate prefetch tool call ID: {call_id}")
+                    seen_ids.add(call_id)
+                    pending[call_id] = call["function"]
+                rendered.append(message)
+            elif message.get("role") == "tool":
+                call_id = message["tool_call_id"]
+                call = pending.pop(call_id, None)
+                if call is None:
+                    raise ValueError(f"Prefetch tool result has no matching request: {call_id}")
+                pair = self.render_tool_result_messages(
+                    context,
+                    call_id=call_id,
+                    tool_name=call["name"],
+                    params=json.loads(call["arguments"]),
+                    result=json.loads(message["content"]),
+                    source="prefetch",
+                )
+                rendered.extend(item for item in pair if item["role"] == "tool")
+            else:
+                if pending:
+                    raise ValueError("Prefetch context interrupted pending tool results")
+                rendered.append(self._normalize_message_instruction(message))
+        if pending:
+            raise ValueError("Prefetch tool calls are missing results")
+        return rendered
+
+    def _normalize_message_instruction(self, message: dict[str, Any]) -> dict[str, Any]:
+        content = message.get("content")
+        if not isinstance(content, str):
+            return message
+        normalized = self.normalize_provider_instruction(content)
+        if normalized == content:
+            return message
+        return {**message, "content": normalized}
 
     def normalize_provider_instruction(self, instruction: str) -> str:
         """Adapt provider-specific output wording to this protocol."""

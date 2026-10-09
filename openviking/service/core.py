@@ -117,6 +117,7 @@ class OpenVikingService:
         )
         self._pack_service = PackService()
         self._search_service = SearchService()
+        self._search_service.set_agent_evolution_config(self._agent_evolution_base_config)
         self._resource_memory_link_service = ResourceMemoryLinkService()
         self._resource_service = ResourceService()
         self._session_service = SessionService()
@@ -252,6 +253,7 @@ class OpenVikingService:
         """Set the legacy server value used as the cluster startup baseline."""
         self._agent_evolution_base_config = config.model_copy(deep=True)
         self._session_service.set_agent_evolution_config(config)
+        self._search_service.set_agent_evolution_config(config)
 
     async def apply_agent_evolution_config(self) -> None:
         """Apply the legacy server value to an already initialized manager."""
@@ -309,6 +311,7 @@ class OpenVikingService:
             consumer=self._on_account_vector_config_change,
         )
         self._session_service.set_runtime_config_manager(manager)
+        self._search_service.set_runtime_config_manager(manager)
         self._vlm_resolver = AccountVLMProvider(manager)
         if self._queue_manager is not None:
             self._queue_manager.set_vlm_resolver(self._vlm_resolver)
@@ -562,7 +565,9 @@ class OpenVikingService:
             session_compressor=self._session_compressor,
             vlm_resolver=self._vlm_resolver,
         )
-        self._session_service.set_jev_config(config.jev)
+        self._search_service.set_advice_dependencies(
+            vlm_resolver=self._vlm_resolver, jev_config=config.jev
+        )
         self._resource_memory_link_service.set_dependencies(
             vikingdb=self._vikingdb_manager,
             viking_fs=self._viking_fs,
@@ -592,6 +597,7 @@ class OpenVikingService:
         self._agent_evolution_service.set_dependencies(
             vikingdb=self._vikingdb_manager,
             viking_fs=self._viking_fs,
+            session_compressor=self._session_compressor,
         )
 
         if self._queue_manager:
@@ -665,6 +671,7 @@ class OpenVikingService:
 
     async def close(self) -> None:
         """Close OpenViking and release resources."""
+        await self._agent_evolution_service.close_background_tasks()
         await self._resource_service.close_background_tasks()
         vlm_resolver = getattr(self, "_vlm_resolver", None)
 

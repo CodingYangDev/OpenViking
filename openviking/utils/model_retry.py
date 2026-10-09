@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import re
 import threading
 import time
+from functools import lru_cache
 from typing import Awaitable, Callable, TypeVar
 
 from openviking.pyagfs.exceptions import AGFSNotADirectoryError
@@ -275,6 +277,11 @@ def classify_api_error(error: Exception) -> str:
             if pattern in text_lower:
                 return ERROR_CLASS_QUOTA_EXCEEDED
 
+    # SDK timeouts can say "Request timed out." and transport causes may be empty.
+    # Preserve the permanent/auth/quota classifications above before checking types.
+    if is_retryable_timeout_error(error):
+        return ERROR_CLASS_TRANSIENT
+
     for text in texts:
         text_lower = text.lower()
         text_compact = text_lower.replace(" ", "")
@@ -288,6 +295,41 @@ def classify_api_error(error: Exception) -> str:
 def is_retryable_api_error(error: Exception) -> bool:
     """Return True if the error should be retried."""
     return classify_api_error(error) == ERROR_CLASS_TRANSIENT
+
+
+@lru_cache(maxsize=1)
+def _timeout_error_classes() -> tuple[type[BaseException], ...]:
+    import httpcore
+    import httpx
+
+    classes: list[type[BaseException]] = [
+        TimeoutError,
+        asyncio.TimeoutError,
+        httpx.TimeoutException,
+        httpcore.TimeoutException,
+    ]
+    try:
+        from openai import APITimeoutError
+
+        classes.append(APITimeoutError)
+    except ImportError:
+        pass
+    try:
+        from volcenginesdkarkruntime._exceptions import ArkAPITimeoutError
+
+        classes.append(ArkAPITimeoutError)
+    except ImportError:
+        pass
+    return tuple(classes)
+
+
+def is_retryable_timeout_error(error: BaseException) -> bool:
+    """Recognize typed SDK/transport timeouts without relying on exception text."""
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int) and 400 <= status < 500 and status != 429:
+        return False  # A rejected request is not retryable because of an earlier timeout.
+    classes = _timeout_error_classes()
+    return any(isinstance(exc, classes) for exc in _iter_exception_chain(error))
 
 
 def _load_rate_limit_error_classes() -> tuple[type[BaseException], ...]:
@@ -372,9 +414,15 @@ def is_retryable_rate_limit_error(exc: BaseException) -> bool:
 
 def rate_limit_retry_delay(attempt: int) -> float:
     """Exponential backoff delay with jitter for LLM rate-limit retries."""
+    max_exponent = max(
+        0,
+        math.ceil(
+            math.log2(RATE_LIMIT_RETRY_MAX_DELAY_SECONDS / RATE_LIMIT_RETRY_BASE_DELAY_SECONDS)
+        ),
+    )
     delay = min(
         RATE_LIMIT_RETRY_MAX_DELAY_SECONDS,
-        RATE_LIMIT_RETRY_BASE_DELAY_SECONDS * (2 ** max(0, attempt - 1)),
+        RATE_LIMIT_RETRY_BASE_DELAY_SECONDS * (2 ** min(max(0, attempt - 1), max_exponent)),
     )
     return delay * random.uniform(0.8, 1.2)
 

@@ -358,7 +358,9 @@ class _GrepMixin:
         """VikingDB bm25 recall + local fs precise matching."""
         vector_store = self._get_vector_store()
         tags_by_uri: Dict[str, List[str]] = {}
-        output_fields = ["uri", "search_tags"] if tag_filter is not None or include_tags else ["uri"]
+        output_fields = (
+            ["uri", "search_tags"] if tag_filter is not None or include_tags else ["uri"]
+        )
 
         # Split regex alternation (e.g. "error|warning|fail") and join as a
         # single query string for bm25 search. VikingDB's standard tokenizer
@@ -905,14 +907,12 @@ class _GrepMixin:
         if before_context > 0:
             start = max(0, line_index - before_context)
             match["before_context"] = [
-                {"line": index + 1, "content": lines[index]}
-                for index in range(start, line_index)
+                {"line": index + 1, "content": lines[index]} for index in range(start, line_index)
             ]
         if after_context > 0:
             end = min(len(lines), line_index + after_context + 1)
             match["after_context"] = [
-                {"line": index + 1, "content": lines[index]}
-                for index in range(line_index + 1, end)
+                {"line": index + 1, "content": lines[index]} for index in range(line_index + 1, end)
             ]
         return match
 

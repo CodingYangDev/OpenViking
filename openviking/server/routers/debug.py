@@ -51,9 +51,7 @@ async def debug_vector_scroll(
     """Get paginated vector records with tenant isolation."""
     service = get_service()
     if not service.vikingdb_manager:
-        return error_response(
-            code="NO_VECTOR_DB", message="Vector DB not initialized"
-        )
+        return error_response(code="NO_VECTOR_DB", message="Vector DB not initialized")
 
     proxy = VikingDBManagerProxy(service.vikingdb_manager, _ctx)
 
@@ -79,9 +77,7 @@ async def debug_vector_count(
 
     service = get_service()
     if not service.vikingdb_manager:
-        return error_response(
-            code="NO_VECTOR_DB", message="Vector DB not initialized"
-        )
+        return error_response(code="NO_VECTOR_DB", message="Vector DB not initialized")
 
     proxy = VikingDBManagerProxy(service.vikingdb_manager, _ctx)
 
@@ -90,9 +86,7 @@ async def debug_vector_count(
         try:
             filter_expr = json.loads(filter)
         except json.JSONDecodeError:
-            return error_response(
-                code="INVALID_FILTER", message="Invalid filter JSON"
-            )
+            return error_response(code="INVALID_FILTER", message="Invalid filter JSON")
 
     if uri:
         # Resolve path variables before using URI

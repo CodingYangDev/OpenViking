@@ -1,35 +1,43 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Generate a fixed Case Experience proposal directly from a Session."""
+"""Generate a fixed Case Experience from factual Trajectory comparisons."""
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from openviking.config.vlm import VLMResolver
 from openviking.message import Message
 from openviking.server.identity import RequestContext
-from openviking.session.memory.agent_experience_context_provider import (
-    AgentExperienceContextProvider,
-)
-from openviking.session.memory.dataclass import MemoryFile, StoredLink
-from openviking.session.memory.experience_dag import (
+from openviking.session.memory.dataclass import StoredLink
+from openviking.session.memory.experience.compiler import compile_dag
+from openviking.session.memory.experience.dag import (
     MAX_EVIDENCE_SUMMARY_CHARS,
+    Dag,
+    TellAgent,
     clip_evidence_summary,
     tool_evidence_summary,
 )
+from openviking.session.memory.experience.experience_context import (
+    AgentExperienceContextProvider,
+)
 from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
+from openviking.session.memory.streaming_memory_updater import render_operation_after_file
 from openviking.session.memory.utils.uri import generate_uri
-from openviking.session.train.components.experience_improvement_gate import (
+from openviking.session.train.domain import ExperienceSet, RolloutAnalysis
+from openviking.session.train.gates.experience import (
     EXPERIENCE_GATE_CONTEXTS_KEY,
 )
-from openviking.session.train.domain import ExperienceSet, RolloutAnalysis
 from openviking.session.train.gradients import PatchSemanticGradient
 from openviking.session.train.utils import safe_int
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
+
+_IDENTIFIER_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{5,64}(?![A-Za-z0-9_-])")
 
 
 @dataclass(slots=True)
@@ -59,17 +67,24 @@ class ExperienceGradientEstimator:
         rollout = analysis.rollout
         if rollout is None:
             raise ValueError("Experience learning requires the source Session rollout and Case")
+        if not analysis.trajectories:
+            raise ValueError("Experience learning requires persisted Trajectories")
         session_uri = str(analysis.metadata.get("source_session_uri") or "")
         if not session_uri:
             raise ValueError("Experience learning requires a source Session archive URI")
         provider = AgentExperienceContextProvider(
-            messages=rollout.messages,
+            messages=[],
             memory_registry=context.memory_registry,
             case=rollout.case,
             target_uri="",
             source_session_uri=session_uri,
             evaluation=analysis.evaluation,
             dag_execution=analysis.metadata.get("experience_execution"),
+            trajectories=analysis.trajectories,
+            current_trajectory_uris=set(
+                analysis.metadata.get("current_trajectory_uris")
+                or [trajectory.uri for trajectory in analysis.trajectories]
+            ),
         )
         provider._ctx = context.request_context
         schema = provider._get_registry().get("experiences")
@@ -104,18 +119,28 @@ class ExperienceGradientEstimator:
             or fields.get("supersedes")
         ):
             raise ValueError("Experience proposal changed the fixed canonical Case target")
+        after_file = await render_operation_after_file(
+            op, schema=schema, extract_context=provider.get_extract_context()
+        )
+        # Training plans use a full candidate with its observed base version;
+        # raw memory updates keep their patch until the locked write boundary.
+        fields["content"] = after_file.content
         if not str(fields.get("content") or "").strip():
             raise ValueError("Experience proposal has empty DAG content")
+        leaked_identifiers = _session_identifier_leaks(str(fields["content"]), analysis)
+        if leaked_identifiers:
+            analysis.metadata["experience_synthesis_noop"] = {
+                "reason": "candidate copied session-specific identifiers into reminders",
+                "identifiers": leaked_identifiers,
+            }
+            tracer.info(
+                "Skipping Experience proposal containing session-specific identifiers: "
+                f"target={target_uri} count={len(leaked_identifiers)}"
+            )
+            return []
         old_file = op.old_memory_file_content
-        after_file = MemoryFile(
-            uri=target_uri,
-            content=fields["content"],
-            memory_type="experiences",
-            extra_fields={
-                **{k: v for k, v in fields.items() if k != "content"},
-                "memory_type": "experiences",
-                "case_name": rollout.case.name,
-            },
+        after_file.extra_fields.update(
+            {"memory_type": "experiences", "case_name": rollout.case.name}
         )
         current = next((p for p in experience_set.policies if p.uri == target_uri), None)
         evaluation = analysis.evaluation
@@ -143,10 +168,11 @@ class ExperienceGradientEstimator:
                 links=[
                     StoredLink(
                         from_uri=target_uri,
-                        to_uri=session_uri,
+                        to_uri=trajectory.uri,
                         link_type="derived_from",
                         weight=1.0,
                     )
+                    for trajectory in analysis.trajectories
                 ],
                 confidence=0.7,
                 metadata={
@@ -242,4 +268,41 @@ def _is_training_control_message(content: str) -> bool:
         text.startswith("# OpenViking Batch Training CaseSpec")
         or text.startswith("# OpenViking OutcomeEvaluation")
         or text.startswith("[Rollout Evaluation]")
+    )
+
+
+def _session_identifier_leaks(
+    candidate_source: str,
+    analysis: RolloutAnalysis,
+) -> list[str]:
+    """Find entity-like identifiers copied from Session evidence into tell reminders."""
+    compiled = Dag.model_validate_json(compile_dag(candidate_source))
+    reminder_text = "\n".join(
+        node.slot_provider.instruction
+        for node in compiled.nodes.values()
+        if isinstance(node.slot_provider, TellAgent)
+    ).casefold()
+    if not reminder_text:
+        return []
+    rollout = analysis.rollout
+    source_payload = {
+        "case_input": rollout.case.input if rollout is not None else {},
+        "trajectories": [
+            {
+                "content": trajectory.content,
+                "evaluation_criteria": trajectory.metadata.get("evaluation_criteria", []),
+            }
+            for trajectory in analysis.trajectories
+        ],
+    }
+    source_text = json.dumps(source_payload, ensure_ascii=False, default=str)
+    identifiers = {
+        match.group(0)
+        for match in _IDENTIFIER_TOKEN_RE.finditer(source_text)
+        if any(character.isalpha() for character in match.group(0))
+        and any(character.isdigit() for character in match.group(0))
+    }
+    return sorted(
+        (identifier for identifier in identifiers if identifier.casefold() in reminder_text),
+        key=str.casefold,
     )

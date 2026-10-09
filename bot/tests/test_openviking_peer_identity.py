@@ -1,5 +1,7 @@
+from types import SimpleNamespace
+
 import pytest
-from vikingbot.openviking_mount.ov_server import VikingClient
+from vikingbot.openviking_mount.ov_server import VikingClient, extract_memories
 
 TELEGRAM_ALICE_PEER_ID = "ext-dGVsZWdyYW06YWxpY2U"
 
@@ -453,3 +455,19 @@ async def test_search_with_peer_id_uses_peer_target_uri_without_forwarding_peer_
             "limit": 3,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (None, []),
+        ([], []),
+        ([{"uri": "viking://memory"}], [{"uri": "viking://memory"}]),
+        ({"memories": [{"uri": "viking://memory"}]}, [{"uri": "viking://memory"}]),
+        (SimpleNamespace(memories=[{"uri": "viking://memory"}]), [{"uri": "viking://memory"}]),
+        ({"memories": "invalid"}, []),
+        (SimpleNamespace(memories=None), []),
+    ],
+)
+def test_extract_memories_accepts_supported_result_shapes(result, expected):
+    assert extract_memories(result) == expected

@@ -17,6 +17,19 @@ if TYPE_CHECKING:
 viking_resource_prefix = "viking://resources/"
 
 
+def extract_memories(result: Any) -> list[Any]:
+    """Normalize list, HTTP-dict and SDK memory search results at the client boundary."""
+    if not result:
+        return []
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        memories = result.get("memories")
+        return memories if isinstance(memories, list) else []
+    memories = getattr(result, "memories", None)
+    return memories if isinstance(memories, list) else []
+
+
 def _is_session_key(agent_id: Optional[str]) -> bool:
     return agent_id is not None and "__" in agent_id
 
@@ -814,17 +827,6 @@ class VikingClient:
     ) -> list[Any] | dict[str, list[Any]]:
         """通过上下文消息检索用户 memory。"""
 
-        def _extract_memories(result: Any) -> list[Any]:
-            if not result:
-                return []
-            if isinstance(result, list):
-                return result
-            if isinstance(result, dict):
-                memories = result.get("memories")
-                return memories if isinstance(memories, list) else []
-            memories = getattr(result, "memories", None)
-            return memories if isinstance(memories, list) else []
-
         if user_ids is None:
             normalized_user_ids: list[str] = []
         elif isinstance(user_ids, str):
@@ -861,7 +863,7 @@ class VikingClient:
                 client, should_close = await self._get_user_scoped_client(scoped_user_id)
             try:
                 user_memory = await client.find(**find_kwargs)
-                all_user_memories.extend(_extract_memories(user_memory))
+                all_user_memories.extend(extract_memories(user_memory))
             finally:
                 if should_close:
                     await client.close()
@@ -875,7 +877,7 @@ class VikingClient:
             )
             return {
                 "user_memory": all_user_memories,
-                "agent_memory": _extract_memories(agent_memory),
+                "agent_memory": extract_memories(agent_memory),
             }
 
         return all_user_memories
@@ -1154,20 +1156,25 @@ class VikingClient:
         client = await self._session_client_for_user(user_id)
         return await client.get_session(session_id)
 
-    async def search_exp(
+    async def search_advice(
         self,
-        session_id: str,
-        context: str,
-        evidence: list[dict[str, Any]],
+        state: list[dict[str, Any]],
         *,
+        query: str,
+        experience_names: list[str] | None = None,
         limit: int = 3,
+        score_threshold: float | None = 0.15,
     ) -> Dict[str, Any]:
         client = await self._session_client_for_user(None)
-        return await client.search_exp(
-            session_id,
-            context,
-            evidence=evidence,
+        return await client.search(
+            query=query,
             limit=limit,
+            options={
+                "mode": "advice",
+                "state": state,
+                "experience_names": experience_names or [],
+                "score_threshold": score_threshold,
+            },
         )
 
     async def get_session_context(

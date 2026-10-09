@@ -145,12 +145,15 @@ class AsyncHTTPClient(import_openviking_sdk().AsyncHTTPClient):
         session_id: str,
         *,
         memory_extraction_config: Dict[str, Any] | None = None,
+        extraction_context: Any = _SESSION_CONFIG_UNSET,
         auto_commit_policy: Any = _SESSION_CONFIG_UNSET,
         telemetry: Any = False,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {}
         if memory_extraction_config is not None:
             payload["memory_extraction_config"] = memory_extraction_config
+        if extraction_context is not _SESSION_CONFIG_UNSET:
+            payload["extraction_context"] = extraction_context
         if auto_commit_policy is not _SESSION_CONFIG_UNSET:
             payload["auto_commit_policy"] = auto_commit_policy
         if telemetry is not False:
@@ -160,28 +163,6 @@ class AsyncHTTPClient(import_openviking_sdk().AsyncHTTPClient):
             "PATCH",
             f"/api/v1/sessions/{session_path}/config",
             json=payload,
-        )
-        return self._handle_response_data(response).get("result", {})
-
-    async def search_exp(
-        self,
-        session_id: str,
-        context: str,
-        *,
-        evidence: list[dict[str, Any]] | None = None,
-        limit: int = 3,
-        score_threshold: float | None = 0.3,
-    ) -> Dict[str, Any]:
-        """Select applicable Experience DAGs and return current instructions."""
-        response = await self._request(
-            "POST",
-            f"/api/v1/sessions/{self._path_segment(session_id)}/experiences/search",
-            json={
-                "context": context,
-                "evidence": evidence or [],
-                "limit": limit,
-                "score_threshold": score_threshold,
-            },
         )
         return self._handle_response_data(response).get("result", {})
 
@@ -225,30 +206,12 @@ class SyncHTTPClient(import_openviking_sdk().SyncHTTPClient):
         super().__init__(*args, **kwargs)
         self._async_client = AsyncHTTPClient(*args, **kwargs)
 
-    def search_exp(
-        self,
-        session_id: str,
-        context: str,
-        *,
-        evidence: list[dict[str, Any]] | None = None,
-        limit: int = 3,
-        score_threshold: float | None = 0.3,
-    ) -> Dict[str, Any]:
-        return run_async(
-            self._async_client.search_exp(
-                session_id,
-                context,
-                evidence=evidence,
-                limit=limit,
-                score_threshold=score_threshold,
-            )
-        )
-
     def update_session_config(
         self,
         session_id: str,
         *,
         memory_extraction_config: Dict[str, Any] | None = None,
+        extraction_context: Any = _SESSION_CONFIG_UNSET,
         auto_commit_policy: Any = _SESSION_CONFIG_UNSET,
         telemetry: Any = False,
     ) -> Dict[str, Any]:
@@ -256,6 +219,8 @@ class SyncHTTPClient(import_openviking_sdk().SyncHTTPClient):
             "memory_extraction_config": memory_extraction_config,
             "telemetry": telemetry,
         }
+        if extraction_context is not _SESSION_CONFIG_UNSET:
+            kwargs["extraction_context"] = extraction_context
         if auto_commit_policy is not _SESSION_CONFIG_UNSET:
             kwargs["auto_commit_policy"] = auto_commit_policy
         return run_async(self._async_client.update_session_config(session_id, **kwargs))

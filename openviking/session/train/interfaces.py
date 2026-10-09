@@ -65,6 +65,17 @@ class PolicyOptimizer(Protocol):
     ) -> PolicyUpdatePlan: ...
 
 
+class PolicyProposalGate(Protocol):
+    """Filters semantic proposals before they are assembled into a policy plan."""
+
+    async def validate_proposals(
+        self,
+        gradients: list[SemanticGradient],
+        policy_set: PolicySet,
+        context: Any,
+    ) -> tuple[list[SemanticGradient], dict[str, Any]]: ...
+
+
 class PolicyUpdateGate(Protocol):
     """Validates an optimized policy plan before it is applied."""
 
@@ -145,6 +156,17 @@ class PolicyTrainer(Protocol):
         policy_set: PolicySet,
         context: Any,
         analyses: list[RolloutAnalysis] | None = None,
+    ) -> RolloutTrainingResult: ...
+
+
+class ExperienceLearner(Protocol):
+    """Phase 2: learn from the complete set of Phase 1 results for an epoch."""
+
+    async def learn(
+        self,
+        batches: list[RolloutTrainingResult],
+        policy_set: PolicySet,
+        context: Any,
     ) -> RolloutTrainingResult: ...
 
 

@@ -198,9 +198,7 @@ class IMutiTableStore(ABC):
         """
         yield from self.read_all(table_name)
 
-    def iter_seek_to_end(
-        self, start_key: str, table_name: str
-    ) -> Iterator[Tuple[str, bytes]]:
+    def iter_seek_to_end(self, start_key: str, table_name: str) -> Iterator[Tuple[str, bytes]]:
         """Lazily iterate a table from ``start_key`` to the end, with a
         materializing compatibility fallback.
 

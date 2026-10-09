@@ -98,7 +98,9 @@ class _AnyDocMarkdownRenderer:
         return assets
 
     def render(self) -> str:
-        parts = [part for block in _items(self.document.blocks) if (part := self._render_block(block))]
+        parts = [
+            part for block in _items(self.document.blocks) if (part := self._render_block(block))
+        ]
         parts.extend(self._render_note_definitions())
         markdown = "\n\n".join(parts)
         return f"{markdown}\n" if markdown else ""
@@ -172,8 +174,7 @@ class _AnyDocMarkdownRenderer:
             if _kind(inline) == "checkbox" and index + 1 < len(normalized):
                 next_inline = normalized[index + 1]
                 starts_with_space = (
-                    isinstance(next_inline, _TextRun)
-                    and next_inline.text[0].isspace()
+                    isinstance(next_inline, _TextRun) and next_inline.text[0].isspace()
                 ) or _kind(next_inline) == "line_break"
                 if not starts_with_space:
                     rendered += " "
@@ -188,7 +189,11 @@ class _AnyDocMarkdownRenderer:
             return self._render_image(inline, context=context, in_label=in_label)
         if kind == "anchor":
             resolved = self.anchors.get(inline.anchor)
-            return f'<a id="{html.escape(resolved.fragment, quote=True)}"></a>' if resolved and resolved.emit_html else ""
+            return (
+                f'<a id="{html.escape(resolved.fragment, quote=True)}"></a>'
+                if resolved and resolved.emit_html
+                else ""
+            )
         if kind == "note_ref":
             number = self.note_numbers.get(inline.note_id or "")
             return f"[^{number}]" if number is not None else ""
@@ -313,7 +318,11 @@ class _AnyDocMarkdownRenderer:
         if source is None:
             return self._escape_text(alt, context=context, in_label=in_label)
         if source.kind == "external":
-            return f"![{escaped_alt}]({self._format_url(source.url or '')})" if source.url else escaped_alt
+            return (
+                f"![{escaped_alt}]({self._format_url(source.url or '')})"
+                if source.url
+                else escaped_alt
+            )
         if source.kind == "unavailable":
             self.warnings.append(f"Embedded image is unavailable: {alt or '<no alt text>'}")
             return self._escape_text(alt, context=context, in_label=in_label)
@@ -433,9 +442,7 @@ class _AnyDocMarkdownRenderer:
         rows: list[list[tuple[str, bool]]] = []
         for row in grid:
             rendered = [
-                (self._render_cell(slot.cell), False)
-                if slot.kind == "origin"
-                else ("", True)
+                (self._render_cell(slot.cell), False) if slot.kind == "origin" else ("", True)
                 for slot in row
             ]
             rendered.extend(("", False) for _ in range(width - len(rendered)))
@@ -483,9 +490,7 @@ class _AnyDocMarkdownRenderer:
     def _flatten_nested_table(self, table: Any) -> list[str]:
         lines: list[str] = []
         for row in table.grid:
-            values = [
-                self._render_cell(slot.cell) if slot.kind == "origin" else "" for slot in row
-            ]
+            values = [self._render_cell(slot.cell) if slot.kind == "origin" else "" for slot in row]
             if any(values):
                 lines.append(" / ".join(values))
         return lines
@@ -618,7 +623,9 @@ class _AnyDocMarkdownRenderer:
     def _next_inline_is_active(inline: Any) -> bool:
         if inline is None:
             return False
-        return not isinstance(inline, _TextRun) or _AnyDocMarkdownRenderer._style_key(inline.style) != (
+        return not isinstance(inline, _TextRun) or _AnyDocMarkdownRenderer._style_key(
+            inline.style
+        ) != (
             False,
             False,
             False,
@@ -628,7 +635,9 @@ class _AnyDocMarkdownRenderer:
 
     @staticmethod
     def _table_is_single_cell(table: Any) -> bool:
-        return len(table.grid) == 1 and len(table.grid[0]) == 1 and table.grid[0][0].kind == "origin"
+        return (
+            len(table.grid) == 1 and len(table.grid[0]) == 1 and table.grid[0][0].kind == "origin"
+        )
 
     @staticmethod
     def _table_width(rows: list[list[tuple[str, bool]]]) -> int:

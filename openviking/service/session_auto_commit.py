@@ -41,15 +41,11 @@ class SessionAutoCommitScheduler:
         if check_interval is not None:
             self._check_interval = float(check_interval)
         else:
-            self._check_interval = float(
-                getattr(config, "check_interval_seconds", 600.0)
-            )
+            self._check_interval = float(getattr(config, "check_interval_seconds", 600.0))
         raw_rate = getattr(config, "scan_rate_limit_files_per_second", 2.0)
         rate = float(raw_rate) if raw_rate is not None else 2.0
         self._scan_rate_limit = max(0.0, rate)
-        self._min_read_interval = (
-            1.0 / self._scan_rate_limit if self._scan_rate_limit > 0 else 0.0
-        )
+        self._min_read_interval = 1.0 / self._scan_rate_limit if self._scan_rate_limit > 0 else 0.0
         self._last_scan_read_at = 0.0
         self._sleep = sleep
         self._running = False
@@ -201,9 +197,7 @@ class SessionAutoCommitScheduler:
             return None
         return session_id, account_id, user_id
 
-    async def _iter_session_meta_paths(
-        self, agfs: AsyncAGFSClient
-    ) -> AsyncIterator[str]:
+    async def _iter_session_meta_paths(self, agfs: AsyncAGFSClient) -> AsyncIterator[str]:
         try:
             account_entries = await agfs.ls(AGFS_SESSION_SCAN_ROOT)
         except Exception:

@@ -17,6 +17,9 @@ from openviking.server.identity import RequestContext
 class ExtractContextProvider(ABC):
     """Extract Context Provider 接口"""
 
+    # A per-request snapshot supplied by the active output protocol, never global state.
+    memory_eval_bindings: Dict[str, Any] | None = None
+
     @abstractmethod
     def instruction(self) -> str:
         """
@@ -60,6 +63,15 @@ class ExtractContextProvider(ABC):
             工具名称列表
         """
         pass
+
+    def customize_tool_schema(self, tool_name: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Customize a model-facing tool schema for this provider."""
+        del tool_name
+        return schema
+
+    def format_prefetch_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Arrange model-facing context after the output protocol registers read bindings."""
+        return messages
 
     @abstractmethod
     def get_memory_schemas(self, ctx: RequestContext) -> List[Any]:

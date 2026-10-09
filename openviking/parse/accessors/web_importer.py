@@ -50,11 +50,7 @@ def parse_web_import_options(kwargs: Dict[str, Any]) -> WebImportOptions:
         raise InvalidArgumentError("args.max_pages must be -1 (unlimited) or >= 1.")
     allow_external_links = _pop_bool_arg(kwargs, "allow_external_links", False)
     skip_download_links = _pop_bool_arg(kwargs, "skip_download_links", True)
-    if (
-        depth == DEPTH_UNLIMITED
-        and max_pages == MAX_PAGES_UNLIMITED
-        and allow_external_links
-    ):
+    if depth == DEPTH_UNLIMITED and max_pages == MAX_PAGES_UNLIMITED and allow_external_links:
         raise InvalidArgumentError(
             "args.depth=-1 and args.max_pages=-1 cannot be combined with "
             "allow_external_links=true; at least one bound is required when "
@@ -164,7 +160,7 @@ class WebImporter:
         root_resolved = root.resolve()
         try:
             dest.relative_to(root_resolved)
-        except ValueError as exc:
+        except ValueError:
             digest = hashlib.sha1(relpath.encode("utf-8")).hexdigest()[:8]
             dest = root_resolved / f"page-{digest}.html"
         return dest

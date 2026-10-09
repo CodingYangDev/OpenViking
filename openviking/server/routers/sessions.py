@@ -17,7 +17,6 @@ from openviking.server.identity import RequestContext
 from openviking.server.models import Response
 from openviking.server.responses import error_response
 from openviking.server.telemetry import run_operation
-from openviking.service.experience_runtime import SearchExperienceRequest
 from openviking.telemetry import TelemetryRequest
 from openviking.utils.image_search import is_viking_uri
 from openviking_cli.utils import get_logger
@@ -174,6 +173,7 @@ class CreateSessionRequest(BaseModel):
     memory_policy: Optional[Dict[str, Any]] = None
     auto_commit_policy: Optional[AutoCommitPolicyRequest] = None
     memory_extraction_config: Optional[MemoryExtractionConfigRequest] = None
+    extraction_context: Optional[str] = Field(default=None, max_length=65_536)
     telemetry: TelemetryRequest = False
 
 
@@ -311,14 +311,15 @@ async def create_session(
 
     async def _create() -> dict[str, Any]:
         await service.initialize_user_directories(_ctx)
-        session = await service.sessions.create(
-            _ctx,
-            request.session_id,
-            memory_policy=request.memory_policy,
-            auto_commit_policy=auto_commit_policy_payload,
-            update_auto_commit_policy=update_auto_commit_policy,
-            event_tags=event_tags,
-        )
+        create_kwargs: Dict[str, Any] = {
+            "memory_policy": request.memory_policy,
+            "auto_commit_policy": auto_commit_policy_payload,
+            "update_auto_commit_policy": update_auto_commit_policy,
+            "event_tags": event_tags,
+        }
+        if request.extraction_context is not None:
+            create_kwargs["extraction_context"] = request.extraction_context
+        session = await service.sessions.create(_ctx, request.session_id, **create_kwargs)
         return {
             "session_id": session.session_id,
             "uri": session.uri,
@@ -327,6 +328,7 @@ async def create_session(
             "memory_extraction_config": service.sessions.effective_memory_extraction_config(
                 session
             ),
+            "extraction_context": session.meta.extraction_context,
         }
 
     execution = await run_operation(
@@ -376,12 +378,13 @@ async def get_session(
 class UpdateSessionConfigRequest(BaseModel):
     """Request body for PATCH /sessions/{id}/config.
 
-    Only the mutable extraction config is editable. Fields left unset are not
-    changed; setting ``events.tags`` to an empty list clears the default.
+    Fields left unset are not changed. Setting ``events.tags`` to an empty list
+    clears the default; setting ``extraction_context`` to null clears it.
     """
 
     memory_extraction_config: Optional[MemoryExtractionConfigRequest] = None
     auto_commit_policy: Optional[AutoCommitPolicyRequest] = None
+    extraction_context: Optional[str] = Field(default=None, max_length=65_536)
     telemetry: TelemetryRequest = False
 
     model_config = {"extra": "forbid"}
@@ -393,7 +396,7 @@ async def update_session_config(
     request: UpdateSessionConfigRequest = Body(default_factory=UpdateSessionConfigRequest),
     _ctx: RequestContext = Depends(get_session_request_context),
 ):
-    """Update mutable session config (event-memory default tags).
+    """Update mutable session extraction configuration.
 
     Takes effect on subsequent message writes, idle scans, and commits.
     ``auto_commit_policy=null`` disables automatic commits.
@@ -403,6 +406,7 @@ async def update_session_config(
     service = get_service()
     event_tags = _event_tags_from_extraction_config(request.memory_extraction_config)
     update_auto_commit_policy = "auto_commit_policy" in request.model_fields_set
+    update_extraction_context = "extraction_context" in request.model_fields_set
     auto_commit_policy = (
         request.auto_commit_policy.model_dump(exclude_none=True)
         if request.auto_commit_policy is not None
@@ -414,6 +418,8 @@ async def update_session_config(
             session_id,
             _ctx,
             event_tags=event_tags,
+            extraction_context=request.extraction_context,
+            update_extraction_context=update_extraction_context,
             auto_commit_policy=auto_commit_policy,
             update_auto_commit_policy=update_auto_commit_policy,
         )
@@ -423,6 +429,7 @@ async def update_session_config(
             "memory_extraction_config": service.sessions.effective_memory_extraction_config(
                 session
             ),
+            "extraction_context": session.meta.extraction_context,
         }
 
     try:
@@ -547,17 +554,6 @@ async def delete_session(
     service = get_service()
     await service.sessions.delete(session_id, _ctx)
     return Response(status="ok", result={"session_id": session_id})
-
-
-@router.post("/{session_id}/experiences/search")
-async def search_exp(
-    request: SearchExperienceRequest,
-    session_id: str = Path(..., description="Session ID"),
-    _ctx: RequestContext = Depends(get_session_request_context),
-):
-    """Select applicable Experience DAGs and return current instructions."""
-    result = await get_service().sessions.search_exp(session_id, request, _ctx)
-    return Response(status="ok", result=result.model_dump(mode="json"))
 
 
 class EventExtractionMetadataRequest(BaseModel):

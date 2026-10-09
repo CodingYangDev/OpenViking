@@ -684,6 +684,7 @@ async def test_fixed_case_merge_groups_sessions_and_rebases_on_latest_policy(mon
         {
             "source_session_uri": "viking://session/old/archives/1",
             "passed": True,
+            "feedback": ["large legacy evaluator payload"],
         }
     ]
     source_uris = [f"viking://session/s{i}/archives/1" for i in range(3)]
@@ -740,6 +741,7 @@ async def test_fixed_case_merge_groups_sessions_and_rebases_on_latest_policy(mon
         PatchMergePolicyOptimizerContext(request_context=fake_request_context()),
     )
     assert [len(group) for group in groups] == [2, 1]
+    assert result.read_policy_uris == sorted({p.target_uri for p in proposals})
     assert len(result.items) == 2
     assert result.items[0].before_content == current.content
     assert result.items[0].base_version == current.version
@@ -749,6 +751,10 @@ async def test_fixed_case_merge_groups_sessions_and_rebases_on_latest_policy(mon
         source["source_session_uri"]
         for source in result.items[0].metadata["patch_metadata"]["source_sessions"]
     } == {"viking://session/old/archives/1", *source_uris[:2]}
+    assert all(
+        "feedback" not in source
+        for source in result.items[0].metadata["patch_metadata"]["source_sessions"]
+    )
 
 
 @pytest.mark.asyncio

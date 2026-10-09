@@ -42,6 +42,7 @@ TILE_QUALITY = 90
 @dataclass
 class TileInfo:
     """Information about a single image tile."""
+
     row: int
     col: int
     x1: int
@@ -57,6 +58,7 @@ class TileInfo:
 @dataclass
 class LargeImageResult:
     """Result of processing a large image."""
+
     needs_processing: bool  # True if large image processing was triggered
     preview_bytes: Optional[bytes] = None  # Low-resolution preview image (None for small images)
     preview_filename: Optional[str] = None
@@ -86,10 +88,7 @@ def save_image_to_bytes(img: Image.Image, format: str = "JPEG", quality: int = 9
 
 
 def needs_large_image_processing(
-    file_path: Path,
-    width: int,
-    height: int,
-    config: Optional[ImageConfig] = None
+    file_path: Path, width: int, height: int, config: Optional[ImageConfig] = None
 ) -> bool:
     """
     Determine if an image needs large image processing.
@@ -111,10 +110,7 @@ def needs_large_image_processing(
     )
 
 
-def create_low_res_preview(
-    img: Image.Image,
-    config: Optional[ImageConfig] = None
-) -> bytes:
+def create_low_res_preview(img: Image.Image, config: Optional[ImageConfig] = None) -> bytes:
     """
     Create a low-resolution preview of an image.
 
@@ -127,7 +123,9 @@ def create_low_res_preview(
     Returns:
         Preview image bytes in JPEG format
     """
-    max_dimension_px = config.preview_max_dimension if config else DEFAULT_IMAGE_PREVIEW_MAX_DIMENSION
+    max_dimension_px = (
+        config.preview_max_dimension if config else DEFAULT_IMAGE_PREVIEW_MAX_DIMENSION
+    )
 
     # Work on a copy
     img = img.copy()
@@ -149,9 +147,7 @@ def create_low_res_preview(
 
 
 def calculate_grid_dimensions(
-    width: int,
-    height: int,
-    config: Optional[ImageConfig] = None
+    width: int, height: int, config: Optional[ImageConfig] = None
 ) -> Tuple[int, int]:
     """
     Calculate optimal grid dimensions (rows x cols) for an image.
@@ -183,11 +179,7 @@ def calculate_grid_dimensions(
 
 
 def calculate_tile_positions(
-    width: int,
-    height: int,
-    rows: int,
-    cols: int,
-    config: Optional[ImageConfig] = None
+    width: int, height: int, rows: int, cols: int, config: Optional[ImageConfig] = None
 ) -> List[Tuple[int, int, int, int]]:
     """
     Calculate positions for each tile with overlap.
@@ -273,11 +265,9 @@ def split_image_into_tiles(
             if not is_png and tile_img.mode in ("RGBA", "P"):
                 tile_img = tile_img.convert("RGB")
 
-            tile_bytes = save_image_to_bytes(
-                tile_img, format=save_format, quality=TILE_QUALITY
-            )
+            tile_bytes = save_image_to_bytes(tile_img, format=save_format, quality=TILE_QUALITY)
 
-            filename = f"{filename_prefix}_{row+1}_{col+1}{ext}"
+            filename = f"{filename_prefix}_{row + 1}_{col + 1}{ext}"
 
             tile_info = TileInfo(
                 row=row + 1,
@@ -289,7 +279,7 @@ def split_image_into_tiles(
                 width=x2 - x1,
                 height=y2 - y1,
                 filename=filename,
-                bytes_data=tile_bytes
+                bytes_data=tile_bytes,
             )
             tiles.append(tile_info)
             tile_idx += 1
@@ -333,7 +323,7 @@ def create_grid_overlay(
     cols: int,
     label_prefix: str = "",
     ext: str = ".jpg",
-    config: Optional[ImageConfig] = None
+    config: Optional[ImageConfig] = None,
 ) -> bytes:
     """
     Create a grid overlay image with tile labels.
@@ -394,7 +384,7 @@ def create_grid_overlay(
             draw.rectangle([sx1, sy1, sx2, sy2], outline=grid_color, width=line_width)
 
             # Calculate label (use ext to match tile file extension)
-            label = f"./tiles/{label_prefix}_{row+1}_{col+1}{ext}"
+            label = f"./tiles/{label_prefix}_{row + 1}_{col + 1}{ext}"
 
             # Load a CJK-capable font
             font = _load_cjk_font(16)
@@ -413,9 +403,13 @@ def create_grid_overlay(
             # Draw background rectangle for text
             padding = 4
             draw.rectangle(
-                [text_x - padding, text_y - padding,
-                 text_x + text_width + padding, text_y + text_height + padding],
-                fill=(255, 255, 255)
+                [
+                    text_x - padding,
+                    text_y - padding,
+                    text_x + text_width + padding,
+                    text_y + text_height + padding,
+                ],
+                fill=(255, 255, 255),
             )
             # Draw text
             draw.text((text_x, text_y), label, fill=grid_color, font=font)
@@ -427,7 +421,7 @@ def process_large_image(
     file_path: Path,
     img: Optional[Image.Image] = None,
     filename_prefix: str = "image",
-    config: Optional[ImageConfig] = None
+    config: Optional[ImageConfig] = None,
 ) -> LargeImageResult:
     """
     Process a large image: create preview, split into tiles, generate grid overlay.
@@ -457,10 +451,12 @@ def process_large_image(
                 needs_processing=False,
                 original_width=width,
                 original_height=height,
-                original_format=format_str
+                original_format=format_str,
             )
 
-        logger.info(f"Processing large image: {width}x{height}, {get_image_size_mb(file_path):.2f}MB")
+        logger.info(
+            f"Processing large image: {width}x{height}, {get_image_size_mb(file_path):.2f}MB"
+        )
 
         # Calculate grid dimensions
         rows, cols = calculate_grid_dimensions(width, height, config)
@@ -476,7 +472,9 @@ def process_large_image(
 
         # Split into tiles
         tiles = split_image_into_tiles(
-            img, rows, cols,
+            img,
+            rows,
+            cols,
             filename_prefix=f"{filename_prefix}_{label_prefix}",
             ext=tile_ext,
             config=config,
@@ -485,10 +483,12 @@ def process_large_image(
 
         # Create grid overlay (use full tile prefix so labels match tile filenames)
         grid_overlay_bytes = create_grid_overlay(
-            img, rows, cols,
+            img,
+            rows,
+            cols,
             label_prefix=f"{filename_prefix}_{label_prefix}",
             ext=tile_ext,
-            config=config
+            config=config,
         )
 
         return LargeImageResult(
@@ -502,7 +502,7 @@ def process_large_image(
             total_cols=cols,
             original_width=width,
             original_height=height,
-            original_format=format_str
+            original_format=format_str,
         )
     finally:
         if own_img:

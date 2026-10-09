@@ -99,9 +99,7 @@ def filter_runtime_fields(model: type[BaseModel], settings: dict[str, Any] | Non
     def walk(cls: type[Any], node: dict[str, Any]) -> dict:
         fields = _model_fields(cls)
         aliases = {
-            field.alias: name
-            for name, field in fields.items()
-            if getattr(field, "alias", None)
+            field.alias: name for name, field in fields.items() if getattr(field, "alias", None)
         }
         result: dict = {}
         for key, value in node.items():
@@ -188,11 +186,7 @@ def _validate_model_list(
         return
 
     fields = _model_fields(element_model)
-    aliases = {
-        item.alias: name
-        for name, item in fields.items()
-        if getattr(item, "alias", None)
-    }
+    aliases = {item.alias: name for name, item in fields.items() if getattr(item, "alias", None)}
     for index, item in enumerate(values):
         if not isinstance(item, dict):
             # Pydantic will report the element type error when the merged
@@ -239,11 +233,7 @@ def _validate_model_object(
 ) -> None:
     """Validate a model nested inside a typed list element."""
     fields = _model_fields(model)
-    aliases = {
-        item.alias: name
-        for name, item in fields.items()
-        if getattr(item, "alias", None)
-    }
+    aliases = {item.alias: name for name, item in fields.items() if getattr(item, "alias", None)}
     for key, value in node.items():
         if not isinstance(key, str):
             raise ConfigPatchError("patch keys must be strings", path=path)
@@ -280,9 +270,7 @@ def _validate_subtree_delete(
         return
     for descendant in _model_field_paths(nested_model, path):
         if descendant not in allowed:
-            raise ConfigPatchError(
-                "field is not modifiable by the config API", path=descendant
-            )
+            raise ConfigPatchError("field is not modifiable by the config API", path=descendant)
         if not creating and descendant in frozen:
             raise ConfigPatchError(
                 "field is create-only and cannot be changed after creation",

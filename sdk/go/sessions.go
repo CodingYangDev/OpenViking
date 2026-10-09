@@ -22,6 +22,7 @@ func (c *Client) CreateSession(ctx context.Context, opts *CreateSessionOptions) 
 		setAny(payload, "auto_commit_policy", opts.AutoCommitPolicy)
 	}
 	setAny(payload, "memory_extraction_config", opts.MemoryExtractionConfig)
+	setString(payload, "extraction_context", opts.ExtractionContext)
 	setAny(payload, "telemetry", opts.Telemetry)
 	if err := mergeExtra(payload, opts.Extra); err != nil {
 		return nil, err
@@ -56,6 +57,9 @@ func (c *Client) UpdateSessionConfig(ctx context.Context, sessionID string, opts
 	}
 	payload := map[string]any{}
 	setAny(payload, "memory_extraction_config", opts.MemoryExtractionConfig)
+	if opts.ExtractionContext != nil {
+		payload["extraction_context"] = *opts.ExtractionContext
+	}
 	if opts.AutoCommitPolicy != nil {
 		payload["auto_commit_policy"] = *opts.AutoCommitPolicy
 	}

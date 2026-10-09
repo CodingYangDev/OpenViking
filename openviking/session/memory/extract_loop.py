@@ -7,13 +7,16 @@ Reference: bot/vikingbot/agent/loop.py AgentLoop structure
 """
 
 import asyncio
+import inspect
 import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from openviking.models.vlm.base import ToolCall, VLMBase
 from openviking.server.identity import RequestContext
+from openviking.session.memory.constants import DEFAULT_EXTRACT_MAX_ITERATIONS
 from openviking.session.memory.dataclass import (
     DeleteId,
     MemoryFile,
@@ -34,7 +37,11 @@ from openviking.session.memory.merge_op import FieldType, ImmutableOp, MergeOp, 
 from openviking.session.memory.page_id_map import ResponsePageIdAllocator
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
 from openviking.session.memory.tools import MEMORY_TOOLS_REGISTRY
-from openviking.session.memory.utils.json_parser import JsonUtils
+from openviking.session.memory.validation.create import (
+    MemoryCreateConflictError,
+    memory_create_target_key,
+    validate_create_operations,
+)
 from openviking.storage.viking_fs import VikingFS, get_viking_fs
 from openviking.telemetry import bind_telemetry_stage, tracer
 from openviking_cli.utils import get_logger
@@ -123,7 +130,7 @@ class ExtractLoop:
         vlm: VLMBase,
         viking_fs: Optional[VikingFS] = None,
         model: Optional[str] = None,
-        max_iterations: int = 3,
+        max_iterations: int = DEFAULT_EXTRACT_MAX_ITERATIONS,
         ctx: Optional[RequestContext] = None,
         context_provider: Optional[Any] = None,  # ExtractContextProvider
         isolation_handler: MemoryIsolationHandler = None,
@@ -137,7 +144,8 @@ class ExtractLoop:
             vlm: VLM instance (from openviking.models.vlm.base)
             viking_fs: VikingFS instance for storage operations
             model: Model name to use
-            max_iterations: Maximum number of ReAct iterations (default: 5)
+            max_iterations: Initial LLM iteration budget (default: 3). Existing tool-call
+                and repair extensions may grant additional iterations.
             ctx: Request context
             context_provider: ExtractContextProvider - 必须提供（由 provider 加载 schema）
             thinking: Whether to explicitly enable model thinking for this extraction loop.
@@ -168,6 +176,10 @@ class ExtractLoop:
         self._last_llm_failure_kind: Optional[str] = None
         self._last_llm_failure_content: str = ""
         self._last_parse_error: Optional[str] = None
+        # Preserve the raw assistant text that produced the most recent parsable
+        # operations, so refetch-triggered follow-up turns can replay the prior
+        # draft instead of asking the model to author it from scratch.
+        self._last_operations_content: str = ""
 
         # Schema 生成器（在 run() 中初始化）
         self.schema_model_generator = None
@@ -194,12 +206,16 @@ class ExtractLoop:
         """
         iteration = 0
         max_iterations = self.max_iterations
+        tracer.set("memory.extraction.max_iterations", max_iterations)
+        tracer.set("memory.extraction.thinking", self.thinking)
         final_operations = None
         raw_links = []
         tools_used: List[Dict[str, Any]] = []
         # Reset format retry counter for each run
         self._format_retry_count = 0
         patch_repair_count = 0
+        reported_create_conflicts: set[tuple[str, str]] = set()
+        provider_validation_repair_count = 0
         resolution_repair_count = 0
         pending_resolution_repair: Optional[Tuple[ResolvedOperations, List]] = None
 
@@ -217,13 +233,8 @@ class ExtractLoop:
         )
         self.schema_model_generator.generate_all_models()
 
-        # 预计算工具 schemas
+        # Resolve the provider's tool names before building the output context.
         allowed_tools = self.context_provider.get_tools()
-        self._tool_schemas = [
-            tool.to_schema()
-            for tool in MEMORY_TOOLS_REGISTRY.values()
-            if tool.name in allowed_tools
-        ]
 
         # Resolve global link support before generating the operations model.
         config = get_openviking_config()
@@ -271,8 +282,8 @@ class ExtractLoop:
 {provider_instruction}
 {reference_rules}
 ## Read Format Rules
-- The read tool accepts `uri`, optional `offset` (0-indexed), and optional `limit`.
-- Read content is returned in Claude Code format: each visible line is prefixed with `line_number<TAB>`.
+- Memory read functions accept optional `offset` (0-indexed) and `limit` arguments.
+- Some read results include line-number prefixes in the form `line_number<TAB>`; SDK object fields are shown as plain text.
 - When you copy text from read results into SEARCH/REPLACE or DELETE operations, copy the exact text after the line-number prefix. Never include the line-number prefix itself in `search`, `replace`, or `delete`.
 {output_contract}
         """,
@@ -280,11 +291,21 @@ class ExtractLoop:
         )
 
         # Pre-fetch context via provider
+        self.context_provider.memory_eval_bindings = None
         tool_call_messages = await self.context_provider.prefetch()
         prefetch_messages = self._output_protocol.render_prefetch_messages(
             tool_call_messages, self._output_context
         )
-        messages.extend(prefetch_messages)
+        messages.extend(self.context_provider.format_prefetch_messages(prefetch_messages))
+
+        # Prefetch may discover or narrow runtime read scopes. Build model-facing
+        # tool descriptions afterwards so they describe the same capabilities
+        # that execution will enforce.
+        self._tool_schemas = [
+            self.context_provider.customize_tool_schema(tool.name, tool.to_schema())
+            for tool in MEMORY_TOOLS_REGISTRY.values()
+            if tool.name in allowed_tools
+        ]
 
         for uri in self.context_provider.read_file_contents:
             self._extract_context.page_id_map.get_page_id(uri)
@@ -342,6 +363,36 @@ class ExtractLoop:
                 else:
                     final_operations = candidate_operations
                     raw_links = candidate_links
+                provider_errors = await self._validate_provider_operations(final_operations)
+                if provider_errors:
+                    if provider_validation_repair_count == 0:
+                        provider_validation_repair_count += 1
+                        max_iterations += 1
+                        self._disable_tools_for_iteration = True
+                        if self._last_operations_content:
+                            messages.append(
+                                {
+                                    "role": "assistant",
+                                    "content": self._last_operations_content,
+                                }
+                            )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": self._build_provider_validation_repair_instruction(
+                                    provider_errors
+                                ),
+                            }
+                        )
+                        tracer.info(
+                            "Extended max_iterations to "
+                            f"{max_iterations} for provider validation repair"
+                        )
+                        continue
+                    raise ValueError(
+                        "Provider operation validation failed after repair: "
+                        + json.dumps(provider_errors, ensure_ascii=False)
+                    )
                 resolution_issues = self._retryable_resolution_issues(final_operations)
                 if resolution_issues and resolution_repair_count == 0:
                     resolution_repair_count += 1
@@ -360,6 +411,55 @@ class ExtractLoop:
                         console=True,
                     )
                     continue
+                try:
+                    await validate_create_operations(final_operations, self.viking_fs, self.ctx)
+                except MemoryCreateConflictError as exc:
+                    conflict_keys = {
+                        (memory_create_target_key(c["uri"], self.viking_fs, self.ctx), c["code"])
+                        for c in exc.conflicts
+                    }
+                    new_conflicts = conflict_keys - reported_create_conflicts
+                    known_read_targets = {
+                        memory_create_target_key(uri, self.viking_fs, self.ctx)
+                        for uri in self.context_provider.read_file_contents
+                    }
+                    # Internal reads are not model tool calls: the provider exposes
+                    # eval only, so execute_tool(name="read") would reject them.
+                    refetched = {}
+                    for conflict in exc.conflicts:
+                        if conflict["code"] != "already_exists":
+                            continue
+                        uri = conflict["uri"]
+                        target_key = memory_create_target_key(uri, self.viking_fs, self.ctx)
+                        if target_key in known_read_targets:
+                            continue
+                        result = await MEMORY_TOOLS_REGISTRY["read"].execute(
+                            self.context_provider.create_tool_context(), uri=uri
+                        )
+                        if not isinstance(result, dict) or "error" in result:
+                            raise exc
+                        refetched[uri] = result
+                        known_read_targets.add(target_key)
+                    if refetched or new_conflicts:
+                        # One bonus per round of new information, not per file or kind.
+                        # An already-read target can still yield new conflict feedback.
+                        max_iterations += 1
+                        tracer.info(
+                            f"Extended max_iterations to {max_iterations} for create repair "
+                            f"({len(new_conflicts)} new conflicts, {len(refetched)} new reads)"
+                        )
+                    elif iteration >= max_iterations:
+                        raise
+                    if refetched:
+                        await self._add_refetch_results_to_messages(messages, refetched)
+                    elif self._last_operations_content:
+                        messages.append(
+                            {"role": "assistant", "content": self._last_operations_content}
+                        )
+                    messages.append({"role": "user", "content": str(exc)})
+                    reported_create_conflicts.update(conflict_keys)
+                    self._disable_tools_for_iteration = False
+                    continue
                 # Check if any write_uris target existing files that weren't read
                 refetch_uris = await self._check_unread_existing_files(final_operations)
                 if refetch_uris:
@@ -375,8 +475,8 @@ class ExtractLoop:
                         tracer.info(f"Extended max_iterations to {max_iterations} for refetch")
 
                     continue
-                dag_errors = self._compile_experience_operations(final_operations)
-                patch_errors = dag_errors + await self._validate_patch_operations(final_operations)
+                gate_errors = await self._validate_content_gates(final_operations)
+                patch_errors = gate_errors + await self._validate_patch_operations(final_operations)
                 if patch_errors and patch_repair_count == 0:
                     patch_repair_count += 1
                     max_iterations += 1
@@ -385,9 +485,9 @@ class ExtractLoop:
                         {
                             "role": "user",
                             "content": (
-                                "DAG construction failed. Re-emit corrected operations with Python "
-                                "programs in experience content. Errors: " + json.dumps(dag_errors)
-                                if dag_errors
+                                "Memory content validation failed after applying the proposed edits. "
+                                "Re-emit corrected operations. Errors: " + json.dumps(gate_errors)
+                                if gate_errors
                                 else self._build_patch_repair_instruction(patch_errors)
                             ),
                         }
@@ -396,11 +496,9 @@ class ExtractLoop:
                         f"Extended max_iterations to {max_iterations} for retry patch repair"
                     )
                     continue
-                if dag_errors:
-                    self._discard_invalid_experience_operations(final_operations, dag_errors)
-                    tracer.info(
-                        f"Skipping invalid Experience DAG updates after repair: {dag_errors}"
-                    )
+                if gate_errors:
+                    self._discard_invalid_content_operations(final_operations, gate_errors)
+                    tracer.info(f"Skipping invalid memory content after repair: {gate_errors}")
                 break
             # If no tool calls either, continue to next iteration (don't break!)
             failure_kind = self._last_llm_failure_kind or "unknown"
@@ -520,37 +618,9 @@ class ExtractLoop:
             and getattr(schema, "operation_mode", None) == "add_only"
         )
 
-    def _uri_belongs_to_schema(self, uri: str, schema: Any) -> Optional[bool]:
-        """Return a path-based ownership result without trusting file metadata."""
-        render_directories = getattr(self._isolation_handler, "render_schema_directories", None)
-        if not callable(render_directories):
-            return None
-        try:
-            directories = render_directories(schema)
-        except Exception:
-            return None
-        if not isinstance(directories, (list, tuple, set)):
-            return None
-        directories = [
-            directory.rstrip("/") for directory in directories if isinstance(directory, str)
-        ]
-        if not directories:
-            return None
-        filename_template = str(getattr(schema, "filename_template", "") or "").lstrip("/")
-        if not filename_template:
-            return None
-        if schema.filename_has_variables():
-            return any(uri.startswith(f"{directory}/") for directory in directories)
-        return any(uri == f"{directory}/{filename_template}" for directory in directories)
-
     def _memory_type_for_uri(self, uri: str) -> Optional[str]:
-        matches = [
-            schema.memory_type
-            for schema in self.context_provider.get_memory_schemas(self.ctx)
-            if self._uri_belongs_to_schema(uri, schema) is True
-        ]
-        unique_matches = list(dict.fromkeys(matches))
-        return unique_matches[0] if len(unique_matches) == 1 else None
+        memory_file = self.context_provider.read_file_contents.get(uri)
+        return memory_file.memory_type if memory_file is not None else None
 
     @staticmethod
     def _is_retryable_event_operation(operation: ResolvedOperation) -> bool:
@@ -769,7 +839,6 @@ class ExtractLoop:
         return assigned_page_ids, page_id_assignments
 
     async def resolve_operations(self, operations) -> tuple[ResolvedOperations, List]:
-        tracer.info(f"operations={JsonUtils.dumps(operations)}")
         upsert_operations: List[ResolvedOperation] = []
         delete_file_contents: List[MemoryFile] = []
         errors: List[str] = []
@@ -830,6 +899,10 @@ class ExtractLoop:
                 page_id = assigned_page_ids[(schema_index, item_index)]
                 is_event = self._is_event_schema(schema)
                 resolved_op = ResolvedOperation(
+                    create_only=bool(
+                        self._output_context is not None
+                        and requested_page_id in self._output_context.create_page_ids
+                    ),
                     old_memory_file_content=None,
                     memory_fields=item_dict,
                     memory_type=memory_type,
@@ -850,16 +923,27 @@ class ExtractLoop:
                     resolved_uri = page_id_map.resolve(requested_page_id)
                     if resolved_uri:
                         old_content = self.context_provider.read_file_contents.get(resolved_uri)
-                        belongs_to_schema = self._uri_belongs_to_schema(resolved_uri, schema)
-                        if belongs_to_schema is False:
+                        existing_memory_type = self._memory_type_for_uri(resolved_uri)
+                        if old_content is None or existing_memory_type != memory_type:
                             invalid_reference_page_ids.add(requested_page_id)
-                            existing_memory_type = self._memory_type_for_uri(resolved_uri)
+                            if old_content is None:
+                                mismatch_reason = (
+                                    f"page_id {page_id} points to an unread memory file; "
+                                    f"cannot verify memory type {memory_type}"
+                                )
+                            elif existing_memory_type is None:
+                                mismatch_reason = (
+                                    f"page_id {page_id} has no memory_type metadata; "
+                                    f"cannot verify memory type {memory_type}"
+                                )
+                            else:
+                                mismatch_reason = (
+                                    f"page_id {page_id} belongs to memory type "
+                                    f"{existing_memory_type}, not {memory_type}"
+                                )
                             resolved_op.resolution_skip = MemoryOperationSkip(
                                 reason_code=MemoryOperationSkipCode.PAGE_ID_TYPE_MISMATCH,
-                                reason=(
-                                    f"page_id {page_id} belongs to memory type "
-                                    f"{existing_memory_type or 'another schema'}, not {memory_type}"
-                                ),
+                                reason=mismatch_reason,
                             )
                         else:
                             resolved_op.uris = [resolved_uri]
@@ -963,7 +1047,7 @@ class ExtractLoop:
         for op in upsert_operations:
             for uri in op.uris:
                 old_content = self.context_provider.read_file_contents.get(uri)
-                if old_content and op.old_memory_file_content is None:
+                if old_content and op.old_memory_file_content is None and not op.create_only:
                     op.old_memory_file_content = old_content
                     break
 
@@ -1054,6 +1138,11 @@ class ExtractLoop:
             the model should not receive tools in the next iteration.
         """
 
+        # Parallel calls see the same already-presented bindings, not each other's results.
+        self.context_provider.memory_eval_bindings = self._output_protocol.get_memory_eval_bindings(
+            self._output_context
+        )
+
         # Execute all tool calls in parallel
         async def execute_single_tool_call(idx: int, tool_call):
             """Execute a single tool call."""
@@ -1066,17 +1155,15 @@ class ExtractLoop:
         results = await asyncio.gather(*action_tasks)
 
         has_unknown_tool = False
+        request_calls = []
+        result_messages = []
 
-        # Process results and add to messages
+        # Keep parallel calls in one assistant turn, followed by all tool replies.
         for _idx, tool_call, result in results:
             # Check for unknown tool error
-            if isinstance(result, dict) and result.get("error", "").startswith("Unknown tool:"):
+            error = result.get("error", "") if isinstance(result, dict) else ""
+            if isinstance(error, str) and error.startswith(("Unknown tool:", "Tool not allowed:")):
                 has_unknown_tool = True
-            # Skip if arguments is None
-            if tool_call.arguments is None:
-                tracer.error(f"Tool call {tool_call.name} has no arguments, skipping")
-                continue
-
             tools_used.append(
                 {
                     "tool_name": tool_call.name,
@@ -1085,17 +1172,20 @@ class ExtractLoop:
                 }
             )
 
-            messages.extend(
-                self._output_protocol.render_tool_result_messages(
-                    self._output_context,
-                    call_id=tool_call.id,
-                    tool_name=tool_call.name,
-                    params=tool_call.arguments,
-                    result=result,
-                    source="tool call",
-                )
+            request, reply = self._output_protocol.render_tool_result_messages(
+                self._output_context,
+                call_id=tool_call.id,
+                tool_name=tool_call.name,
+                params=tool_call.arguments,
+                result=result,
+                source="tool call",
             )
+            request_calls.extend(request["tool_calls"])
+            result_messages.append(reply)
 
+        if request_calls:
+            messages.append({"role": "assistant", "content": None, "tool_calls": request_calls})
+        messages.extend(result_messages)
         return has_unknown_tool
 
     async def _call_llm(
@@ -1117,9 +1207,15 @@ class ExtractLoop:
         if not self._disable_tools_for_iteration and self._tool_schemas:
             tools = self._tool_schemas
             tool_choice = "auto"
+        # Refresh only at the request boundary so snapshots never accumulate in history.
+        request_messages = messages
+        if self._output_protocol is not None:
+            binding_index = self._output_protocol.render_binding_index()
+            if binding_index:
+                request_messages = [*messages, {"role": "user", "content": binding_index}]
         with bind_telemetry_stage("memory_extract"):
             response = await self.vlm.get_completion_async(
-                messages=messages,
+                messages=request_messages,
                 tools=tools,
                 tool_choice=tool_choice,
                 thinking=self.thinking,
@@ -1132,7 +1228,6 @@ class ExtractLoop:
         # Log cache hit info
         if hasattr(response, "usage") and response.usage:
             usage = response.usage
-            prompt_tokens = usage.get("prompt_tokens", 0)
             cached_tokens = (
                 usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
                 if isinstance(usage.get("prompt_tokens_details"), dict)
@@ -1147,15 +1242,6 @@ class ExtractLoop:
                     CacheEventDataSource.record_miss("L2")
             except Exception:
                 pass
-            if prompt_tokens > 0:
-                cache_hit_rate = (cached_tokens / prompt_tokens) * 100
-                tracer.info(
-                    f"[KVCache] prompt_tokens={prompt_tokens}, cached_tokens={cached_tokens}, cache_hit_rate={cache_hit_rate:.1f}%"
-                )
-            else:
-                tracer.info(
-                    f"[KVCache] prompt_tokens={prompt_tokens}, cached_tokens={cached_tokens}"
-                )
 
         # Case 0: Handle string response (when tools are not provided) or None
         if response is None:
@@ -1165,14 +1251,15 @@ class ExtractLoop:
             content = response
         # Case 1: LLM returned tool calls
         elif response.has_tool_calls:
-            # Format tool calls nicely for debug logging
-            for tc in response.tool_calls:
-                tracer.info(f"[assistant tool_call] (id={tc.id}, name={tc.name})")
-                tracer.info(f"  {json.dumps(tc.arguments, indent=2, ensure_ascii=False)}")
+            self._trace_model_output(
+                {"tool_calls": [{"id": tc.id, "name": tc.name} for tc in response.tool_calls]}
+            )
             return (response.tool_calls, None)
         else:
             # Case 2: VLMResponse without tool calls - get content from response
             content = response.content or ""
+
+        self._trace_model_output({"content": content})
 
         # Parse operations from content
         if content:
@@ -1198,6 +1285,7 @@ class ExtractLoop:
                     )
                     return (None, None)
 
+                self._last_operations_content = content
                 return (None, operations)
             except Exception as e:
                 self._last_parse_error = str(e)
@@ -1218,6 +1306,14 @@ class ExtractLoop:
             f"response_preview={_preview_text(self._last_llm_failure_content)!r}"
         )
         return (None, None)
+
+    @staticmethod
+    def _trace_model_output(payload: Dict[str, Any]) -> None:
+        with tracer.start_as_current_span("memory.model.output"):
+            tracer.info(
+                "output="
+                + json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))
+            )
 
     async def _check_unread_existing_files(self, operations: ResolvedOperations) -> Dict:
         refetch_uris = {}
@@ -1252,57 +1348,53 @@ class ExtractLoop:
         """Build schema-aware final-iteration instructions for the LLM."""
         return self._output_protocol.render_final_instruction(self._output_context)
 
-    def _compile_experience_operations(
-        self, operations: ResolvedOperations
-    ) -> List[Dict[str, Any]]:
-        from openviking.session.memory.experience_dag_compiler import normalize_dag_source
+    async def _validate_content_gates(self, operations: ResolvedOperations) -> List[Dict[str, Any]]:
+        from openviking.session.memory.streaming_memory_updater import (
+            clone_operation_for_uri,
+            render_operation_after_file,
+        )
+        from openviking.session.memory.validation.content import get_content_gate
 
-        compiled = []
+        schemas = {
+            schema.memory_type: schema
+            for schema in self.context_provider.get_memory_schemas(self.ctx)
+        }
         errors = []
+        staged = {}
         for operation in operations.upsert_operations:
-            if operation.memory_type != "experiences":
+            if get_content_gate(operation.memory_type) is None:
                 continue
-            code = operation.memory_fields.get("content")
-            if code is None:
-                continue
-            target = operation.uris[0] if operation.uris else str(operation.page_id)
-            try:
-                content = normalize_dag_source(code)
-            except (ValueError, TypeError) as exc:
-                errors.append({"uri": target, "page_id": operation.page_id, "error": str(exc)})
-            else:
-                compiled.append((operation, content))
-        for operation, content in compiled:
-            operation.memory_fields["content"] = content
+            for uri in operation.uris:
+                try:
+                    preview = clone_operation_for_uri(operation, uri)
+                    if uri in staged:
+                        preview.old_memory_file_content = staged[uri]
+                    staged[uri] = await render_operation_after_file(
+                        preview,
+                        schema=schemas[operation.memory_type],
+                        extract_context=self._extract_context,
+                    )
+                except (ValueError, TypeError, KeyError) as exc:
+                    errors.append({"uri": uri, "page_id": operation.page_id, "error": str(exc)})
         return errors
 
     @staticmethod
-    def _discard_invalid_experience_operations(
+    def _discard_invalid_content_operations(
         operations: ResolvedOperations, errors: List[Dict[str, Any]]
     ) -> None:
         invalid_uris = {str(error.get("uri") or "") for error in errors}
-        invalid_page_ids = {error.get("page_id") for error in errors}
-        operations.upsert_operations = [
-            operation
-            for operation in operations.upsert_operations
-            if operation.memory_type != "experiences"
-            or (
-                (operation.uris[0] if operation.uris else str(operation.page_id))
-                not in invalid_uris
-                and operation.page_id not in invalid_page_ids
-            )
-        ]
-        operations.delete_file_contents = [
-            file
-            for file in operations.delete_file_contents
-            if file.memory_type != "experiences"
-            and "/memories/experiences/" not in str(file.uri or "")
-        ]
-        operations.delete_replacements = {
-            old_uri: new_uri
-            for old_uri, new_uri in operations.delete_replacements.items()
-            if old_uri not in invalid_uris and new_uri not in invalid_uris
+        invalid_page_ids = {
+            error["page_id"] for error in errors if error.get("page_id") is not None
         }
+        operations.upsert_operations = [
+            op
+            for op in operations.upsert_operations
+            if not (set(op.uris) & invalid_uris) and op.page_id not in invalid_page_ids
+        ]
+        # Never execute destructive follow-ups to an invalid candidate. Valid
+        # independent upserts can still proceed after the repair opportunity.
+        operations.delete_file_contents = []
+        operations.delete_replacements = {}
         operations.resolved_links = [
             link
             for link in operations.resolved_links
@@ -1394,31 +1486,89 @@ class ExtractLoop:
     def _build_patch_repair_instruction(self, patch_errors: List[Dict[str, Any]]) -> str:
         return self._output_protocol.render_patch_repair(patch_errors)
 
+    async def _validate_provider_operations(
+        self, operations: ResolvedOperations
+    ) -> List[Dict[str, Any]]:
+        validate = getattr(self.context_provider, "validate_resolved_operations", None)
+        if not callable(validate):
+            return []
+        result = validate(operations)
+        return list(await result if inspect.isawaitable(result) else result)
+
+    def _build_provider_validation_repair_instruction(self, errors: List[Dict[str, Any]]) -> str:
+        render = getattr(self.context_provider, "render_operation_repair", None)
+        if callable(render):
+            return str(render(errors))
+        return (
+            "The operations failed provider validation. Re-emit the complete operations only. "
+            "Errors: " + json.dumps(errors, ensure_ascii=False)
+        )
+
     async def _add_refetch_results_to_messages(
         self,
         messages: List[Dict[str, Any]],
         refetch_uris: Dict[str, Any],
     ) -> None:
-        """Add existing file content as read tool results to messages."""
-        # Calculate call_id based on existing tool messages
-        call_id_seq = len([m for m in messages if m.get("role") == "tool"]) + 1000
+        """Add existing file content as read tool results to messages.
+
+        When the ReAct loop refetches existing files after the model already
+        produced parsable operations, replay the model's previous draft as an
+        assistant message so the follow-up turn can revise it instead of
+        starting over. Otherwise the model tends to treat the prior operations
+        as "already delivered" and emits an empty set on the next turn.
+        """
+        prior_operations_content = self._last_operations_content or ""
+        if prior_operations_content:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": prior_operations_content,
+                }
+            )
+
+        # Keep every prior binding valid across supplemental reads, including
+        # names the model may have used in its own eval calls or previous draft.
+        used_names = set(
+            re.findall(
+                r"\brefetched_memory_\d+\b",
+                json.dumps(messages, ensure_ascii=False, default=str),
+            )
+        )
+        index = 1
         for uri, parsed in refetch_uris.items():
+            while f"refetched_memory_{index}" in used_names:
+                index += 1
+            variable = f"refetched_memory_{index}"
+            used_names.add(variable)
             messages.extend(
                 self._output_protocol.render_tool_result_messages(
                     self._output_context,
-                    call_id=call_id_seq,
-                    tool_name="read",
-                    params={"uri": uri},
-                    result=parsed,
+                    call_id=f"call_memory_{uuid4().hex}",
+                    tool_name="eval",
+                    params={"code": f"{variable} = sdk.read(uri={uri!r})"},
+                    result={variable: parsed},
                     source="automatic read",
                 )
             )
-            call_id_seq += 1
 
-        # Add reminder message for the model
+        if prior_operations_content:
+            reminder = (
+                "Note: The files above were automatically read because they exist and "
+                "you didn't read them before deciding to write. Re-emit your previous "
+                "draft above as ONE complete operations payload, revising only the "
+                "entries affected by the newly read content. Do not drop unaffected "
+                "entries and do not return an empty payload."
+            )
+        else:
+            reminder = (
+                "Note: The files above were automatically read because they exist and "
+                "you didn't read them before deciding to write. Please consider the "
+                "existing content when making write decisions. You can now output "
+                "updated operations."
+            )
         messages.append(
             {
                 "role": "user",
-                "content": "Note: The files above were automatically read because they exist and you didn't read them before deciding to write. Please consider the existing content when making write decisions. You can now output updated operations.",
+                "content": reminder,
             }
         )

@@ -15,6 +15,7 @@ from openviking.service.task_work_index import bind_task_context
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.queuefs.session_commit_msg import SessionCommitMsg
+from openviking.telemetry import tracer
 from openviking.telemetry.span_models import create_root_span_attributes
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -113,6 +114,8 @@ class SessionCommitProcessor(DequeueHandlerBase):
         await self._finalize_cancelled(msg, ctx)
         return ProcessResult.cancelled()
 
+    @tracer.errors_to_trace()
+    @tracer("queue.session_commit.process", ignore_args=True, ignore_result=True)
     async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
         if not data:
             return ProcessResult.success()
@@ -120,6 +123,23 @@ class SessionCommitProcessor(DequeueHandlerBase):
         try:
             msg, ctx = self._parse_message(data)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            tracer.error("Invalid SessionCommit queue message", e=exc, console=False)
             return ProcessResult.failed(str(exc))
-        processed = await self._process(msg, ctx)
+        tracer.set("task_id", msg.task_id)
+        tracer.set("session_id", msg.session_id)
+        tracer.set("account_id", ctx.account_id)
+        tracer.set("user_id", ctx.user.user_id)
+        try:
+            processed = await self._process(msg, ctx)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            tracer.error("SessionCommit consumer failed; skipping delivery", e=exc, console=False)
+            tracker = get_task_tracker()
+            owner = {"account_id": ctx.account_id, "user_id": ctx.user.user_id}
+            # Consumption can begin before the producer registers the task.
+            await tracker.create(
+                "session_commit", resource_id=msg.session_id, task_id=msg.task_id, **owner
+            )
+            await tracker.fail(msg.task_id, error, **owner)
+            return ProcessResult.failed(error)
         return ProcessResult.success() if processed else ProcessResult.requeued()

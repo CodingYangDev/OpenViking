@@ -2,6 +2,7 @@
 
 import json
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,11 +20,12 @@ from vikingbot.utils.tracing import get_current_response_id
 
 @dataclass(frozen=True)
 class ToolExecutionResult:
-    """Tool result plus request-scoped Skill resolution metadata."""
+    """Tool result, Skill resolution metadata, and an optional context-delivery receipt."""
 
     result: Any
     effective_params: dict[str, Any]
     skill_uris: tuple[str, ...] = ()
+    on_result_added: Callable[[str], Awaitable[None]] | None = None
 
 
 class ToolRegistry:
@@ -170,6 +172,7 @@ class ToolRegistry:
         openviking_connection: dict[str, Any] | None = None,
         channel_metadata: dict[str, Any] | None = None,
         skill_runtime: Any | None = None,
+        messages: list[dict[str, Any]] | None = None,
     ) -> ToolExecutionResult:
         """
         Execute a tool by name with given parameters.
@@ -211,6 +214,7 @@ class ToolRegistry:
             openviking_connection=openviking_connection,
             channel_metadata=dict(channel_metadata or {}),
             skill_runtime=skill_runtime,
+            messages=messages,
         )
 
         # Langfuse tool call tracing - automatic for all tools
@@ -308,6 +312,7 @@ class ToolRegistry:
             result=result,
             effective_params=effective_params,
             skill_uris=skill_uris,
+            on_result_added=tool_context.on_result_added,
         )
 
     async def execute(

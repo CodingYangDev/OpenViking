@@ -35,7 +35,10 @@ from openviking.session.memory.streaming_memory_updater import (
     make_streaming_memory_updater_key,
 )
 from openviking.session.memory.tools import (
+    MemoryEvalFunction,
+    MemoryEvalTool,
     MemoryLsTool,
+    MemoryReadByFieldsTool,
     MemoryReadTool,
     MemorySearchTool,
     MemoryTool,
@@ -80,7 +83,10 @@ __all__ = [
     "ExtractLoop",
     # Tools (Tool implementations)
     "MemoryTool",
+    "MemoryEvalFunction",
+    "MemoryEvalTool",
     "MemoryReadTool",
+    "MemoryReadByFieldsTool",
     "MemorySearchTool",
     "MemoryLsTool",
     "register_tool",

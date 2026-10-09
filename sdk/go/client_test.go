@@ -2020,12 +2020,14 @@ func TestSessionAPIsSendEventMemoryTags(t *testing.T) {
 	if _, err := client.CreateSession(context.Background(), &CreateSessionOptions{
 		SessionID:              "tagged",
 		MemoryExtractionConfig: config,
+		ExtractionContext:      `{"project_id":"project-1"}`,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.UpdateSessionConfig(context.Background(), "tagged", &UpdateSessionConfigOptions{
 		MemoryExtractionConfig: config,
 		AutoCommitPolicy:       Map(map[string]any{"message_count_threshold": 25}),
+		ExtractionContext:      String(`{"project_id":"project-2"}`),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -2055,6 +2057,9 @@ func TestSessionAPIsSendEventMemoryTags(t *testing.T) {
 	if _, ok := createBody["memory_extraction_config"]; !ok {
 		t.Fatalf("create body = %#v", createBody)
 	}
+	if createBody["extraction_context"] != `{"project_id":"project-1"}` {
+		t.Fatalf("create extraction_context = %#v", createBody["extraction_context"])
+	}
 	if requests[1]["method"] != http.MethodPatch ||
 		requests[1]["path"] != "/api/v1/sessions/tagged/config" {
 		t.Fatalf("patch request = %#v", requests[1])
@@ -2063,6 +2068,9 @@ func TestSessionAPIsSendEventMemoryTags(t *testing.T) {
 	if policy, ok := patchBody["auto_commit_policy"].(map[string]any); !ok ||
 		policy["message_count_threshold"] != float64(25) {
 		t.Fatalf("patch auto_commit_policy = %#v", patchBody["auto_commit_policy"])
+	}
+	if patchBody["extraction_context"] != `{"project_id":"project-2"}` {
+		t.Fatalf("patch extraction_context = %#v", patchBody["extraction_context"])
 	}
 	commitBody := requests[2]["body"].(map[string]any)
 	metadata := commitBody["extraction_metadata"].(map[string]any)

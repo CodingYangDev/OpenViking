@@ -44,7 +44,11 @@ from openviking.session.extraction_batch import (
     plan_extraction_batches,
     resolve_extraction_batch_limits,
 )
-from openviking.session.memory.constants import AGENT_EVOLUTION_MEMORY_TYPES
+from openviking.session.memory.constants import (
+    AGENT_EVOLUTION_MEMORY_TYPES,
+    CASE_MEMORY_TYPE,
+    TRAJECTORY_MEMORY_TYPE,
+)
 from openviking.session.memory.utils.language import resolve_output_language_from_conversation
 from openviking.session.memory_policy import MemoryPolicy
 from openviking.session.retention import (
@@ -91,7 +95,7 @@ _PHASE2_QUEUE_WAIT_TIMEOUT_SECONDS = 1800.0
 _MEMORY_EXTRACTION_MAX_RETRIES = 3
 _MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS = 1.0
 _MEMORY_EXTRACTION_RETRY_MAX_DELAY_SECONDS = 8.0
-_AGENT_TRAINING_REQUIRED_MEMORY_TYPES = frozenset({"experiences"})
+_AGENT_TRAINING_REQUIRED_MEMORY_TYPES = frozenset({CASE_MEMORY_TYPE, TRAJECTORY_MEMORY_TYPE})
 _SESSION_PHASE1_LOCK_TIMEOUT_SECONDS = 30.0
 
 
@@ -144,6 +148,8 @@ def _apply_agent_evolution_setting(
         peer_enabled=policy.peer_enabled,
         memory_types=effective_types,
         working_memory_enabled=policy.working_memory_enabled,
+        extract_max_iterations=policy.extract_max_iterations,
+        extract_thinking=policy.extract_thinking,
     )
 
 
@@ -324,6 +330,9 @@ class SessionMeta:
     # session. Maps to config.memory_extraction_config.events.tags in the API.
     # None means no session default; a commit may still override per-call.
     event_search_tags: Optional[List[str]] = None
+    # Trusted caller-provided context for long-term memory extraction. This is
+    # kept outside messages so it can guide routing without becoming evidence.
+    extraction_context: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         data = {
@@ -350,6 +359,7 @@ class SessionMeta:
             ),
             "last_message_at": self.last_message_at,
             "last_auto_commit_at": self.last_auto_commit_at,
+            "extraction_context": self.extraction_context,
         }
         if self.total_message_count is not None:
             data["total_message_count"] = self.total_message_count
@@ -370,6 +380,7 @@ class SessionMeta:
             except (TypeError, ValueError):
                 memory_counts[key] = 0
 
+        extraction_context = data.get("extraction_context", "")
         return cls(
             session_id=data.get("session_id", ""),
             created_at=data.get("created_at", ""),
@@ -405,6 +416,7 @@ class SessionMeta:
             last_message_at=data.get("last_message_at", ""),
             last_auto_commit_at=data.get("last_auto_commit_at", ""),
             event_search_tags=data.get("event_search_tags"),
+            extraction_context=(extraction_context if isinstance(extraction_context, str) else ""),
         )
 
 
@@ -641,10 +653,13 @@ class Session:
         self,
         *,
         event_search_tags: Optional[List[str]] = None,
+        extraction_context: Optional[str] = None,
+        update_extraction_context: bool = False,
         auto_commit_policy: Optional[Dict[str, Any]] = None,
         update_auto_commit_policy: bool = False,
     ) -> None:
         """Update mutable session config without overwriting concurrent meta changes."""
+        update_extraction_context = update_extraction_context or extraction_context is not None
         update_auto_commit_policy = update_auto_commit_policy or auto_commit_policy is not None
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
         lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
@@ -662,6 +677,8 @@ class Session:
                     raise
             if event_search_tags is not None:
                 self._meta.event_search_tags = list(event_search_tags)
+            if update_extraction_context:
+                self._meta.extraction_context = extraction_context or ""
             if update_auto_commit_policy:
                 if auto_commit_policy is None:
                     self._meta.auto_commit_policy = None
@@ -1098,8 +1115,8 @@ class Session:
     async def _ensure_phase1_ready(self, archive_uri: str) -> bool:
         """Verify or recover a queued Phase 1 before Phase 2 consumes it.
 
-        New commits enqueue while holding the session lock and before rewriting
-        root messages. A consumer therefore acquires the same lock, then either
+        New commits enqueue after persisting root messages and metadata, but before
+        publishing ready. A consumer acquires the same session lock, then either
         observes ``phase1.status=ready`` in archive metadata or
         deterministically reconciles a process crash from the persisted intent.
         """
@@ -1250,9 +1267,9 @@ class Session:
         """Archive immediately and enqueue restart-safe Phase 2 processing.
 
         Phase 1 (Archive prep, path-lock protected): Split messages into
-        archive/retain parts, persist a recoverable intent and archive raw,
-        enqueue Phase 2, then publish the retained root state with
-        ``phase1.status=ready``. Uses a distributed filesystem lock across
+        archive/retain parts, persist a recoverable intent, archive raw and retained
+        root state, then enqueue Phase 2 and publish ``phase1.status=ready``.
+        Uses a distributed filesystem lock across
         workers and processes.
         Phase 2 (Memory extraction): Runs through the persistent QueueFS queue.
 
@@ -1511,6 +1528,7 @@ class Session:
                 record_auto_commit_success=record_auto_commit_success,
                 event_search_tags=list(effective_event_tags),
                 auto_commit_policy=dict(self._meta.auto_commit_policy or {}),
+                extraction_context=self._meta.extraction_context,
             )
             phase1_stage = "phase1_persist"
             try:
@@ -1559,21 +1577,6 @@ class Session:
                         },
                     )
 
-                phase1_stage = "queue_enqueue"
-                await get_queue_manager().enqueue(
-                    QueueManager.SESSION_COMMIT,
-                    queue_msg.to_dict(),
-                )
-
-                phase1_stage = "task_tracker_create"
-                await get_task_tracker().create(
-                    "session_commit",
-                    resource_id=self.session_id,
-                    account_id=self.ctx.account_id,
-                    user_id=self.ctx.user.user_id,
-                    task_id=task_id,
-                )
-
                 phase1_stage = "phase1_persist"
                 self._messages = retained_messages
                 await self._write_to_agfs_async(messages=self._messages)
@@ -1597,6 +1600,23 @@ class Session:
                     # never see a stale state.
                     self._meta.last_auto_commit_at = get_current_timestamp()
                 await self._save_meta()
+
+                phase1_stage = "queue_enqueue"
+                await get_queue_manager().enqueue(
+                    QueueManager.SESSION_COMMIT,
+                    queue_msg.to_dict(),
+                )
+
+                phase1_stage = "task_tracker_create"
+                await get_task_tracker().create(
+                    "session_commit",
+                    resource_id=self.session_id,
+                    account_id=self.ctx.account_id,
+                    user_id=self.ctx.user.user_id,
+                    task_id=task_id,
+                )
+
+                phase1_stage = "phase1_persist"
                 await self._write_phase1_ready_marker(archive_uri)
             except Exception as e:
                 logger.error(f"[commit] Failed during {phase1_stage}: {e}")
@@ -1813,6 +1833,7 @@ class Session:
             record_auto_commit_success=msg.record_auto_commit_success,
             event_search_tags=list(msg.event_search_tags or []),
             auto_commit_policy=msg.auto_commit_policy,
+            extraction_context=msg.extraction_context,
         )
         return True
 
@@ -1942,6 +1963,7 @@ class Session:
         record_auto_commit_success: bool = False,
         event_search_tags: Optional[List[str]] = None,
         auto_commit_policy: Optional[Dict[str, Any]] = None,
+        extraction_context: str = "",
     ) -> None:
         """Phase 2: Extract memories and enqueue semantic work in the background."""
         from openviking.service.task_tracker import get_task_tracker
@@ -1954,6 +1976,7 @@ class Session:
         memories_extracted: Dict[str, int] = {}
         usage_events_extracted = 0
         extracted_skill_results: list[dict] = []
+        extracted_trajectory_uris: list[str] = []
         skipped_memory_operations: list[dict[str, Any]] = []
         memory_diff_uri: Optional[str] = None
         completed_memory_steps: Dict[str, set[str]] = {}
@@ -1985,6 +2008,18 @@ class Session:
                     ov_config = get_openviking_config()
                     effective_policy = MemoryPolicy.from_dict(memory_policy)
                     extraction_batch_limits = resolve_extraction_batch_limits(auto_commit_policy)
+                    if (
+                        extraction_context
+                        and extraction_batch_limits.max_message_tokens is not None
+                    ):
+                        extraction_batch_limits = ExtractionBatchLimits(
+                            max_message_tokens=max(
+                                0,
+                                extraction_batch_limits.max_message_tokens
+                                - estimate_text_tokens(extraction_context),
+                            ),
+                            max_messages=extraction_batch_limits.max_messages,
+                        )
                     working_memory_enabled = effective_policy.working_memory_enabled
                     checkpoint_requests = (
                         await self._checkpoints.collect_requests_for_phase2(
@@ -2203,6 +2238,9 @@ class Session:
                                     peer_memory_enabled=peer_memory_enabled,
                                     allowed_peer_ids=allowed_peer_ids,
                                     event_search_tags=event_search_tags,
+                                    extraction_context=extraction_context,
+                                    extract_max_iterations=effective_policy.extract_max_iterations,
+                                    extract_thinking=effective_policy.extract_thinking,
                                 )
 
                             if extraction_batch_limits.enabled:
@@ -2256,9 +2294,11 @@ class Session:
                             if isinstance(result, dict):
                                 target_contexts = list(result.get("contexts", []))
                                 target_skills = list(result.get("session_skills", []))
+                                target_trajectories = list(result.get("trajectory_uris", []))
                             else:
                                 target_contexts = list(result or [])
                                 target_skills = []
+                                target_trajectories = []
                             logger.info(
                                 "Extracted %s memories for %s",
                                 len(target_contexts),
@@ -2270,6 +2310,10 @@ class Session:
                                 memories_extracted[cat] = memories_extracted.get(cat, 0) + 1
                             if target_skills:
                                 extracted_skill_results.extend(target_skills)
+                            if target_trajectories:
+                                extracted_trajectory_uris.extend(
+                                    str(uri) for uri in target_trajectories if uri
+                                )
 
                         if total_extracted:
                             self._stats.memories_extracted += total_extracted
@@ -2371,6 +2415,7 @@ class Session:
                     for item in extracted_skill_results
                     if isinstance(item, dict) and (item.get("uri") or item.get("root_uri"))
                 ],
+                "trajectory_uris": list(dict.fromkeys(extracted_trajectory_uris)),
                 "memory_extraction": {
                     "skipped": len(skipped_memory_operations),
                     "skipped_operations": skipped_memory_operations,

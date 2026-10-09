@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 import sys
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from fastapi import Request
 
@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # "_" during identity mapping.
 _ALLOWED_IDENTIFIER_CHARS = re.compile(r"[^a-zA-Z0-9_.@-]")
 
+
 def _check_jwt_available() -> bool:
     """Lazy check for JWT library availability (cached after first call)."""
     global httpx, JWTError, jwk, jwt, Key, ExpiredSignatureError, JWTClaimsError
@@ -42,6 +43,7 @@ def _check_jwt_available() -> bool:
             from jose import JWTError, jwk, jwt  # noqa: F401
             from jose.backends.base import Key  # noqa: F401
             from jose.exceptions import ExpiredSignatureError, JWTClaimsError  # noqa: F401
+
             _check_jwt_available._cached = True
         except ImportError:
             logger.warning(
@@ -55,10 +57,18 @@ def _check_jwt_available() -> bool:
 # Supported signing algorithms. Asymmetric algorithms are preferred for OIDC;
 # HMAC algorithms are included for completeness but require a shared secret.
 _SUPPORTED_ALGORITHMS = [
-    "RS256", "RS384", "RS512",
-    "ES256", "ES384", "ES512",
-    "PS256", "PS384", "PS512",
-    "HS256", "HS384", "HS512",
+    "RS256",
+    "RS384",
+    "RS512",
+    "ES256",
+    "ES384",
+    "ES512",
+    "PS256",
+    "PS384",
+    "PS512",
+    "HS256",
+    "HS384",
+    "HS512",
 ]
 
 _DISCOVERY_PATH = "/.well-known/openid-configuration"
@@ -143,9 +153,7 @@ class OIDCAuthPlugin(AuthPlugin):
 
         return ResolvedIdentity(role=Role.USER, account_id=account_id, user_id=user_id)
 
-    def _extract_token(
-        self, request: Request, api_key: Optional[str] = None
-    ) -> Optional[str]:
+    def _extract_token(self, request: Request, api_key: Optional[str] = None) -> Optional[str]:
         """Extract JWT token from request."""
         if self._config is None:
             return None
@@ -156,7 +164,7 @@ class OIDCAuthPlugin(AuthPlugin):
             if auth_header:
                 prefix = self._config.token_header_prefix
                 if prefix and auth_header.startswith(prefix):
-                    return auth_header[len(prefix):].strip()
+                    return auth_header[len(prefix) :].strip()
                 # Without a configured prefix, accept raw bearer token
                 return auth_header.strip()
 
@@ -261,9 +269,7 @@ class OIDCAuthPlugin(AuthPlugin):
                     "OIDC discovery document at %s did not contain a jwks_uri",
                     discovery_url,
                 )
-                raise UnauthenticatedError(
-                    "OIDC discovery document is missing 'jwks_uri'"
-                )
+                raise UnauthenticatedError("OIDC discovery document is missing 'jwks_uri'")
 
             logger.info("OIDC discovery resolved jwks_uri=%s", jwks_uri)
             self._jwks_uri = jwks_uri
@@ -296,9 +302,7 @@ class OIDCAuthPlugin(AuthPlugin):
                 try:
                     self._jwks[key_kid] = jwk.construct(key_dict)
                 except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "Failed to construct key for kid=%s: %s", key_kid, e
-                    )
+                    logger.warning("Failed to construct key for kid=%s: %s", key_kid, e)
 
         if kid not in self._jwks:
             raise UnauthenticatedError(f"Unknown key ID: {kid}")
@@ -342,9 +346,7 @@ class OIDCAuthPlugin(AuthPlugin):
 
         # Resolve the effective audience once. Explicit audience wins;
         # otherwise fall back to client_id (standard OIDC ID token contract).
-        self._effective_audience: Optional[str] = (
-            self._config.audience or self._config.client_id
-        )
+        self._effective_audience: Optional[str] = self._config.audience or self._config.client_id
 
         logger.info(
             "OIDC auth plugin initialized with issuer=%s, audience=%s",

@@ -88,11 +88,7 @@ class FeishuApiSession:
                     "Feishu credentials not configured. Set FEISHU_APP_ID and "
                     "FEISHU_APP_SECRET environment variables, or configure in ov.conf."
                 )
-            builder = (
-                builder.app_id(app_id)
-                .app_secret(app_secret)
-                .cache(self._tenant_token_cache)
-            )
+            builder = builder.app_id(app_id).app_secret(app_secret).cache(self._tenant_token_cache)
 
         client = builder.build()
         self._clients[use_user_token] = client

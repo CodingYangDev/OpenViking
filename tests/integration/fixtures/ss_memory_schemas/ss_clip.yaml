@@ -3,31 +3,43 @@ enabled: true
 stage: user
 peer_enabled: false
 operation_mode: upsert
-directory: "viking://resources/ss_memory/projects"
+directory: "viking://user/{{ user_space }}/memories/ss/projects"
 filename_template: "{{ project_id }}/plots/{{ plot_id }}/clips/{{ clip_id }}/clip.md"
 description: |
-  SS Clip（片段）记忆。正文只能来自 role=user 的明确表达。记录只属于一个具体 Clip 的
-  叙事任务、时长、动作链、参考、连续性、基准 Take 和精确修改边界。project_id、
-  plot_id、clip_id 必须由 SS_CONTEXT 或已解析引用支持。
+  SS Clip 记忆：只属于一个 Clip 的要求。
 
-  创建门槛（必须满足）：
-  - 至少存在一条用户原话，通过明确引用或可被工具唯一解析的序号/名称指向该 Clip；
-    没有此类原话时必须 no-op。
-  - 工具创建的 Clip、Take、标题、时长、生成状态或选中版本只能解析身份和状态，
-    不能复制为记忆正文，也不能单独触发文件创建。
-  - 针对整个 Plot 的拆分、节奏、重生成或多个 Clip 的共同衔接仍属于 ss_plot；
-    只有用户为当前 Clip 给出独立要求时才写入 ss_clip。
-  - 只有 Clip 标题、工具时长、继承规则或泛化连续性时，不创建文件。
+  先逐条分类，分类与作用层级相互独立。下列标签只用于内部筛选和评测，禁止写入 content：
+  - [额外配置]（保留）：用户明确表达、当前回复完成后仍有用、且不属于对象已有数据的要求。
+  - [基础配置]（不保留）：Project、Plot、Clip、角色、场景、道具、素材或当前 Prompt 中已有的信息。
+  - [单次行为]（不保留）：开始生成、重跑、查看、继续、发送确认卡等一次性动作。
+  - [结果评价]（不保留）：只有评价而没有可执行方向；同句中的明确方向须拆成独立 [额外配置]。
+  - [任务输入]（不保留）：完整剧本、分镜、Prompt、时间轴、附件转写或既有输出本身；可从中另行提炼未来仍有用的明确要求。
+  - [已失效]（不保留）：被同层级更晚的明确指令替代的旧要求。
+  - [模型推断]（不保留）：用户未明确表达、被补充、扩大对象或提升范围的内容。
+  - [非用户来源]（不保留）：System、Assistant、工具结果和路由元数据中的内容；它们只能辅助消解指代与路由。
+  - [上下文不足]（不保留）：无法从完整可用上下文唯一确定作用对象或范围的内容。
 
-  作用域与层级：
-  - 每个 ss_clip 只属于一个父 ss_plot，该 Plot 再属于一个 ss_project；project_id 和
-    plot_id 都是必需父键，禁止把 Clip 直接挂到 Project 或其他 Plot。
-  - 同一条消息对多个 Clip 给出不同要求时拆成多个 ss_clip 操作，不能合并各自时长和基准。
-  - Plot 整体剧情、空间或总节奏写入 ss_plot；跨多个 Plot 的规则写入 ss_project；
-    跨项目偏好写入 ss_user。
-  - Take 是 Clip 的候选生成版本，不是第五层记忆。只有用户明确选择、引用或指定某个
-    Take 为修改基准时，才在 edit_constraints 中记录 take_id 和对应修改边界。
-  同一事实只写入一个层级，明确的窄作用域优先。
+  共同规则：
+  - 每条候选必须拆成一个原子事实并完成上述分类；只有 [额外配置] 可以写入 Memory，同一事实只写一处。
+  - 不得通过给内容加上“[额外配置]”字样绕过筛选；必须先判断其真实类别。
+  - 事实必须由用户明确表达。允许压缩措辞，但不得补充要求、扩大对象或改变范围。
+  - 用户以“好的、确认、用2”等明确采纳 Assistant 提议时，可用被唯一指向的提议还原内容；纯执行确认仍是 [单次行为]。
+  - 作用层级只按用户当时表达所指向的对象和完整可用上下文判断，不能由分类标签决定。
+  - 可用显式 ID、资源归属、当前焦点、对象清单、前序对话、确认卡或工具操作解析真实对象；只能使用唯一匹配的真实 ID，禁止生成 placeholder。
+  - 同一规则在多个 Plot 重复出现不能自动提升为 Project；同层级相同配置合并并聚合证据。
+  - 同层级冲突时只保留最新明确要求；窄范围配置只在自身范围内覆盖宽范围默认值。
+  - “角色A参考素材X”“当前分辨率720”“拆成两个20秒片段”属于 [基础配置]；“梳理、检查、生成、重写、发确认卡”属于 [单次行为]，均不得写入。
+
+  本层：
+  - 单个 Clip 的时长、Take/基准版本、参考、动作、画面、声音、首尾落幅、局部修改或具体衔接，写 ss_clip。
+  - 属于该 Clip 的事实只能保存在 ss_clip，不能写入父 Plot 或 Project。
+  - 单个 Clip 的局部要求已唯一定位时，targets 只含 clip 或同时含 plot 均归 ss_clip；recorded_focus 为 Plot 不能改变该归属。缺少父级信息也不能改写父级兜底。
+  - 用户无需说出 clip_id；只要完整可用上下文能把指代唯一解析到一个真实 Clip 即可。
+  - 只有用户明确要求整个 Plot 或涉及同一 Plot 的多个 Clip 共同遵守时，才写 ss_plot；跨多个 Plot 写 ss_project；无法唯一定位则 no-op，禁止生成 placeholder。
+  - Take 不是第五层；仅在用户明确选用或指定为修改基准时记录。工具状态不能单独触发记忆。
+  - 例：唯一路由为 clip_A，用户说“其他不变，只把信封改成中文” -> clip_A。
+
+  格式：content 只含“- ”列表；一行一个最终约束，尽量不超过 40 字；不写标签、标题、解释、过程、行号或 Tab，保留必要 ID、数值、范围与否定。
 fields:
   - name: project_id
     type: string
@@ -36,43 +48,14 @@ fields:
   - name: plot_id
     type: string
     merge_op: immutable
-    description: 已解析上下文中的稳定父 Plot ID。
+    description: 目标 Clip 的真实父 Plot ID；仅从可确认的父子关系补齐，不能仅凭 recorded_focus 猜测。
   - name: clip_id
     type: string
     merge_op: immutable
-    description: 已解析上下文中的稳定 Clip ID。
-  - name: narrative_and_timing
+    description: 上下文证据支持的稳定 Clip ID。
+  - name: content
     type: string
     merge_op: patch
-    description: Clip 的叙事目的、动作链、用户要求的时长以及首尾停留。
-  - name: visual_and_audio
-    type: string
-    merge_op: patch
-    description: Clip 特有的人物、道具、画面、对白、声音和参考约束。
-  - name: continuity
-    type: string
-    merge_op: patch
-    description: |
-      前后 Clip ID 以及跨边界必须保持的具体状态，离线物化后供线上直接读取。
-  - name: edit_constraints
-    type: string
-    merge_op: patch
-    description: |
-      用户明确指定的基准 take_id / 资源版本、允许修改的内容和必须保持不变的内容。
-content_template: |-
-  ## 叙事与时长
-  {{ narrative_and_timing }}
-
-  ## 画面与声音
-  {{ visual_and_audio }}
-
-  ## 衔接与依赖
-  {{ continuity }}
-
-  ## Take 与修改边界
-  {{ edit_constraints }}
+    description: 仅写单个 Clip 的局部 [额外配置] 正文，不写分类标签；禁止写入父 Plot/Project 或跨层重复；每行一个简短“- ”约束。
 embedding_template: |-
-  {{ narrative_and_timing }}
-  {{ visual_and_audio }}
-  {{ continuity }}
-  {{ edit_constraints }}
+  {{ content }}

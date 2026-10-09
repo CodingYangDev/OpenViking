@@ -189,15 +189,9 @@ def load_ovcli_config(config_path: Optional[str] = None) -> Optional[OVCLIConfig
 
         # Parse LDAP config
         auth_mode = _optional_string(data.get("auth_mode"), path="ovcli.auth_mode")
-        ldap_username = _optional_string(
-            data.get("ldap_username"), path="ovcli.ldap_username"
-        )
-        ldap_password = _optional_string(
-            data.get("ldap_password"), path="ovcli.ldap_password"
-        )
-        oidc_token = _optional_string(
-            data.get("oidc_token"), path="ovcli.oidc_token"
-        )
+        ldap_username = _optional_string(data.get("ldap_username"), path="ovcli.ldap_username")
+        ldap_password = _optional_string(data.get("ldap_password"), path="ovcli.ldap_password")
+        oidc_token = _optional_string(data.get("oidc_token"), path="ovcli.oidc_token")
 
         return OVCLIConfig(
             url=_optional_string(data.get("url"), path="ovcli.url"),
@@ -221,7 +215,9 @@ def load_ovcli_config(config_path: Optional[str] = None) -> Optional[OVCLIConfig
         raise ValueError(f"Invalid CLI config in {path}: {exc}") from exc
 
 
-def _resolve_env_or_config(env_var: str, explicit: Optional[str], config_value: Optional[str]) -> Optional[str]:
+def _resolve_env_or_config(
+    env_var: str, explicit: Optional[str], config_value: Optional[str]
+) -> Optional[str]:
     """Helper to resolve value: explicit arg > env var > config file."""
     if explicit is not None:
         return explicit
@@ -253,23 +249,19 @@ def resolve_client_config(
 
     # Resolve LDAP config (explicit arg > env var > config file)
     resolved_auth_mode = _resolve_env_or_config(
-        "OPENVIKING_AUTH_MODE", auth_mode,
-        cli_config.auth_mode if cli_config else None
+        "OPENVIKING_AUTH_MODE", auth_mode, cli_config.auth_mode if cli_config else None
     )
     resolved_ldap_username = _resolve_env_or_config(
-        "OPENVIKING_USERNAME", ldap_username,
-        cli_config.ldap_username if cli_config else None
+        "OPENVIKING_USERNAME", ldap_username, cli_config.ldap_username if cli_config else None
     )
     resolved_ldap_password = _resolve_env_or_config(
-        "OPENVIKING_PASSWORD", ldap_password,
-        cli_config.ldap_password if cli_config else None
+        "OPENVIKING_PASSWORD", ldap_password, cli_config.ldap_password if cli_config else None
     )
     # OIDC token: explicit arg > env var > config file.
     # When auth_mode is oidc and no token is resolvable, leave it None so
     # callers can choose to fall back to an api_key that looks like a JWT.
     resolved_oidc_token = _resolve_env_or_config(
-        "OPENVIKING_OIDC_TOKEN", oidc_token,
-        cli_config.oidc_token if cli_config else None
+        "OPENVIKING_OIDC_TOKEN", oidc_token, cli_config.oidc_token if cli_config else None
     )
 
     resolved_url = url or os.getenv("OPENVIKING_URL") or (cli_config.url if cli_config else None)

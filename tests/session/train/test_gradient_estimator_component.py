@@ -17,8 +17,9 @@ from openviking.session.train import (
     RolloutAnalysis,
     Rubric,
     RubricEvaluation,
+    Trajectory,
 )
-from openviking.session.train.components.experience_improvement_gate import (
+from openviking.session.train.gates.experience import (
     EXPERIENCE_GATE_CONTEXTS_KEY,
 )
 
@@ -42,6 +43,27 @@ def analysis(name="case_a", session=SESSION, passed=True):
     )
     return RolloutAnalysis(
         rollout=rollout,
+        trajectories=[
+            Trajectory(
+                name="sample",
+                uri=(
+                    "viking://user/u/memories/trajectories/"
+                    + name
+                    + "/"
+                    + session.rsplit("/sessions/", 1)[-1].replace("/", "_")
+                    + ".md"
+                ),
+                content="# Session Context\n\n# Trajectory\n\n1. `user` cancel duplicate\n",
+                outcome="unknown" if passed is None else "success" if passed else "failure",
+                metadata={
+                    "case_name": name,
+                    "source_session_uri": session,
+                    "evidence": [],
+                    "experience_execution": {},
+                    "evaluation": None,
+                },
+            )
+        ],
         evaluation=(
             None
             if passed is None
@@ -91,18 +113,19 @@ async def test_direct_session_proposal_has_fixed_case_and_archive_provenance(mon
     monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", run)
     item = analysis(passed=False)
     gradients = await estimate(ExperienceGradientEstimator(), item)
-    assert item.trajectories == []
+    assert len(item.trajectories) == 1
     assert len(gradients) == 1
     proposal = gradients[0]
     assert proposal.target_name == item.rollout.case.name
-    assert proposal.links[0].to_uri == SESSION
+    assert proposal.links[0].to_uri == item.trajectories[0].uri
     gate_context = proposal.metadata[EXPERIENCE_GATE_CONTEXTS_KEY][0]
     assert gate_context["passed"] is False
     assert gate_context["feedback"] == ["duplicate remains"]
     assert gate_context["evidence"][0]["summary"] == "Cancel the duplicate booking."
     provider = run.await_args.args[0]
     assert provider.target_uri == proposal.target_uri
-    assert provider.messages == item.rollout.messages
+    assert provider.messages == []
+    assert provider.trajectories == item.trajectories
 
 
 @pytest.mark.asyncio
@@ -112,6 +135,85 @@ async def test_unknown_outcome_is_not_promoted_to_success(monkeypatch):
     )
     (proposal,) = await estimate(ExperienceGradientEstimator(), analysis(passed=None))
     assert proposal.metadata[EXPERIENCE_GATE_CONTEXTS_KEY][0]["passed"] is None
+
+
+@pytest.mark.asyncio
+async def test_candidate_can_generalize_evaluator_backed_success_value(monkeypatch):
+    item = analysis(passed=True)
+    item.trajectories[0].metadata["evaluation_criteria"] = [
+        {
+            "id": "evaluation:metadata.result.communicate_checks[0].met",
+            "kind": "criterion",
+            "passed": True,
+            "summary": '{"info":"1628","met":true}',
+        }
+    ]
+
+    async def generalized_candidate(self, provider, context):
+        provider.read_file = AsyncMock(return_value=None)
+        await provider.prefetch()
+        return operations(
+            content='dag = workflow("total")\nr = tell("calculate the total from current records")'
+        )
+
+    monkeypatch.setattr(
+        ExperienceGradientEstimator,
+        "_run_extract_loop",
+        generalized_candidate,
+    )
+
+    proposals = await estimate(ExperienceGradientEstimator(), item)
+    assert len(proposals) == 1
+
+
+@pytest.mark.asyncio
+async def test_candidate_copying_session_entity_ids_into_reminder_becomes_noop(monkeypatch):
+    item = analysis(passed=True)
+    item.rollout.case.input = {"user_query": "Cancel the reservations XEHM4B and 59XX6W."}
+
+    monkeypatch.setattr(
+        ExperienceGradientEstimator,
+        "_run_extract_loop",
+        AsyncMock(
+            return_value=operations(
+                content=(
+                    'dag = workflow("scope")\n'
+                    'r = tell("Only modify XEHM4B and 59XX6W unless the user adds another")'
+                )
+            )
+        ),
+    )
+
+    assert await estimate(ExperienceGradientEstimator(), item) == []
+    assert item.metadata["experience_synthesis_noop"] == {
+        "reason": "candidate copied session-specific identifiers into reminders",
+        "identifiers": ["59XX6W", "XEHM4B"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_generalized_reminder_and_numeric_rule_value_are_accepted(monkeypatch):
+    item = analysis(passed=True)
+    item.rollout.case.input = {
+        "user_query": "Cancel reservations XEHM4B and 59XX6W and communicate total 1628."
+    }
+
+    monkeypatch.setattr(
+        ExperienceGradientEstimator,
+        "_run_extract_loop",
+        AsyncMock(
+            return_value=operations(
+                content=(
+                    'dag = workflow("scope")\n'
+                    'r = tell("Only modify reservations explicitly selected in the current '
+                    'request; communicate total 1628")'
+                )
+            )
+        ),
+    )
+
+    proposals = await estimate(ExperienceGradientEstimator(), item)
+    assert len(proposals) == 1
 
 
 @pytest.mark.asyncio
@@ -192,3 +294,33 @@ async def test_estimator_wires_session_provider_into_extract_loop(monkeypatch):
     assert provider.source_session_uri == SESSION
     assert provider._viking_fs is fs
     resolver.get_vlm.assert_awaited_once_with("default")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("as_dict", [False, True])
+async def test_patch_proposal_materializes_valid_dag_and_retains_observed_base(
+    monkeypatch, as_dict
+):
+    from openviking.session.memory.merge_op import SearchReplaceBlock, StrPatch
+
+    source = 'dag = workflow("review")\nr = tell("old reminder")'
+    patch = StrPatch(blocks=[SearchReplaceBlock(search="old reminder", replace="new reminder")])
+    value = patch.model_dump() if as_dict else patch
+    ops = operations(content=value)
+    old = MemoryFile(
+        uri=f"{ROOT}/case_a.md",
+        memory_type="experiences",
+        content=source,
+        extra_fields={"experience_name": "case_a", "version": 3},
+    )
+    ops.upsert_operations[0].old_memory_file_content = old
+    monkeypatch.setattr(
+        ExperienceGradientEstimator, "_run_extract_loop", AsyncMock(return_value=ops)
+    )
+    (proposal,) = await estimate(ExperienceGradientEstimator(), analysis())
+    expected = source.replace("old reminder", "new reminder")
+    assert proposal.before_file.content == source
+    assert proposal.after_file.content == expected
+    assert proposal.metadata["memory_fields"]["content"] == expected
+    assert proposal.base_version == 3
+    assert ops.upsert_operations[0].memory_fields["content"] is value

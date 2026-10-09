@@ -45,9 +45,7 @@ def _load_document(path: Path, format_hint: str | None = None):
 
     try:
         document = (
-            anydoc.to_document(data, source_format)
-            if source_format
-            else anydoc.to_document(data)
+            anydoc.to_document(data, source_format) if source_format else anydoc.to_document(data)
         )
     except anydoc.ConvertError as exc:
         format_context = f" as {source_format}" if source_format else ""

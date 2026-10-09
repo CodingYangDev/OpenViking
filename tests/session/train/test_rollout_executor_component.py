@@ -5,9 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -251,6 +250,7 @@ async def test_tau2_plain_text_router_records_delivered_assistant_message():
     from benchmark.tau2.train.rollout_executor_vikingbot import _make_tau2_plain_text_router
 
     delivered = []
+    user_messages = []
 
     class FakeTools:
         @staticmethod
@@ -268,6 +268,7 @@ async def test_tau2_plain_text_router_records_delivered_assistant_message():
         bus=None,
         session_key=SimpleNamespace(),
         record_delivered_assistant_message=delivered.append,
+        record_user_message=lambda user, assistant: user_messages.append((user, assistant)),
     )
     result = await route(
         SimpleNamespace(
@@ -289,6 +290,7 @@ async def test_tau2_plain_text_router_records_delivered_assistant_message():
         {"role": "assistant", "content": "visible answer"},
         {"role": "user", "content": "user reply"},
     ]
+    assert user_messages == [("user reply", "visible answer")]
 
 
 def test_tau2_reward_info_is_json_safe_in_rollout_messages_and_evaluation():
@@ -392,6 +394,189 @@ def test_tau2_litellm_generate_retry_patch_does_not_retry_non_rate_limit(monkeyp
     assert calls["count"] == 1
 
 
+def _tau2_model_reply(content=None, tool_calls=None, **raw_fields):
+    return SimpleNamespace(
+        content=content,
+        tool_calls=tool_calls,
+        raw_data={
+            "id": "response-for-diagnostics",
+            "model": "test-model",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": content, "tool_calls": tool_calls, **raw_fields},
+                }
+            ],
+            "usage": {"completion_tokens": 12},
+        },
+    )
+
+
+@pytest.mark.parametrize("content", [None, "", " \n"])
+@pytest.mark.parametrize(
+    "reasoning",
+    [
+        {"reasoning_content": "private thinking"},
+        {"thinking_blocks": [{"type": "thinking", "thinking": "private thinking"}]},
+    ],
+)
+def test_tau2_generate_retries_reasoning_only_reply(monkeypatch, content, reasoning):
+    import benchmark.tau2.common.tau2_env.tau2_environment as module
+
+    reply = _tau2_model_reply("Yes, please proceed.")
+    generate = Mock(spec=[], side_effect=[_tau2_model_reply(content, **reasoning), reply])
+    sleeps = []
+    diagnostics = Mock()
+    monkeypatch.setattr(module, "_tau2_rate_limit_retry_delay", lambda attempt: attempt)
+    monkeypatch.setattr(module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(module.tracer, "info", diagnostics)
+    warning = Mock()
+    monkeypatch.setattr(module.logger, "warning", warning)
+    messages = [{"role": "user", "content": "Please confirm."}]
+
+    wrapped = module._wrap_tau2_generate_with_rate_limit_retry(generate)
+    assert wrapped(model="test-model", messages=messages) is reply
+    assert generate.call_count == 2
+    assert sleeps == [1]
+    assert all(call.kwargs["messages"] is messages for call in generate.call_args_list)
+    assert generate.call_args_list[0] == generate.call_args_list[1]
+    assert messages == [{"role": "user", "content": "Please confirm."}]
+    event = diagnostics.call_args.args[0]
+    assert "response-for-diagnostics" in event
+    assert "finish_reason" in event
+    assert "completion_tokens" in event
+    assert "private thinking" not in event
+    warning.assert_not_called()
+
+
+def test_tau2_generate_reasoning_only_retry_is_bounded(monkeypatch):
+    import benchmark.tau2.common.tau2_env.tau2_environment as module
+
+    generate = Mock(spec=[], return_value=_tau2_model_reply(reasoning_content="private thinking"))
+    sleeps = []
+    trace_error = Mock()
+    monkeypatch.setattr(module, "_tau2_rate_limit_retry_delay", lambda attempt: attempt)
+    monkeypatch.setattr(module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(module.tracer, "error", trace_error)
+
+    wrapped = module._wrap_tau2_generate_with_rate_limit_retry(generate)
+    with pytest.raises(ValueError, match="reasoning-only.*3 attempts") as error:
+        wrapped()
+    assert generate.call_count == 3
+    assert sleeps == [1, 2]
+    assert "response-for-diagnostics" in str(error.value)
+    assert "private thinking" not in str(error.value)
+    assert trace_error.call_args.kwargs == {"e": error.value, "console": False}
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        _tau2_model_reply("Valid final answer", reasoning_content="thinking"),
+        _tau2_model_reply("###STOP###", reasoning_content="thinking"),
+        _tau2_model_reply(tool_calls=[{"name": "tool"}], reasoning_content="thinking"),
+        _tau2_model_reply(),
+        _tau2_model_reply("", reasoning_content=""),
+        _tau2_model_reply("", reasoning_content=" \n"),
+        _tau2_model_reply(reasoning_content="thinking", refusal="Request refused"),
+        SimpleNamespace(content=None, tool_calls=None, raw_data=None),
+        SimpleNamespace(
+            content=None,
+            tool_calls=None,
+            audio_content="audio-bytes",
+            raw_data=_tau2_model_reply(reasoning_content="thinking").raw_data,
+        ),
+    ],
+)
+def test_tau2_generate_does_not_retry_other_replies(monkeypatch, reply):
+    import benchmark.tau2.common.tau2_env.tau2_environment as module
+
+    generate = Mock(spec=[], return_value=reply)
+    sleep = Mock(side_effect=AssertionError("unexpected retry"))
+    monkeypatch.setattr(module.time, "sleep", sleep)
+    assert module._wrap_tau2_generate_with_rate_limit_retry(generate)() is reply
+    generate.assert_called_once_with()
+    sleep.assert_not_called()
+
+
+def test_tau2_generate_reasoning_only_budget_survives_rate_limits(monkeypatch):
+    import benchmark.tau2.common.tau2_env.tau2_environment as module
+
+    empty = _tau2_model_reply(reasoning_content="thinking")
+    rate_limit = RuntimeError("TPM (Tokens Per Minute) limit of the model is exceeded")
+    generate = Mock(spec=[], side_effect=[empty, rate_limit, empty, rate_limit, empty])
+    sleeps = []
+    monkeypatch.setattr(module, "_tau2_rate_limit_retry_delay", lambda attempt: attempt)
+    monkeypatch.setattr(module.time, "sleep", sleeps.append)
+
+    with pytest.raises(ValueError, match="reasoning-only.*3 attempts"):
+        module._wrap_tau2_generate_with_rate_limit_retry(generate)()
+    assert generate.call_count == 5
+    assert sleeps == [1, 1, 2, 2]
+
+
+def test_tau2_reasoning_only_retry_does_not_duplicate_user_history(monkeypatch):
+    import tau2.user.user_simulator as simulator_module
+    from tau2.data_model.message import AssistantMessage, SystemMessage
+    from tau2.user.user_simulator import UserSimulator, UserState
+
+    import benchmark.tau2.common.tau2_env.tau2_environment as module
+
+    empty = AssistantMessage(
+        role="assistant",
+        content=None,
+        raw_data=_tau2_model_reply(reasoning_content="thinking").raw_data,
+    )
+    valid = AssistantMessage(role="assistant", content="Yes, please proceed.")
+    generate = Mock(spec=[], side_effect=[empty, valid])
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        simulator_module, "generate", module._wrap_tau2_generate_with_rate_limit_retry(generate)
+    )
+    simulator = UserSimulator(llm="offline-mock", instructions="Offline test", tools=[])
+    state = UserState(
+        system_messages=[SystemMessage(role="system", content="Offline test")], messages=[]
+    )
+    incoming = AssistantMessage(role="assistant", content="Please confirm.")
+
+    user_reply, state = simulator.generate_next_message(incoming, state)
+    user_reply.validate()
+    assert user_reply.content == valid.content
+    assert state.messages == [incoming, user_reply]
+    assert generate.call_count == 2
+
+
+@pytest.mark.parametrize("exception", [ValueError("bad request"), asyncio.CancelledError()])
+def test_tau2_reasoning_only_retry_preserves_other_errors(monkeypatch, exception):
+    import benchmark.tau2.common.tau2_env.tau2_environment as module
+
+    generate = Mock(
+        spec=[],
+        side_effect=[_tau2_model_reply(reasoning_content="thinking"), exception],
+    )
+    sleeps = []
+    monkeypatch.setattr(module, "_tau2_rate_limit_retry_delay", lambda attempt: attempt)
+    monkeypatch.setattr(module.time, "sleep", sleeps.append)
+    with pytest.raises(type(exception)) as error:
+        module._wrap_tau2_generate_with_rate_limit_retry(generate)()
+    assert error.value is exception
+    assert generate.call_count == 2
+    assert sleeps == [1]
+
+
+def test_tau2_reasoning_only_retry_preserves_content_filter(monkeypatch):
+    import benchmark.tau2.common.tau2_env.tau2_environment as module
+
+    reply = _tau2_model_reply(reasoning_content="thinking")
+    reply.raw_data["choices"][0]["finish_reason"] = "content_filter"
+    generate = Mock(spec=[], return_value=reply)
+    sleep = Mock(side_effect=AssertionError("unexpected retry"))
+    monkeypatch.setattr(module.time, "sleep", sleep)
+    assert module._wrap_tau2_generate_with_rate_limit_retry(generate)() is reply
+    generate.assert_called_once_with()
+    sleep.assert_not_called()
+
+
 def test_tau2_native_env_reward_handles_required_id_and_tool_call_ids(monkeypatch):
     import benchmark.tau2.common.tau2_env.tau2_environment as tau2_environment
     from benchmark.tau2.common.tau2_env.tau2_environment import Tau2BenchEnv
@@ -439,54 +624,91 @@ def test_tau2_final_answer_is_appended_for_native_evaluation(monkeypatch):
     assert evaluation.communicate_checks[0].met is True
 
 
-def test_tau2_configure_tools_removes_only_openviking_tools():
-    from benchmark.tau2.train.rollout_executor import _configure_tools
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data_split", ["airline_train", "airline_test"])
+@pytest.mark.parametrize("keep_default_tools", [False, True])
+@pytest.mark.parametrize("empty_provider", [False, True])
+async def test_tau2_configure_tools_uses_only_provider_whitelist(
+    data_split, keep_default_tools, empty_provider
+):
+    from vikingbot.agent.tools.registry import ToolRegistry
+    from vikingbot.config.schema import SessionKey
 
-    class FakeTools:
-        def __init__(self):
-            self.tool_names = [
-                "read_file",
-                "openviking_search",
-                "openviking_memory_commit",
-                "web_search",
-            ]
-            self.unregistered = []
-            self.registered = []
+    from benchmark.tau2.train.rollout_executor_vikingbot import _configure_tools, _make_tau2_tool
 
-        def unregister(self, name):
-            self.unregistered.append(name)
-            self.tool_names.remove(name)
+    def schema(name):
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
 
-        def register(self, tool):
-            self.registered.append(tool.name)
+    inherited_names = [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "exec",
+        "web_search",
+        "web_fetch",
+        "generate_image",
+        "message",
+        "spawn",
+        "openviking_search",
+        "openviking_memory_commit",
+        "ask_for_advice",
+        "future_builtin",
+        "calculate",
+    ]
+    inherited_provider = SimpleNamespace(call_tool=Mock(side_effect=AssertionError("builtin ran")))
+    agent = SimpleNamespace(tools=ToolRegistry())
+    for name in inherited_names:
+        agent.tools.register(_make_tau2_tool(schema(name), inherited_provider))
+    # A different, ordinary bot registry must remain untouched.
+    ordinary_tools = ToolRegistry()
+    ordinary_tools.register(agent.tools.get("web_search"))
 
-    class FakeAgent:
-        def __init__(self):
-            self.tools = FakeTools()
+    provider_names = (
+        []
+        if empty_provider
+        else [
+            "get_user_details",
+            "calculate",
+            "communicate_with_user",
+            "done",
+        ]
+    )
+    provider = SimpleNamespace(
+        list_openai_tools=lambda: [schema(name) for name in provider_names],
+        call_tool=Mock(return_value="ok"),
+    )
+    _configure_tools(
+        agent,
+        provider,
+        keep_default_tools=keep_default_tools,
+        data_split=data_split,
+        task_no=5,
+    )
 
-    class FakeProvider:
-        def list_openai_tools(self):
-            return [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_user_details",
-                        "description": "get user",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                }
-            ]
-
-        def call_tool(self, name, args):
-            return "ok"
-
-    agent = FakeAgent()
-
-    _configure_tools(agent, FakeProvider(), keep_default_tools=True)
-
-    assert agent.tools.unregistered == ["openviking_search", "openviking_memory_commit"]
-    assert agent.tools.tool_names == ["read_file", "web_search"]
-    assert agent.tools.registered == ["get_user_details"]
+    assert agent.tools.tool_names == provider_names
+    assert agent.tools.get_definitions() == [schema(name) for name in provider_names]
+    assert agent.tools.get_definitions(ov_tools_enable=False) == agent.tools.get_definitions()
+    assert (agent._tau2_dag_runtime is not None) == keep_default_tools
+    if keep_default_tools:
+        assert not hasattr(agent._tau2_dag_runtime, "experience_names")
+    key = SessionKey(type="cli", channel_id="test", chat_id=data_split)
+    for name in set(inherited_names) - set(provider_names):
+        outcome = await agent.tools.execute_detailed(name, {}, session_key=key)
+        assert outcome.result == f"Error: Tool '{name}' not found"
+    if not empty_provider:
+        # An overlapping name must use Tau2's implementation, not the old builtin.
+        assert await agent.tools.get("calculate").execute(None) == "ok"
+        provider.call_tool.assert_called_once_with("calculate", {})
+    inherited_provider.call_tool.assert_not_called()
+    assert ordinary_tools.tool_names == ["web_search"]
 
 
 def test_tau2_rollout_backend_factory_defaults_to_native():
@@ -640,7 +862,10 @@ async def test_tau2_vikingbot_rollout_runs_on_current_event_loop():
 
 
 @pytest.mark.asyncio
-async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(monkeypatch):
+@pytest.mark.parametrize("execution_failure", [None, "simulator", "evaluation"])
+async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(
+    monkeypatch, execution_failure
+):
     import benchmark.tau2.train.rollout_executor_vikingbot as module
     from benchmark.tau2.train.rollout_executor_vikingbot import VikingBotTau2RolloutExecutor
 
@@ -648,8 +873,19 @@ async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(monkeypatc
     calls = []
 
     class FakeEnv:
+        execution_error = None
+
         def _get_reward(self):
             calls.append(("reward", threading.get_ident()))
+            if execution_failure == "simulator":
+                self.execution_error = {
+                    "source": "tau2_simulator",
+                    "type": "ValueError",
+                    "message": "empty user reply",
+                }
+                return 0.0, {}
+            if execution_failure == "evaluation":
+                raise ValueError("evaluation failed")
             return 1.0, {"ok": True}
 
     class FakeTau2BenchToolProvider:
@@ -674,7 +910,10 @@ async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(monkeypatc
     async def fake_run_agent(**kwargs):
         calls.append(("run_agent", threading.get_ident()))
         calls.append(("case_lookup", kwargs.get("case_lookup")))
-        return "final", None, [], {}, 1, None, []
+        kwargs["initial_llm_request"].update(
+            {"messages": [{"role": "user", "content": "initial"}], "tools": []}
+        )
+        return "final", None, [], {}, 1, None, [], None
 
     monkeypatch.setattr(module, "_tool_provider_cls", lambda: FakeTau2BenchToolProvider)
     monkeypatch.setattr(module, "_build_agent", lambda *args, **kwargs: FakeAgent())
@@ -700,7 +939,12 @@ async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(monkeypatc
         ExecutionContext(policy_snapshot_id="snapshot", metadata={}),
     )
 
-    assert rollout.metadata["reward"] == 1.0
+    if execution_failure is None:
+        assert rollout.metadata["reward"] == 1.0
+        assert rollout.metadata["execution_error"] is None
+    else:
+        assert rollout.evaluation.score == 0.0
+        assert rollout.metadata["execution_error"]["source"] == f"tau2_{execution_failure}"
     call_values = dict(calls)
     assert call_values["case_lookup"] == {
         "benchmark": "tau2",
@@ -722,6 +966,10 @@ async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(monkeypatc
             "input.task_id": "0",
         },
     }
+    assert rollout.metadata["initial_llm_request"] == {
+        "messages": [{"role": "user", "content": "initial"}],
+        "tools": [],
+    }
     call_threads = call_values
     assert call_threads["reset"] != event_loop_thread
     assert call_threads["build_agent"] != event_loop_thread
@@ -730,205 +978,197 @@ async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_tau2_run_agent_injects_experience_without_loader_tool(monkeypatch):
-    from vikingbot.providers.base import LLMResponse, ToolCallRequest
+@pytest.mark.parametrize("split", ["train", "test"])
+@pytest.mark.parametrize("keep_default_tools", [False, True])
+async def test_tau2_run_agent_loads_no_skills(tmp_path, split, keep_default_tools):
+    from vikingbot.agent.context import ContextBuilder
+    from vikingbot.agent.tools.registry import ToolRegistry
+    from vikingbot.config.schema import SessionKey
 
     import benchmark.tau2.train.rollout_executor_vikingbot as module
 
-    observed = {}
-    real_imports = module._vikingbot_imports()
+    for name in ("experience_loader", "task_case_experience", "other_skill"):
+        folder = tmp_path / "skills" / name
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(
+            f"---\nname: {name}\nalways: true\n---\n{name} instructions", encoding="utf-8"
+        )
+    context = ContextBuilder(tmp_path, remote_skills_summary="REMOTE_SKILL_SENTINEL")
+    context._templates_ensured = True
+    context._get_identity = AsyncMock(return_value="Test agent")
+    from vikingbot.session.manager import SessionManager
 
-    class FakeSandbox:
-        content = ""
-
-        async def read_file(self, path):
-            observed.setdefault("sandbox_reads", []).append(path)
-            return self.content
-
-        async def write_file(self, path, content):
-            observed.setdefault("sandbox_writes", []).append((path, content))
-            type(self).content = content
-
-    class FakeSandboxManager:
-        def get_workspace_path(self, session_key):
-            return Path("/tmp/fake-workspace")
-
-        def to_workspace_id(self, session_key):
-            return "workspace"
-
-        async def get_sandbox(self, session_key):
-            return FakeSandbox()
-
-    class FakeContextBuilder:
-        def __init__(self, workspace, *, sandbox_manager=None, eval=False, **kwargs):
-            self.workspace = workspace
-            self.sandbox_manager = sandbox_manager
-
-        async def build_messages(self, **kwargs):
-            return [
-                {"role": "system", "content": "ctx system"},
-                {"role": "user", "content": kwargs["current_message"]},
-            ]
-
-        def add_assistant_message(self, messages, content, tool_calls=None, reasoning_content=None):
-            msg = {"role": "assistant", "content": content or "[tool call]"}
-            if tool_calls:
-                msg["tool_calls"] = tool_calls
-            if reasoning_content:
-                msg["reasoning_content"] = reasoning_content
-            messages.append(msg)
-            return messages
-
-        def add_tool_result(self, messages, tool_call_id, tool_name, result):
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "name": tool_name,
-                    "content": result,
-                }
-            )
-            return messages
-
-    class FakeProvider:
-        def __init__(self):
-            self.call_count = 0
-
-        async def chat(self, messages, tools=None, **kwargs):
-            self.call_count += 1
-            observed["llm_messages"] = list(messages)
-            return LLMResponse(
-                content=None,
-                tool_calls=[ToolCallRequest("call-1", "done", {}, 0)],
-            )
-
-        async def chat_stream(self, **kwargs):
-            from vikingbot.providers.base import LLMStreamEvent
-
-            yield LLMStreamEvent(type="response", response=await self.chat(**kwargs))
-
-        def get_default_model(self):
-            return "fake"
-
-    class FakeAgent:
-        def __init__(self):
-            from vikingbot.agent.tools.filesystem import ReadFileTool
-            from vikingbot.agent.tools.registry import ToolRegistry
-
-            self.sandbox_manager = FakeSandboxManager()
-            self.context = FakeContextBuilder(Path("/tmp/fake-workspace"))
-            self.tools = ToolRegistry()
-            self.tools.register(ReadFileTool())
-            self.tools.register(_DoneTool())
-            self.provider = FakeProvider()
-            self.model = "fake"
-            self.temperature = None
-            self.max_iterations = 3
-            self._tau2_dag_runtime = SimpleNamespace(
-                search_exp=AsyncMock(
-                    return_value='[Experience Reminder]\n[\n  {\n    "slot": "check"\n  }\n]'
-                ),
-                close=AsyncMock(),
-                events=[
-                    {
-                        "experience_uri": "viking://user/default/memories/experiences/case.md",
-                        "state": "running",
-                        "revision": 1,
-                        "slot_values": {"condition": True},
-                        "node_slots": {"1": "condition", "2": "remind"},
-                        "executed_nodes": [1],
-                        "current_nodes": [2],
-                        "waiting_for_context": [],
-                        "actions": [{"node_id": 2, "slot_name": "remind"}],
-                        "completed_nodes": [],
-                        "action_outcomes": [{"node_id": 2, "status": "issued"}],
-                        "evidence": [{"id": "message:0", "summary": "large duplicated input"}],
-                    }
-                ],
-                reminder_messages=[],
-                record_delivered_assistant_message=lambda content: None,
-            )
-
-        _chat_with_stream_events = real_imports["AgentLoop"]._chat_with_stream_events
-        _run_agent_loop = real_imports["AgentLoop"]._run_agent_loop
-
-    class _DoneTool:
-        @property
-        def name(self):
-            return "done"
-
-        @property
-        def description(self):
-            return "done"
-
-        @property
-        def parameters(self):
-            return {"type": "object", "properties": {}}
-
-        def to_schema(self):
-            return {
-                "type": "function",
-                "function": {
-                    "name": self.name,
-                    "description": self.description,
-                    "parameters": self.parameters,
-                },
-            }
-
-        def validate_params(self, params):
-            return []
-
-        async def execute(self, tool_context, **kwargs):
-            return ""
-
-    monkeypatch.setattr(
-        module,
-        "_vikingbot_imports",
-        lambda: {**real_imports, "ContextBuilder": FakeContextBuilder},
+    agent = SimpleNamespace(
+        sessions=SessionManager(tmp_path),
+        context=context,
+        tools=ToolRegistry(),
+        _run_agent_loop=AsyncMock(return_value=(None, None, [], {}, 1)),
     )
 
-    agent = FakeAgent()
+    async def run_loop(**kwargs):
+        kwargs["on_initial_llm_request"](
+            kwargs["messages"], agent.tools.get_definitions(ov_tools_enable=False)
+        )
+        return None, None, [], {}, 1
+
+    agent._run_agent_loop.side_effect = run_loop
+    initial_request = {}
+    module._configure_tools(
+        agent,
+        SimpleNamespace(list_openai_tools=lambda: []),
+        keep_default_tools=keep_default_tools,
+        data_split=f"airline_{split}",
+    )
+
+    await module._run_agent(
+        agent=agent,
+        system_prompt="Business policy remains in context",
+        user_prompt="Please help with my task",
+        session_key=SessionKey(type="cli", channel_id="test", chat_id=f"advice-{split}"),
+        sender_id="test_user",
+        keep_default_tools=keep_default_tools,
+        initial_llm_request=initial_request,
+    )
+
+    kwargs = agent._run_agent_loop.await_args.kwargs
+    if keep_default_tools:
+        assert "done" in agent._tau2_dag_runtime.review_tools
+        assert "transfer_to_human_agents" in agent._tau2_dag_runtime.review_tools
+        assert "communicate_with_user" not in agent._tau2_dag_runtime.review_tools
+    prompt = kwargs["messages"][0]["content"]
+    assert initial_request["messages"] == kwargs["messages"]
+    assert initial_request["tools"] == []
+    assert "### Skill:" not in prompt
+    assert "ask_for_advice" not in agent.tools.tool_names
+    assert "You MUST call `ask_for_advice`" not in prompt
+    for excluded in (
+        "experience_loader",
+        "task_case_experience",
+        "other_skill",
+        "REMOTE_SKILL_SENTINEL",
+        "Required skill:",
+    ):
+        assert excluded not in prompt
+    assert kwargs["messages"][1]["content"] == "Business policy remains in context"
+    assert kwargs["inject_write_experience"] is False
+    assert kwargs["ov_tools_enable"] is False
+    assert (kwargs["experience_context_provider"] is not None) == keep_default_tools
+
+
+@pytest.mark.asyncio
+async def test_tau2_run_agent_retains_partial_work_on_model_error(tmp_path):
+    from vikingbot.agent.loop import AgentLLMError
+
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+
+    completed_tools = [{"tool_name": "get_user_details", "args": "{}", "result": "known"}]
+    usage = {"total_tokens": 12}
+    from benchmark.tau2.train.dag_experience_runtime import Tau2DagExperienceRuntime
+
+    runtime = Tau2DagExperienceRuntime()
+    runtime.close = AsyncMock()
+    from vikingbot.session.manager import SessionManager
+
+    agent = SimpleNamespace(
+        sessions=SessionManager(tmp_path),
+        context=SimpleNamespace(build_messages=AsyncMock(return_value=[])),
+        _tau2_dag_runtime=runtime,
+        _run_agent_loop=AsyncMock(
+            side_effect=AgentLLMError(
+                "model failed", tools_used=completed_tools, usage=usage, iteration=2
+            )
+        ),
+    )
+    initial_request = {}
+    model_error = agent._run_agent_loop.side_effect
+
+    async def fail_model(**kwargs):
+        kwargs["on_initial_llm_request"](kwargs["messages"], [])
+        raise model_error
+
+    agent._run_agent_loop.side_effect = fail_model
     result = await module._run_agent(
         agent=agent,
-        system_prompt="tau2 policy",
-        user_prompt="user query",
-        session_key=SimpleNamespace(safe_name=lambda: "session"),
-        sender_id="tau2_user",
+        system_prompt="policy",
+        user_prompt="question",
+        session_key=module._vikingbot_imports()["SessionKey"](
+            type="cli", channel_id="test", chat_id="x"
+        ),
+        sender_id="user",
         keep_default_tools=True,
-        case_lookup={"benchmark": "tau2", "strict": True, "case_name": "case"},
+        initial_llm_request=initial_request,
     )
+    assert result[0] is None and result[1] is None
+    assert result[2] == completed_tools
+    assert result[3] == usage
+    assert result[4] == 2
+    assert result[7] == {
+        "source": "vikingbot_llm",
+        "type": "AgentLLMError",
+        "message": "model failed",
+    }
+    runtime.close.assert_awaited_once()
+    assert initial_request == {
+        "capture_boundary": "agent_provider",
+        "messages": [{"role": "system", "content": "policy"}],
+        "tools": [],
+    }
 
-    tools_used = result[2]
-    messages = observed["llm_messages"]
-    assert not observed.get("sandbox_writes")
-    assert not observed.get("sandbox_reads")
-    assert any("[Experience Reminder]" in str(msg.get("content")) for msg in messages)
-    assert [tool["tool_name"] for tool in tools_used] == ["done"]
-    assert tools_used[0]["execute_success"] is True
-    assert agent.provider.call_count == 1
-    assert result[6] == [
-        {
-            "role": "user",
-            "content": '[Experience Reminder]\n[\n  {\n    "slot": "check"\n  }\n]',
-            "after_tool_count": 0,
-        }
-    ]
-    assert result[5].startswith("[Experience Execution]\n")
-    assert "large duplicated input" not in result[5]
 
-    rollout_messages = module._build_rollout_messages(
-        system_prompt="tau2 policy",
-        user_prompt="user query",
-        tools_used=tools_used,
-        final_content=None,
-        evaluation_result=None,
-        reward=1.0,
-        experience_messages=result[6],
-    )
-    reminder_messages = [
-        message
-        for message in rollout_messages
-        if message.role == "user" and "[Experience Reminder]" in message.content
+@pytest.mark.asyncio
+async def test_tau2_batch_returns_failed_model_rollout_without_aborting_others(monkeypatch):
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+
+    rewards = []
+
+    class Provider:
+        def __init__(self, domain, task_id, data_root=None):
+            self.policy = "policy"
+            self.user_query = "question"
+            self.env = SimpleNamespace(_get_reward=self.reward, execution_error=None)
+            self.task_id = task_id
+
+        def reward(self):
+            assert self.task_id != "bad", "Do not evaluate a fatal model failure"
+            rewards.append(self.task_id)
+            return 1.0, {"ok": True}
+
+        def reset(self):
+            pass
+
+        def list_openai_tools(self):
+            return []
+
+    async def run_agent(**kwargs):
+        error = None
+        if kwargs["case_lookup"]["task_id"] == "bad":
+            error = {"source": "vikingbot_llm", "type": "AgentLLMError", "message": "model failed"}
+        return (None if error else "done", None, [], {}, 1, None, [], error)
+
+    monkeypatch.setattr(module, "_tool_provider_cls", lambda: Provider)
+    monkeypatch.setattr(module, "_build_agent", lambda *a, **kw: SimpleNamespace())
+    monkeypatch.setattr(module, "_configure_tools", lambda *a, **kw: None)
+    monkeypatch.setattr(module, "_run_agent", run_agent)
+    cases = [
+        Case(
+            name=task,
+            task_signature=f"tau2:{task}",
+            input={
+                "domain": "airline",
+                "split": "train",
+                "task_id": task,
+                "task_no": i,
+                "data_split": "airline_train",
+            },
+            rubric=Rubric("reward", "", []),
+        )
+        for i, task in enumerate(("bad", "good"))
     ]
-    assert len(reminder_messages) == 1
-    assert reminder_messages[0].id == "tau2-experience-reminder-0"
+    executor = module.VikingBotTau2RolloutExecutor()
+    results = await executor.execute(cases, _policy_set(), ExecutionContext(policy_snapshot_id="p"))
+    assert len(results) == 2
+    assert results[0].evaluation.passed is False
+    assert results[0].metadata["execution_error"]["source"] == "vikingbot_llm"
+    assert results[1].evaluation.passed is True
+    assert results[1].metadata["execution_error"] is None
+    assert rewards == ["good"]

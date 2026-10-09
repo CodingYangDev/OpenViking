@@ -600,9 +600,7 @@ class RuntimeConfigManager(Generic[C, A]):
             reason=reason,
         )
 
-    def _chain_notification(
-        self, event: ConfigChangeEvent
-    ) -> Optional[_PendingNotification]:
+    def _chain_notification(self, event: ConfigChangeEvent) -> Optional[_PendingNotification]:
         """Link an event to the preceding notification for the same scope."""
         is_evict = event.reason is ConfigChangeReason.EVICT
         if not event.changed_sections and not is_evict:
@@ -616,9 +614,7 @@ class RuntimeConfigManager(Generic[C, A]):
         self._notification_tails[event.scope] = completion
         return pending
 
-    async def _notify_in_order(
-        self, pending: Optional[_PendingNotification]
-    ) -> None:
+    async def _notify_in_order(self, pending: Optional[_PendingNotification]) -> None:
         """Deliver one event after its scope predecessor, without write locks."""
         if pending is None:
             return
@@ -760,10 +756,7 @@ class RuntimeConfigManager(Generic[C, A]):
         async with self._lock_for(scope):
             with self._publication_lock:
                 entry = self._accounts.get(account_id)
-                if (
-                    entry is None
-                    or time.monotonic() - entry.last_access <= ACCOUNT_IDLE_TTL_SECS
-                ):
+                if entry is None or time.monotonic() - entry.last_access <= ACCOUNT_IDLE_TTL_SECS:
                     return
                 self._accounts.pop(account_id)
                 self._persisted_settings.pop(scope, None)
