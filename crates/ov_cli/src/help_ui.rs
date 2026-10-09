@@ -211,7 +211,7 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
     },
     CommandHelpSpec {
         path: &["mcps"],
-        purpose: "Manage remote MCP servers and invoke their tools.",
+        purpose: "Manage remote MCP servers, tools, and live context mounts.",
         examples: &[
             HelpItem {
                 label: "ov mcps add '{\"mcpServers\":{\"weather\":{\"url\":\"https://example.com/mcp\"}}}'",
@@ -220,6 +220,10 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
             HelpItem {
                 label: "ov mcps find \"current weather\"",
                 description: "Find a tool in registered catalogs.",
+            },
+            HelpItem {
+                label: "ov mcps mount viking://agent/tools/weather/current.json viking://resources/demo/weather.md --title \"Beijing Weather\" --description \"Current weather in Beijing\" --timeout-seconds 120 --args '{\"city\":\"Beijing\"}'",
+                description: "Mount a tool as a live context node.",
             },
         ],
         next_steps: &[HelpItem {
@@ -3217,7 +3221,10 @@ mod tests {
         for (command, expected) in [
             ("task", "Inspect and manage async processing tasks."),
             ("skills", "Manage installed agent skills."),
-            ("mcps", "Manage remote MCP servers and invoke their tools."),
+            (
+                "mcps",
+                "Manage remote MCP servers, tools, and live context mounts.",
+            ),
             (
                 "session",
                 "Manage sessions, messages, archives, and committed session context.",

@@ -1,0 +1,64 @@
+metadata:
+  id: "semantic.live_context_summary"
+  name: "Live Context Node Summary Generation"
+  description: "Summarize an MCP-backed live context node and preserve the information an agent needs to invoke its tool"
+  version: "1.0.0"
+  language: "en"
+  category: "semantic"
+
+variables:
+  - name: "file_name"
+    type: "string"
+    description: "Live context node file name"
+    required: true
+
+  - name: "title"
+    type: "string"
+    description: "Live context node title"
+    required: true
+
+  - name: "description"
+    type: "string"
+    description: "Live context node description"
+    required: true
+
+  - name: "tool_uri"
+    type: "string"
+    description: "URI of the MCP Tool definition"
+    required: true
+
+  - name: "arguments"
+    type: "string"
+    description: "JSON object containing the mounted MCP Tool arguments"
+    required: true
+
+  - name: "output_language"
+    type: "string"
+    description: "Language code for output"
+    required: true
+
+template: |
+  Output Language: {{ output_language }}
+
+  Generate a concise operational summary for this MCP-backed live context node.
+
+  [Node]
+  File: {{ file_name }}
+  Title: {{ title }}
+  Description: {{ description }}
+  MCP Tool URI: {{ tool_uri }}
+  Mounted arguments: {{ arguments }}
+
+  Output requirements:
+  - Write 80-180 words in {{ output_language }} as plain text.
+  - State the title and description so the node's purpose is immediately clear.
+  - Preserve the exact MCP Tool URI `{{ tool_uri }}` without translating, shortening, or rewriting it.
+  - Preserve every mounted argument name and value from `{{ arguments }}`.
+  - Explain that the mounted arguments describe this node's default live-context call.
+  - Explicitly guide an agent to read the Tool definition at `{{ tool_uri }}` and its inputSchema, then invoke the same MCP Tool with other valid arguments when a request needs different inputs or more precise results.
+  - Do not claim that the mounted arguments are the only allowed arguments.
+  - Do not invent Tool capabilities, parameters, results, or constraints absent from the supplied node.
+  - Do not use Markdown headings or tables.
+
+llm_config:
+  temperature: 0.0

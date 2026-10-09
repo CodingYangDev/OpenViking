@@ -8,16 +8,22 @@ import asyncio
 import hashlib
 import json
 import re
+import sqlite3
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 
 import httpx
+import yaml
+from jsonschema import SchemaError, ValidationError, validate
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import CallToolResult, InitializeResult, Tool
 
+from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.pyagfs import AGFSNotFoundError, AsyncAGFSClient
 from openviking.server.identity import RequestContext
 from openviking_cli.exceptions import (
@@ -36,6 +42,19 @@ _TOOL_URI_RE = re.compile(
 _TOOLS_ROOT = "viking://agent/tools"
 _REGISTRY_VERSION = 1
 _DEFAULT_TIMEOUT_SECONDS = 30.0
+_MOUNT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS live_context_nodes (
+    node_uri TEXT PRIMARY KEY,
+    mcp_name TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    tool_uri TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_live_context_nodes_tool
+ON live_context_nodes (mcp_name, tool_name);
+"""
 
 
 def _now() -> str:
@@ -79,6 +98,10 @@ class MCPService:
         return f"/local/{account_id}/_system/mcps.json"
 
     @staticmethod
+    def _mounts_path(account_id: str) -> str:
+        return f"/local/{account_id}/_system/live_context_nodes.dat"
+
+    @staticmethod
     def _empty_document() -> dict[str, Any]:
         return {"version": _REGISTRY_VERSION, "servers": {}}
 
@@ -103,6 +126,55 @@ class MCPService:
             indent=2,
             sort_keys=True,
         ).encode("utf-8")
+        await self._agfs().write(path, payload)
+
+    async def _open_mount_database(self, ctx: RequestContext) -> sqlite3.Connection:
+        path = self._mounts_path(ctx.account_id)
+        try:
+            raw = _decode_read_result(await self._agfs().read(path))
+        except (AGFSNotFoundError, FileNotFoundError):
+            raw = b""
+        temporary = tempfile.NamedTemporaryFile(
+            prefix="openviking-mounts-",
+            suffix=".sqlite3",
+            delete=False,
+        )
+        temporary_path = temporary.name
+        if raw:
+            temporary.write(raw)
+            temporary.flush()
+        temporary.close()
+        connection = sqlite3.connect(temporary_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.executescript(_MOUNT_SCHEMA)
+            return connection
+        except sqlite3.DatabaseError as exc:
+            connection.close()
+            Path(temporary_path).unlink(missing_ok=True)
+            raise RuntimeError(f"Invalid live context mount database: {path}") from exc
+
+    @staticmethod
+    def _close_mount_database(connection: sqlite3.Connection) -> None:
+        row = connection.execute("PRAGMA database_list").fetchone()
+        temporary_path = row[2] if row and len(row) > 2 else ""
+        connection.close()
+        if temporary_path:
+            Path(temporary_path).unlink(missing_ok=True)
+
+    async def _write_mount_database(
+        self,
+        connection: sqlite3.Connection,
+        ctx: RequestContext,
+    ) -> None:
+        connection.commit()
+        row = connection.execute("PRAGMA database_list").fetchone()
+        database_path = row[2] if row and len(row) > 2 else ""
+        if not database_path:
+            raise RuntimeError("Live context mount database has no backing file")
+        payload = Path(database_path).read_bytes()
+        path = self._mounts_path(ctx.account_id)
+        await self._agfs().ensure_parent_dirs(path)
         await self._agfs().write(path, payload)
 
     async def _load(self, ctx: RequestContext) -> dict[str, Any]:
@@ -189,8 +261,9 @@ class MCPService:
         self,
         server: dict[str, Any],
         headers: dict[str, str],
+        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     ) -> AsyncIterator[ClientSession]:
-        timeout = httpx.Timeout(_DEFAULT_TIMEOUT_SECONDS, read=_DEFAULT_TIMEOUT_SECONDS)
+        timeout = httpx.Timeout(timeout_seconds, read=timeout_seconds)
         try:
             async with httpx.AsyncClient(headers=headers, timeout=timeout) as http_client:
                 async with streamable_http_client(
@@ -200,7 +273,7 @@ class MCPService:
                     async with ClientSession(
                         read,
                         write,
-                        read_timeout_seconds=timedelta(seconds=_DEFAULT_TIMEOUT_SECONDS),
+                        read_timeout_seconds=timedelta(seconds=timeout_seconds),
                     ) as session:
                         yield session
         except (InvalidArgumentError, NotFoundError, UnavailableError):
@@ -341,6 +414,101 @@ class MCPService:
             documents.append({"uri": uri, **document})
         return documents
 
+    async def _tool(self, uri: str, ctx: RequestContext) -> dict[str, Any]:
+        match = _TOOL_URI_RE.fullmatch(uri)
+        if match is None:
+            raise InvalidArgumentError(
+                "Tool URI must match viking://agent/tools/<server>/<tool>.json"
+            )
+        server_name = match.group("server")
+        tool_name = match.group("tool")
+        await self._registered(server_name, ctx)
+        try:
+            content = await self._service.fs.read(uri, ctx=ctx)
+            document = json.loads(content)
+            tool = document["tool"]
+        except (AGFSNotFoundError, NotFoundError, FileNotFoundError) as exc:
+            raise NotFoundError(uri, "MCP tool") from exc
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Invalid MCP tool document: {uri}") from exc
+        if (
+            not isinstance(document, dict)
+            or document.get("server") != server_name
+            or not isinstance(document.get("revision"), str)
+            or not isinstance(tool, dict)
+            or tool.get("name") != tool_name
+        ):
+            raise RuntimeError(f"Invalid MCP tool document: {uri}")
+        return document
+
+    @staticmethod
+    def _validate_tool_arguments(tool_document: dict[str, Any], arguments: dict[str, Any]) -> None:
+        schema = tool_document["tool"].get("inputSchema", {"type": "object"})
+        try:
+            validate(instance=arguments, schema=schema)
+        except SchemaError as exc:
+            raise RuntimeError("Invalid inputSchema in MCP tool document") from exc
+        except ValidationError as exc:
+            location = ".".join(str(part) for part in exc.absolute_path)
+            prefix = (
+                f"Invalid MCP tool arguments at '{location}'"
+                if location
+                else ("Invalid MCP tool arguments")
+            )
+            raise InvalidArgumentError(f"{prefix}: {exc.message}") from exc
+
+    @staticmethod
+    def _validate_node_uri(uri: str, ctx: RequestContext) -> str:
+        normalized = validate_request_viking_uri(
+            uri,
+            ctx,
+            field_name="live context node URI",
+        )
+        if not normalized.endswith(".md"):
+            raise InvalidArgumentError("Live context node URI must end with .md")
+        return normalized
+
+    @staticmethod
+    def _render_live_context_node(
+        tool_uri: str,
+        tool_document: dict[str, Any],
+        title: str,
+        description: str | None,
+        timeout_seconds: int,
+        arguments: dict[str, Any],
+    ) -> str:
+        metadata: dict[str, Any] = {
+            "type": "OpenViking Live Context",
+            "title": title,
+        }
+        if description is not None:
+            metadata["description"] = description
+        metadata.update(
+            {
+                "x-openviking": {
+                    "schema_version": "v1",
+                    "type": "mcp",
+                    "definition": tool_uri,
+                    "revision": tool_document["revision"],
+                    "args": arguments,
+                    "timeout_seconds": timeout_seconds,
+                    "retry": {
+                        "max_attempts": 3,
+                        "backoff_seconds": 1,
+                        "backoff_multiplier": 2,
+                        "max_backoff_seconds": 5,
+                    },
+                },
+            }
+        )
+        frontmatter = yaml.safe_dump(
+            metadata,
+            allow_unicode=True,
+            sort_keys=False,
+            default_flow_style=False,
+        ).rstrip()
+        return f"---\n{frontmatter}\n---\n"
+
     async def add(
         self,
         name: str,
@@ -432,32 +600,43 @@ class MCPService:
         query = query.strip()
         if not query:
             raise InvalidArgumentError("Tool search query must not be empty")
-        registry = await self._load(ctx)
-        terms = {term for term in re.split(r"\W+", query.casefold()) if term}
+
+        search_result = await self._service.search.find(
+            query=query,
+            ctx=ctx,
+            target_uri=_TOOLS_ROOT,
+            limit=limit,
+            level=[2],
+        )
+        result_dict = (
+            search_result.to_dict()
+            if hasattr(search_result, "to_dict")
+            else dict(search_result or {})
+        )
         results: list[dict[str, Any]] = []
-        names = sorted(registry["servers"])
-        catalogs = await asyncio.gather(*(self._catalog(name, ctx) for name in names))
-        for name, documents in zip(names, catalogs, strict=True):
-            for document in documents:
-                tool = document["tool"]
-                haystack = f"{tool.get('name', '')} {tool.get('description', '')}".casefold()
-                exact = query.casefold() in haystack
-                matches = sum(term in haystack for term in terms)
-                if not exact and matches == 0:
-                    continue
-                score = 1.0 if exact else matches / max(len(terms), 1)
-                results.append(
-                    {
-                        "uri": document["uri"],
-                        "server": name,
-                        "name": tool["name"],
-                        "description": tool.get("description", ""),
-                        "revision": document["revision"],
-                        "score": round(score, 6),
-                    }
-                )
-        results.sort(key=lambda item: (-item["score"], item["server"], item["name"]))
-        return {"tools": results[:limit], "total": len(results)}
+        seen: set[str] = set()
+        for hit in result_dict.get("resources", []):
+            uri = hit.get("uri")
+            match = _TOOL_URI_RE.fullmatch(uri) if isinstance(uri, str) else None
+            if match is None or uri in seen:
+                continue
+            try:
+                document = await self._tool(uri, ctx)
+            except NotFoundError:
+                continue
+            seen.add(uri)
+            tool = document["tool"]
+            results.append(
+                {
+                    "uri": uri,
+                    "server": match.group("server"),
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "revision": document["revision"],
+                    "score": hit.get("score", 0.0),
+                }
+            )
+        return {"tools": results, "total": len(results)}
 
     async def _registered(
         self,
@@ -546,11 +725,225 @@ class MCPService:
                 "tool_count": len(tool_names),
             }
 
+    async def mount(
+        self,
+        tool_uri: str,
+        node_uri: str,
+        title: str,
+        description: str | None,
+        timeout_seconds: int,
+        arguments: dict[str, Any],
+        ctx: RequestContext,
+    ) -> dict[str, Any]:
+        if not title.strip():
+            raise InvalidArgumentError("Live context node title must not be empty")
+        if timeout_seconds <= 0:
+            raise InvalidArgumentError("Live context node timeout_seconds must be positive")
+        node_uri = self._validate_node_uri(node_uri, ctx)
+        async with self._lock(ctx.account_id):
+            tool_document = await self._tool(tool_uri, ctx)
+            self._validate_tool_arguments(tool_document, arguments)
+            match = _TOOL_URI_RE.fullmatch(tool_uri)
+            assert match is not None
+            server_name = match.group("server")
+            tool_name = match.group("tool")
+
+            connection = await self._open_mount_database(ctx)
+            try:
+                existing = connection.execute(
+                    "SELECT * FROM live_context_nodes WHERE node_uri = ?",
+                    (node_uri,),
+                ).fetchone()
+                content = self._render_live_context_node(
+                    tool_uri,
+                    tool_document,
+                    title,
+                    description,
+                    timeout_seconds,
+                    arguments,
+                )
+                arguments_json = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+                created_at = existing["created_at"] if existing is not None else _now()
+                await self._service.fs.write(
+                    node_uri,
+                    content,
+                    ctx=ctx,
+                    mode="replace",
+                    wait=True,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO live_context_nodes (
+                        node_uri, mcp_name, tool_name, tool_uri, revision, args_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_uri) DO UPDATE SET
+                        mcp_name = excluded.mcp_name,
+                        tool_name = excluded.tool_name,
+                        tool_uri = excluded.tool_uri,
+                        revision = excluded.revision,
+                        args_json = excluded.args_json
+                    """,
+                    (
+                        node_uri,
+                        server_name,
+                        tool_name,
+                        tool_uri,
+                        tool_document["revision"],
+                        arguments_json,
+                        created_at,
+                    ),
+                )
+                await self._write_mount_database(connection, ctx)
+            finally:
+                self._close_mount_database(connection)
+
+        return {
+            "node_uri": node_uri,
+            "mcp": server_name,
+            "tool": tool_name,
+            "tool_uri": tool_uri,
+            "revision": tool_document["revision"],
+            "title": title,
+            "description": description,
+            "timeout_seconds": timeout_seconds,
+            "arguments": arguments,
+            "created_at": created_at,
+            "mounted": True,
+        }
+
+    async def unmount(self, node_uri: str, ctx: RequestContext) -> dict[str, Any]:
+        node_uri = self._validate_node_uri(node_uri, ctx)
+        async with self._lock(ctx.account_id):
+            connection = await self._open_mount_database(ctx)
+            try:
+                row = connection.execute(
+                    "SELECT * FROM live_context_nodes WHERE node_uri = ?",
+                    (node_uri,),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(node_uri, "live context mount")
+                try:
+                    content = await self._service.fs.read(node_uri, ctx=ctx)
+                except (AGFSNotFoundError, NotFoundError, FileNotFoundError):
+                    content = None
+                await self._service.fs.rm(node_uri, ctx=ctx, recursive=False, wait=True)
+                connection.execute(
+                    "DELETE FROM live_context_nodes WHERE node_uri = ?",
+                    (node_uri,),
+                )
+                try:
+                    await self._write_mount_database(connection, ctx)
+                except Exception:
+                    if content is not None:
+                        await self._service.fs.write(
+                            node_uri,
+                            content,
+                            ctx=ctx,
+                            mode="create",
+                            wait=True,
+                        )
+                    raise
+            finally:
+                self._close_mount_database(connection)
+        return {
+            "node_uri": node_uri,
+            "mcp": row["mcp_name"],
+            "tool": row["tool_name"],
+            "tool_uri": row["tool_uri"],
+            "unmounted": True,
+        }
+
+    async def mounts(
+        self,
+        mcp_name: str,
+        tool_name: str | None,
+        ctx: RequestContext,
+    ) -> dict[str, Any]:
+        mcp_name = self._validate_server_name(mcp_name)
+        await self._registered(mcp_name, ctx)
+        if tool_name is not None and not self._valid_tool_name(tool_name):
+            raise InvalidArgumentError("Invalid MCP tool name")
+
+        connection = await self._open_mount_database(ctx)
+        try:
+            query = "SELECT * FROM live_context_nodes WHERE mcp_name = ?"
+            parameters: tuple[str, ...] = (mcp_name,)
+            if tool_name is not None:
+                query += " AND tool_name = ?"
+                parameters = (mcp_name, tool_name)
+            query += " ORDER BY tool_name, node_uri"
+            rows = connection.execute(query, parameters).fetchall()
+        finally:
+            self._close_mount_database(connection)
+
+        items = [
+            {
+                "node_uri": row["node_uri"],
+                "mcp": row["mcp_name"],
+                "tool": row["tool_name"],
+                "tool_uri": row["tool_uri"],
+                "revision": row["revision"],
+                "arguments": json.loads(row["args_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+        return {"mounts": items, "total": len(items)}
+
+    @staticmethod
+    def _parse_live_context_node(content: str) -> tuple[str, dict[str, Any], int] | None:
+        lines = content.splitlines()
+        if not lines or lines[0] != "---":
+            return None
+        try:
+            closing_index = lines[1:].index("---") + 1
+            metadata = yaml.safe_load("\n".join(lines[1:closing_index]))
+        except (ValueError, yaml.YAMLError):
+            return None
+        if not isinstance(metadata, dict) or metadata.get("type") != "OpenViking Live Context":
+            return None
+        extension = metadata.get("x-openviking")
+        if not isinstance(extension, dict) or extension.get("type") != "mcp":
+            return None
+        tool_uri = extension.get("definition")
+        arguments = extension.get("args", {})
+        timeout_seconds = extension.get("timeout_seconds", 60)
+        if (
+            not isinstance(tool_uri, str)
+            or not isinstance(arguments, dict)
+            or not isinstance(timeout_seconds, int)
+            or isinstance(timeout_seconds, bool)
+            or timeout_seconds <= 0
+        ):
+            raise InvalidArgumentError(
+                "Live context node requires string x-openviking.definition "
+                "object x-openviking.args, and positive integer "
+                "x-openviking.timeout_seconds"
+            )
+        return tool_uri, arguments, timeout_seconds
+
+    async def invoke_live_context(
+        self,
+        content: str,
+        ctx: RequestContext,
+    ) -> dict[str, Any] | None:
+        invocation = self._parse_live_context_node(content)
+        if invocation is None:
+            return None
+        tool_uri, arguments, timeout_seconds = invocation
+        return await self.invoke(
+            tool_uri,
+            arguments,
+            ctx,
+            timeout_seconds=timeout_seconds,
+        )
+
     async def invoke(
         self,
         uri: str,
         arguments: dict[str, Any],
         ctx: RequestContext,
+        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         match = _TOOL_URI_RE.fullmatch(uri)
         if match is None:
@@ -563,12 +956,13 @@ class MCPService:
         if tool_name not in await self._catalog_names(server_name, ctx):
             raise NotFoundError(uri, "MCP tool")
 
-        async with self._session(server, headers) as session:
+        async with self._session(server, headers, timeout_seconds) as session:
             await session.initialize()
             try:
                 result: CallToolResult = await session.call_tool(
                     tool_name,
                     arguments=arguments,
+                    read_timeout_seconds=timedelta(seconds=timeout_seconds),
                 )
             except Exception as exc:
                 raise UnavailableError(

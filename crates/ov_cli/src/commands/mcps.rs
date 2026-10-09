@@ -393,6 +393,112 @@ pub async fn status(
     Ok(())
 }
 
+pub async fn mount(
+    client: &HttpClient,
+    tool_uri: &str,
+    node_uri: &str,
+    title: &str,
+    description: Option<&str>,
+    timeout_seconds: u64,
+    raw_arguments: &str,
+    output_format: OutputFormat,
+    compact: bool,
+) -> Result<()> {
+    let arguments = parse_arguments(raw_arguments)?;
+    let response: Value = client
+        .post(
+            "/api/v1/mcps/mount",
+            &json!({
+                "tool_uri": tool_uri,
+                "node_uri": node_uri,
+                "title": title,
+                "description": description,
+                "timeout_seconds": timeout_seconds,
+                "arguments": arguments,
+            }),
+        )
+        .await?;
+    print_response(&response, output_format, compact);
+    Ok(())
+}
+
+pub async fn unmount(
+    client: &HttpClient,
+    node_uri: &str,
+    output_format: OutputFormat,
+    compact: bool,
+) -> Result<()> {
+    let params = vec![("node_uri".to_string(), node_uri.to_string())];
+    let response: Value = client.delete("/api/v1/mcps/mount", &params).await?;
+    print_response(&response, output_format, compact);
+    Ok(())
+}
+
+pub async fn mounts(
+    client: &HttpClient,
+    mcp: &str,
+    tool: Option<&str>,
+    output_format: OutputFormat,
+    compact: bool,
+) -> Result<()> {
+    validate_server_name(mcp)?;
+    let mut params = vec![("mcp".to_string(), mcp.to_string())];
+    if let Some(tool) = tool {
+        params.push(("tool".to_string(), tool.to_string()));
+    }
+    let response: Value = client.get("/api/v1/mcps/mounts", &params).await?;
+    if let Some(rendered) = render_mounts_for_table(&response, output_format) {
+        println!("{rendered}");
+    } else {
+        print_response(&response, output_format, compact);
+    }
+    Ok(())
+}
+
+fn render_mounts_for_table(response: &Value, output_format: OutputFormat) -> Option<String> {
+    if matches!(output_format, OutputFormat::Json) {
+        return None;
+    }
+    let payload = response_payload(response);
+    let mounts = payload.get("mounts")?.as_array()?;
+    if mounts.is_empty() {
+        return Some(theme::muted("No live context mounts found.").to_string());
+    }
+
+    let total = payload
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or(mounts.len() as u64);
+    let noun = if total == 1 { "mount" } else { "mounts" };
+    let mut lines = vec![
+        theme::heading(format!("{total} live context {noun}"))
+            .bold()
+            .to_string(),
+        String::new(),
+    ];
+    for (index, mount) in mounts.iter().enumerate() {
+        let mount = mount.as_object()?;
+        let node_uri = mount.get("node_uri")?.as_str()?;
+        let tool_uri = mount.get("tool_uri")?.as_str()?;
+        if index > 0 {
+            lines.push(String::new());
+        }
+        lines.push(format!(
+            "{}. {}",
+            theme::command((index + 1).to_string()).bold(),
+            theme::heading(node_uri).bold()
+        ));
+        lines.push(format!("   {}", theme::sky_value(tool_uri).bold()));
+        if let Some(created_at) = mount.get("created_at").and_then(Value::as_str) {
+            lines.push(format!(
+                "   {}",
+                theme::muted(format!("created: {created_at}"))
+            ));
+        }
+    }
+    Some(lines.join("\n"))
+}
+
 pub async fn invoke(
     client: &HttpClient,
     uri: &str,
@@ -414,8 +520,8 @@ pub async fn invoke(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_add_config, parse_arguments, render_list_for_table, render_show_for_table,
-        validate_server_name,
+        parse_add_config, parse_arguments, render_list_for_table, render_mounts_for_table,
+        render_show_for_table, validate_server_name,
     };
     use crate::output::OutputFormat;
     use serde_json::json;
@@ -534,5 +640,25 @@ mod tests {
         assert!(rendered.contains("- message (string, required): Message to echo"));
         assert!(!rendered.contains("\"inputSchema\""));
         assert!(render_show_for_table(&response, OutputFormat::Json).is_none());
+    }
+
+    #[test]
+    fn mounts_use_human_readable_output_in_table_mode() {
+        let response = json!({
+            "result": {
+                "mounts": [{
+                    "node_uri": "viking://resources/demo/weather.md",
+                    "tool_uri": "viking://agent/tools/weather/current.json",
+                    "created_at": "2026-10-08T12:00:00+00:00"
+                }],
+                "total": 1
+            }
+        });
+        let rendered =
+            render_mounts_for_table(&response, OutputFormat::Table).expect("mounts output");
+        assert!(rendered.contains("1 live context mount"));
+        assert!(rendered.contains("viking://resources/demo/weather.md"));
+        assert!(rendered.contains("viking://agent/tools/weather/current.json"));
+        assert!(render_mounts_for_table(&response, OutputFormat::Json).is_none());
     }
 }

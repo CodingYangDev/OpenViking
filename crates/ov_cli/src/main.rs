@@ -1895,6 +1895,42 @@ enum McpCommands {
         #[arg(value_name = "name")]
         name: String,
     },
+    /// Mount an MCP tool as a live context node
+    Mount {
+        /// Tool URI under viking://agent/tools
+        #[arg(value_name = "mcp-tool-uri")]
+        tool_uri: String,
+        /// Markdown URI to create for the live context node
+        #[arg(value_name = "live-context-node-uri")]
+        node_uri: String,
+        /// Title written to the live context node
+        #[arg(long, value_name = "title")]
+        title: String,
+        /// Description written to the live context node
+        #[arg(long, value_name = "description")]
+        description: Option<String>,
+        /// MCP Tool call timeout in seconds
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_seconds: u64,
+        /// Fixed tool arguments as a JSON object
+        #[arg(long = "args", default_value = "{}", value_name = "json")]
+        arguments: String,
+    },
+    /// Remove a mounted live context node
+    Unmount {
+        /// Live context Markdown node URI
+        #[arg(value_name = "live-context-node-uri")]
+        node_uri: String,
+    },
+    /// List live context nodes mounted from an MCP server
+    Mounts {
+        /// Registered MCP server name
+        #[arg(long = "mcp", value_name = "name")]
+        mcp: String,
+        /// Optional MCP tool name
+        #[arg(long = "tool", value_name = "tool")]
+        tool: Option<String>,
+    },
     /// Invoke a registered MCP tool
     Invoke {
         /// Tool URI under viking://agent/tools
@@ -2810,7 +2846,18 @@ fn is_skill_subcommand(token: &str) -> bool {
 fn is_mcp_subcommand(token: &str) -> bool {
     matches!(
         token,
-        "add" | "remove" | "list" | "find" | "validate" | "show" | "sync" | "status" | "invoke"
+        "add"
+            | "remove"
+            | "list"
+            | "find"
+            | "validate"
+            | "show"
+            | "sync"
+            | "status"
+            | "mount"
+            | "unmount"
+            | "mounts"
+            | "invoke"
     )
 }
 
@@ -3579,6 +3626,41 @@ async fn main() {
                 }
                 McpCommands::Status { name } => {
                     commands::mcps::status(&client, &name, ctx.output_format, ctx.compact).await
+                }
+                McpCommands::Mount {
+                    tool_uri,
+                    node_uri,
+                    title,
+                    description,
+                    timeout_seconds,
+                    arguments,
+                } => {
+                    commands::mcps::mount(
+                        &client,
+                        &tool_uri,
+                        &node_uri,
+                        &title,
+                        description.as_deref(),
+                        timeout_seconds,
+                        &arguments,
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
+                }
+                McpCommands::Unmount { node_uri } => {
+                    commands::mcps::unmount(&client, &node_uri, ctx.output_format, ctx.compact)
+                        .await
+                }
+                McpCommands::Mounts { mcp, tool } => {
+                    commands::mcps::mounts(
+                        &client,
+                        &mcp,
+                        tool.as_deref(),
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
                 }
                 McpCommands::Invoke { uri, arguments } => {
                     commands::mcps::invoke(
@@ -4738,6 +4820,9 @@ mod tests {
             &["ov", "mcps", "show"],
             &["ov", "mcps", "sync"],
             &["ov", "mcps", "status"],
+            &["ov", "mcps", "mount"],
+            &["ov", "mcps", "unmount"],
+            &["ov", "mcps", "mounts"],
             &["ov", "mcps", "invoke"],
         ];
 
@@ -6172,20 +6257,153 @@ mod tests {
     }
 
     #[test]
-    fn mcps_rejects_unimplemented_subcommands() {
-        assert!(Cli::try_parse_from(["ov", "mcps", "mount"]).is_err());
-        assert!(Cli::try_parse_from(["ov", "mcps", "unmount"]).is_err());
-        assert!(Cli::try_parse_from(["ov", "mcps", "mounts"]).is_err());
-        assert!(Cli::try_parse_from(["ov", "mcps", "status"]).is_err());
+    fn mcps_parse_mount_subcommand() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mount = Cli::try_parse_from([
+                    "ov",
+                    "mcps",
+                    "mount",
+                    "viking://agent/tools/weather/current.json",
+                    "viking://resources/demo/weather.md",
+                    "--title",
+                    "Beijing Weather",
+                    "--description",
+                    "Current weather in Beijing",
+                    "--timeout-seconds",
+                    "120",
+                    "--args",
+                    r#"{"city":"Beijing"}"#,
+                ])
+                .expect("mount should parse");
+                assert!(matches!(
+                    &mount.command,
+                    Commands::Mcps {
+                        action: McpCommands::Mount {
+                            tool_uri,
+                            node_uri,
+                            title,
+                            description,
+                            timeout_seconds,
+                            arguments
+                        }
+                    } if tool_uri.ends_with("/current.json")
+                        && node_uri.ends_with("/weather.md")
+                        && title == "Beijing Weather"
+                        && description.as_deref() == Some("Current weather in Beijing")
+                        && *timeout_seconds == 120
+                        && arguments.contains("Beijing")
+                ));
 
-        let status =
-            Cli::try_parse_from(["ov", "mcps", "status", "demo"]).expect("status should parse");
-        assert!(matches!(
-            status.command,
-            Commands::Mcps {
-                action: McpCommands::Status { name }
-            } if name == "demo"
-        ));
+                let default_timeout = Cli::try_parse_from([
+                    "ov",
+                    "mcps",
+                    "mount",
+                    "viking://agent/tools/weather/current.json",
+                    "viking://resources/demo/weather.md",
+                    "--title",
+                    "Beijing Weather",
+                ])
+                .expect("mount with default timeout should parse");
+                assert!(matches!(
+                    &default_timeout.command,
+                    Commands::Mcps {
+                        action: McpCommands::Mount {
+                            timeout_seconds, ..
+                        }
+                    } if *timeout_seconds == 60
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn mcps_mount_requires_title() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                assert!(
+                    Cli::try_parse_from([
+                        "ov",
+                        "mcps",
+                        "mount",
+                        "viking://agent/tools/weather/current.json",
+                        "viking://resources/demo/weather.md",
+                    ])
+                    .is_err()
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn mcps_parse_unmount_subcommand() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let unmount = Cli::try_parse_from([
+                    "ov",
+                    "mcps",
+                    "unmount",
+                    "viking://resources/demo/weather.md",
+                ])
+                .expect("unmount should parse");
+                assert!(matches!(
+                    &unmount.command,
+                    Commands::Mcps {
+                        action: McpCommands::Unmount { node_uri }
+                    } if node_uri.ends_with("/weather.md")
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn mcps_parse_mounts_subcommand() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mounts = Cli::try_parse_from([
+                    "ov", "mcps", "mounts", "--mcp", "weather", "--tool", "current",
+                ])
+                .expect("mounts should parse");
+                assert!(matches!(
+                    &mounts.command,
+                    Commands::Mcps {
+                        action: McpCommands::Mounts { mcp, tool }
+                    } if mcp == "weather" && tool.as_deref() == Some("current")
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn mcps_status_requires_name() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                assert!(Cli::try_parse_from(["ov", "mcps", "status"]).is_err());
+                let status = Cli::try_parse_from(["ov", "mcps", "status", "demo"])
+                    .expect("status should parse");
+                assert!(matches!(
+                    &status.command,
+                    Commands::Mcps {
+                        action: McpCommands::Status { name }
+                    } if name == "demo"
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

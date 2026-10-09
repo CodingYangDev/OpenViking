@@ -64,6 +64,8 @@ template: |
   - Treat child directories as parts of the same repository unless the summaries clearly show they are independent projects.
   - Do not describe every child directory as an independent project by default.
   - When the summaries indicate a code repository, explain how subdirectories relate to the whole repo, such as services, libraries, apps, modules, or support folders.
+  - For an MCP-backed live context node, preserve its title, description, exact MCP Tool URI, and mounted arguments in its detailed description.
+  - For an MCP-backed live context node, retain the guidance that an agent can read the Tool definition and inputSchema at that URI, then invoke the Tool with other valid arguments for different inputs or more precise results.
 
   Faithfulness rules:
   - Describe only what the provided summaries state; do not invent entities, facts, or relationships not present in them.

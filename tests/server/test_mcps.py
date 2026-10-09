@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import sqlite3
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -153,7 +155,7 @@ async def test_invoke_failure_is_not_retried_or_rewrapped(monkeypatch):
     )
 
     @asynccontextmanager
-    async def fake_session(_server, _headers):
+    async def fake_session(_server, _headers, _timeout_seconds):
         try:
             yield session
         except (InvalidArgumentError, UnavailableError):
@@ -167,44 +169,98 @@ async def test_invoke_failure_is_not_retried_or_rewrapped(monkeypatch):
             {"city": "Beijing"},
             _ctx(),
         )
-    session.call_tool.assert_awaited_once()
-
-
-async def test_find_reports_total_before_limit(monkeypatch):
-    service = MCPService(SimpleNamespace())
-    tools = [
-        {
-            "revision": str(index),
-            "tool": {
-                "name": f"weather.{index}",
-                "description": "Current weather forecast",
-            },
-        }
-        for index in range(3)
-    ]
-    monkeypatch.setattr(
-        service,
-        "_load",
-        AsyncMock(return_value={"version": 1, "servers": {"weather": {"name": "weather"}}}),
+    session.call_tool.assert_awaited_once_with(
+        "current",
+        arguments={"city": "Beijing"},
+        read_timeout_seconds=timedelta(seconds=30),
     )
+
+
+async def test_invoke_live_context_uses_definition_and_arguments(monkeypatch):
+    service = MCPService(SimpleNamespace())
+    invoke = AsyncMock(return_value={"result": {"content": [{"type": "text", "text": "5.858"}]}})
+    monkeypatch.setattr(service, "invoke", invoke)
+    content = """---
+type: OpenViking Live Context
+title: Sum e and pi
+description: Calculate the sum of e and pi.
+x-openviking:
+  schema_version: v1
+  type: mcp
+  definition: viking://agent/tools/demo/get-sum.json
+  args:
+    a: 3.14
+    b: 2.718
+  timeout_seconds: 120
+---
+"""
+
+    result = await service.invoke_live_context(content, _ctx())
+
+    assert result == {"result": {"content": [{"type": "text", "text": "5.858"}]}}
+    invoke.assert_awaited_once_with(
+        "viking://agent/tools/demo/get-sum.json",
+        {"a": 3.14, "b": 2.718},
+        _ctx(),
+        timeout_seconds=120,
+    )
+
+
+async def test_invoke_live_context_ignores_regular_content():
+    service = MCPService(SimpleNamespace())
+
+    assert await service.invoke_live_context("# Regular document", _ctx()) is None
+
+
+async def test_find_uses_semantic_search_scoped_to_mcp_tools(monkeypatch):
+    search = AsyncMock(
+        return_value={
+            "resources": [
+                {
+                    "uri": "viking://agent/tools/weather/current.json",
+                    "score": 0.87,
+                    "abstract": "Live atmospheric conditions",
+                }
+            ]
+        }
+    )
+    service = MCPService(SimpleNamespace(search=SimpleNamespace(find=search)))
     monkeypatch.setattr(
         service,
-        "_catalog",
+        "_tool",
         AsyncMock(
-            return_value=[
-                {
-                    "uri": f"viking://agent/tools/weather/{item['tool']['name']}.json",
-                    **item,
-                }
-                for item in tools
-            ]
+            return_value={
+                "revision": "revision-1",
+                "tool": {
+                    "name": "current",
+                    "description": "Get current weather conditions",
+                },
+            }
         ),
     )
 
-    result = await service.find("weather", 1, _ctx())
+    result = await service.find("Should I carry an umbrella?", 5, _ctx())
 
-    assert result["total"] == 3
-    assert len(result["tools"]) == 1
+    search.assert_awaited_once_with(
+        query="Should I carry an umbrella?",
+        ctx=_ctx(),
+        target_uri="viking://agent/tools",
+        limit=5,
+        level=[2],
+    )
+    assert result == {
+        "tools": [
+            {
+                "uri": "viking://agent/tools/weather/current.json",
+                "server": "weather",
+                "name": "current",
+                "description": "Get current weather conditions",
+                "revision": "revision-1",
+                "score": 0.87,
+            }
+        ],
+        "total": 1,
+    }
 
 
 async def test_show_uses_catalog_instead_of_legacy_registry_tools(monkeypatch):
@@ -240,6 +296,202 @@ async def test_show_uses_catalog_instead_of_legacy_registry_tools(monkeypatch):
     assert all(tool["tool"]["name"] != "legacy" for tool in result["tools"])
 
 
+async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
+    stored: dict[str, bytes] = {}
+
+    async def read_storage(path):
+        if path not in stored:
+            raise FileNotFoundError(path)
+        return stored[path]
+
+    async def write_storage(path, content):
+        stored[path] = content
+
+    agfs = SimpleNamespace(
+        read=AsyncMock(side_effect=read_storage),
+        write=AsyncMock(side_effect=write_storage),
+        ensure_parent_dirs=AsyncMock(),
+    )
+    fs = SimpleNamespace(
+        write=AsyncMock(return_value={}),
+        read=AsyncMock(),
+        rm=AsyncMock(return_value={}),
+    )
+    backing = SimpleNamespace(
+        fs=fs,
+        viking_fs=SimpleNamespace(exists=AsyncMock(return_value=False)),
+    )
+    service = MCPService(backing)
+    monkeypatch.setattr(service, "_async_agfs", agfs)
+    tool_document = {
+        "server": "weather",
+        "revision": "revision-1",
+        "tool": {
+            "name": "current",
+            "title": "Current Weather",
+            "description": "Get current weather",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    monkeypatch.setattr(service, "_tool", AsyncMock(return_value=tool_document))
+    monkeypatch.setattr(
+        service,
+        "_registered",
+        AsyncMock(return_value=({"name": "weather"}, {})),
+    )
+
+    tool_uri = "viking://agent/tools/weather/current.json"
+    node_uri = "viking://resources/demo/weather.md"
+    mounted = await service.mount(
+        tool_uri,
+        node_uri,
+        "Beijing Weather",
+        "Current weather in Beijing",
+        60,
+        {"city": "Beijing"},
+        _ctx(),
+    )
+
+    assert mounted["mounted"] is True
+    assert "idempotent" not in mounted
+    assert mounted["revision"] == "revision-1"
+    written = fs.write.await_args.args[1]
+    assert "type: OpenViking Live Context" in written
+    assert "title: Beijing Weather" in written
+    assert "description: Current weather in Beijing" in written
+    assert f"definition: {tool_uri}" in written
+    assert "revision: revision-1" in written
+    assert "timeout_seconds: 60" in written
+    assert "city: Beijing" in written
+    assert "x-instruction" not in written
+    fs.write.assert_awaited_once_with(
+        node_uri,
+        written,
+        ctx=_ctx(),
+        mode="replace",
+        wait=True,
+    )
+
+    database = stored["/local/account-1/_system/live_context_nodes.dat"]
+    connection = sqlite3.connect(":memory:")
+    connection.deserialize(database)
+    row = connection.execute("SELECT * FROM live_context_nodes").fetchone()
+    connection.close()
+    assert row[0] == node_uri
+    assert row[1:4] == ("weather", "current", tool_uri)
+
+    repeated = await service.mount(
+        tool_uri,
+        node_uri,
+        "Shanghai Weather",
+        "Current weather in Shanghai",
+        120,
+        {"city": "Shanghai"},
+        _ctx(),
+    )
+    assert repeated["mounted"] is True
+    assert "idempotent" not in repeated
+    assert repeated["created_at"] == mounted["created_at"]
+    assert fs.write.await_count == 2
+    assert fs.write.await_args.kwargs["mode"] == "replace"
+    updated = fs.write.await_args.args[1]
+    assert "title: Shanghai Weather" in updated
+    assert "city: Shanghai" in updated
+    assert "timeout_seconds: 120" in updated
+
+    listed = await service.mounts("weather", "current", _ctx())
+    assert listed["total"] == 1
+    assert listed["mounts"][0]["arguments"] == {"city": "Shanghai"}
+
+    fs.read.return_value = updated
+    unmounted = await service.unmount(node_uri, _ctx())
+    assert unmounted["unmounted"] is True
+    fs.rm.assert_awaited_once_with(node_uri, ctx=_ctx(), recursive=False, wait=True)
+    assert (await service.mounts("weather", None, _ctx()))["mounts"] == []
+
+
+async def test_mount_validates_node_uri_and_arguments(monkeypatch):
+    fs = SimpleNamespace(write=AsyncMock(), rm=AsyncMock())
+    backing = SimpleNamespace(
+        fs=fs,
+        viking_fs=SimpleNamespace(exists=AsyncMock(return_value=False)),
+    )
+    service = MCPService(backing)
+    tool_document = {
+        "server": "weather",
+        "revision": "revision-1",
+        "tool": {
+            "name": "current",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+    monkeypatch.setattr(service, "_tool", AsyncMock(return_value=tool_document))
+
+    def empty_mount_database(_ctx):
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            """
+            CREATE TABLE live_context_nodes (
+                node_uri TEXT PRIMARY KEY,
+                mcp_name TEXT,
+                tool_name TEXT,
+                tool_uri TEXT,
+                revision TEXT,
+                args_json TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        return connection
+
+    monkeypatch.setattr(
+        service,
+        "_open_mount_database",
+        AsyncMock(side_effect=empty_mount_database),
+    )
+
+    with pytest.raises(InvalidArgumentError, match="title must not be empty"):
+        await service.mount(
+            "viking://agent/tools/weather/current.json",
+            "viking://resources/demo/weather.md",
+            " ",
+            None,
+            60,
+            {"city": "Beijing"},
+            _ctx(),
+        )
+
+    with pytest.raises(InvalidArgumentError, match=r"end with \.md"):
+        await service.mount(
+            "viking://agent/tools/weather/current.json",
+            "viking://resources/demo/weather.json",
+            "Weather",
+            None,
+            60,
+            {"city": "Beijing"},
+            _ctx(),
+        )
+    with pytest.raises(InvalidArgumentError, match="required property"):
+        await service.mount(
+            "viking://agent/tools/weather/current.json",
+            "viking://resources/demo/weather.md",
+            "Weather",
+            None,
+            60,
+            {},
+            _ctx(),
+        )
+
+
 async def test_router_exposes_and_delegates_only_requested_operations(monkeypatch):
     methods = {
         name: AsyncMock(return_value={"operation": name})
@@ -253,6 +505,9 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
             "sync",
             "status",
             "invoke",
+            "mount",
+            "unmount",
+            "mounts",
         )
     }
     fake_service = SimpleNamespace(mcps=SimpleNamespace(**methods))
@@ -284,6 +539,24 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
                 "arguments": {"city": "Beijing"},
             },
         ),
+        (
+            "POST",
+            "/api/v1/mcps/mount",
+            {
+                "tool_uri": "viking://agent/tools/demo/current.json",
+                "node_uri": "viking://resources/demo/current.md",
+                "title": "Current Weather",
+                "description": "Current weather in Beijing",
+                "timeout_seconds": 120,
+                "arguments": {"city": "Beijing"},
+            },
+        ),
+        (
+            "DELETE",
+            "/api/v1/mcps/mount?node_uri=viking%3A%2F%2Fresources%2Fdemo%2Fcurrent.md",
+            None,
+        ),
+        ("GET", "/api/v1/mcps/mounts?mcp=demo&tool=current", None),
     ]
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         for method, path, body in requests:

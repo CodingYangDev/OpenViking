@@ -37,12 +37,59 @@ class InvokeMCPToolRequest(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
+class MountMCPToolRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool_uri: str
+    node_uri: str
+    title: str = Field(min_length=1)
+    description: str | None = None
+    timeout_seconds: int = Field(default=60, gt=0)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
 @router.post("")
 async def add_mcp(
     body: AddMCPRequest,
     ctx: RequestContext = Depends(get_request_context),
 ):
     result = await get_service().mcps.add(body.name, body.url, body.headers, ctx)
+    return Response(status="ok", result=result)
+
+
+@router.post("/mount")
+async def mount_mcp_tool(
+    body: MountMCPToolRequest,
+    ctx: RequestContext = Depends(get_request_context),
+):
+    result = await get_service().mcps.mount(
+        body.tool_uri,
+        body.node_uri,
+        body.title,
+        body.description,
+        body.timeout_seconds,
+        body.arguments,
+        ctx,
+    )
+    return Response(status="ok", result=result)
+
+
+@router.delete("/mount")
+async def unmount_mcp_tool(
+    node_uri: str = Query(),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    result = await get_service().mcps.unmount(node_uri, ctx)
+    return Response(status="ok", result=result)
+
+
+@router.get("/mounts")
+async def list_mcp_mounts(
+    mcp: str = Query(),
+    tool: str | None = Query(default=None),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    result = await get_service().mcps.mounts(mcp, tool, ctx)
     return Response(status="ok", result=result)
 
 
