@@ -15,6 +15,8 @@ from openviking_cli.utils.config.open_viking_config import get_openviking_config
 
 SECRET = "sk-proj-abcd012345678901234567890123wxyz"
 MASKED = "sk-proj-ab****yz"
+ARK_SECRET = "ark-1256ca13-21f2-4124-8832-0411e3c355sb-e95ee"
+ARK_MASKED = "ark-12****ee"
 
 
 @pytest.fixture(autouse=True)
@@ -33,10 +35,15 @@ async def test_append_entry_points_store_expected_content(
     monkeypatch.setattr(get_openviking_config().memory, "extraction_enabled", False)
     if not enabled:
         monkeypatch.setattr(secret_masking, "MAX_TEXT_CHARS", 1)
+    body = "abcd012345678901234567890123wxyz"
+    text = f"{SECRET}\nMY_COMPANY_API_KEY={body}"
+    abstract = f"EVAL_ARK_API_KEY={ARK_SECRET}"
+    parameters = {"secret_key": SECRET, "MY-API-KEY": body, "DB_PASSWORD": body}
+    output = f"curl --api-key {body} --user synthetic:{body} url"
     parts = [
-        TextPart(SECRET),
-        ContextPart(abstract=SECRET),
-        ToolPart(tool_id="config-check", tool_input={"secret_key": SECRET}, tool_output=SECRET),
+        TextPart(text),
+        ContextPart(abstract=abstract),
+        ToolPart(tool_id="config-check", tool_input=parameters, tool_output=output),
     ]
     original = deepcopy(parts)
     if "messages" in method:
@@ -50,11 +57,16 @@ async def test_append_entry_points_store_expected_content(
     fresh = client(session_id=session.session_id)
     await fresh.load()
     stored = fresh.messages[0].parts
-    expected = MASKED if enabled else SECRET
-    assert stored[0].text == expected
-    assert stored[1].abstract == expected
-    assert stored[2].tool_input == {"secret_key": expected}
-    assert stored[2].tool_output == expected
+    assert stored[0].text == (f"{MASKED}\nMY_COMPANY_API_KEY=ab****yz" if enabled else text)
+    assert stored[1].abstract == (f"EVAL_ARK_API_KEY={ARK_MASKED}" if enabled else abstract)
+    assert stored[2].tool_input == (
+        {"secret_key": MASKED, "MY-API-KEY": "ab****yz", "DB_PASSWORD": "ab****yz"}
+        if enabled
+        else parameters
+    )
+    assert stored[2].tool_output == (
+        "curl --api-key ab****yz --user [REDACTED] url" if enabled else output
+    )
 
 
 async def test_externalized_output_and_archive_only_contain_masked_content(
@@ -65,7 +77,14 @@ async def test_externalized_output_and_archive_only_contain_masked_content(
     )
     output = "\n".join(
         json.dumps(
-            {"trace_id": index, "api_key": SECRET, "status": ["ok", "retry", "timeout"][index % 3]}
+            {
+                "trace_id": index,
+                "api_key": SECRET,
+                "EVAL-ARK_API-KEY": ARK_SECRET,
+                "DB_PASSWORD": "abcd012345678901234567890123wxyz",
+                "command": "curl --user synthetic:abcd012345678901234567890123wxyz url",
+                "status": ["ok", "retry", "timeout"][index % 3],
+            }
         )
         for index in range(30)
     )
@@ -83,7 +102,10 @@ async def test_externalized_output_and_archive_only_contain_masked_content(
     external = await session._viking_fs.read_file(
         f"{stored.tool_output_ref}/output.txt", ctx=session.ctx
     )
-    assert external == output.replace(SECRET, MASKED)
+    expected = output.replace(SECRET, MASKED).replace(ARK_SECRET, ARK_MASKED)
+    expected = expected.replace("synthetic:abcd012345678901234567890123wxyz", "[REDACTED]")
+    expected = expected.replace("abcd012345678901234567890123wxyz", "ab****yz")
+    assert external == expected
     assert SECRET not in stored.tool_output
     fresh = client(session_id=session.session_id)
     await fresh.load()
@@ -109,6 +131,7 @@ async def test_externalized_output_and_archive_only_contain_masked_content(
         f"{result['archive_uri']}/messages.jsonl", ctx=session.ctx
     )
     assert SECRET not in archive
+    assert ARK_SECRET not in archive
 
 
 @pytest.mark.parametrize("failure", ["limit", "scanner_error"])
