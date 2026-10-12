@@ -180,7 +180,7 @@ ov grep "openviking" --uri viking://resources/volcengine/OpenViking/docs/zh
 
 `ov find` 返回匹配的上下文及其 URI，可继续查看内容。客户端配置（`ov config`）、CLI 独立安装和索引维护，见 [CLI 安装](https://docs.openviking.ai/zh/getting-started/05-cli-setup)。
 
-构建自己的应用，可使用 [Python](../../sdk/python/README_CN.md)、[Go](../../sdk/go/README_CN.md)、[TypeScript](../../sdk/typescript/README_CN.md) SDK 或 [HTTP API](https://docs.openviking.ai/zh/api/01-overview)。
+构建自己的应用，可使用 [Python](../../sdk/python/README.md)、[Go](../../sdk/go/README.md)、[TypeScript](../../sdk/typescript/README.md) SDK 或 [HTTP API](https://docs.openviking.ai/zh/api/01-overview)。
 
 ## 接入你的 Agent
 

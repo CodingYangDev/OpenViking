@@ -8,9 +8,10 @@
     "docs:build": "vitepress build .",
     "docs:preview": "vitepress preview . --host 0.0.0.0",
     "check:api": "node scripts/check-api-reference.mjs",
+    "check:sdk-readmes": "node scripts/check-sdk-readmes.mjs",
     "test:theme": "node --experimental-strip-types --test .vitepress/theme/*.test.ts",
     "test:search": "node --experimental-strip-types --test .vitepress/theme/openviking-search-*.test.ts",
-    "check:docs": "node scripts/check-docs-consistency.mjs"
+    "check:docs": "node scripts/check-sdk-readmes.mjs && node scripts/check-docs-consistency.mjs"
   },
   "devDependencies": {
     "markdown-it-task-lists": "^2.1.1",
