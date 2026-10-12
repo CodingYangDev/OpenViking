@@ -14,6 +14,7 @@ const requiredSections = [
   'API 速查表',
   '兼容性',
 ]
+const requiredContractSubsections = ['方法契约', '字段契约']
 
 function markdownFiles(directory) {
   if (!fs.existsSync(directory)) return []
@@ -36,6 +37,87 @@ function trackedMarkdownFiles(root) {
   } catch {
     return markdownFiles(root)
   }
+}
+
+function pythonPublicMethods(classSource) {
+  const methods = []
+  let decorators = []
+  for (const line of classSource.split('\n')) {
+    if (/^    @/.test(line)) {
+      decorators.push(line.trim())
+      continue
+    }
+    const match = /^    (?:async )?def (\w+)\(/.exec(line)
+    if (match) {
+      if (!match[1].startsWith('_')
+        && !decorators.some((decorator) => decorator.startsWith('@property'))) {
+        methods.push(match[1])
+      }
+      decorators = []
+      continue
+    }
+    if (line.trim()) decorators = []
+  }
+  return methods
+}
+
+function publicClientMethods(root, language) {
+  if (language === 'go') {
+    const directory = path.join(root, 'sdk', 'go')
+    if (!fs.existsSync(directory)) return { methods: [] }
+    return { methods: fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+      if (!entry.isFile() || !entry.name.endsWith('.go')) return []
+      return [...fs.readFileSync(path.join(directory, entry.name), 'utf8').matchAll(
+        /^func \(\w+ \*?Client\) ([A-Z]\w*)\(/gm,
+      )].map((match) => match[1])
+    }) }
+  }
+
+  const sourceLabel = language === 'python'
+    ? 'sdk/python/openviking_sdk/client.py'
+    : 'sdk/typescript/src/client.ts'
+  const sourceFile = path.join(
+    root,
+    'sdk',
+    language,
+    language === 'python' ? 'openviking_sdk/client.py' : 'src/client.ts',
+  )
+  if (!fs.existsSync(sourceFile)) {
+    return { methods: [], error: `${sourceLabel}: required public client source file is missing` }
+  }
+  const source = fs.readFileSync(sourceFile, 'utf8')
+  const className = language === 'python' ? 'SyncHTTPClient' : 'OpenVikingClient'
+  const classStart = source.search(new RegExp(`^${language === 'typescript' ? 'export ' : ''}class ${className}\\b`, 'm'))
+  if (classStart < 0) {
+    return { methods: [], error: `${sourceLabel}: required public client class "${className}" is missing` }
+  }
+  const nextClass = source.slice(classStart + 1).search(/^(?:export )?class\s/m)
+  const classSource = source.slice(classStart, nextClass < 0 ? undefined : classStart + 1 + nextClass)
+  if (language === 'python') return { methods: pythonPublicMethods(classSource) }
+  const methodPattern = /^  (?!(?:private|protected)\b)(?:public\s+)?(?:async\s+)?([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(/gm
+  return { methods: [...classSource.matchAll(methodPattern)]
+    .map((match) => match[1])
+    .filter((method) => method !== 'constructor') }
+}
+
+function apiQuickReference(source) {
+  const heading = /^##\s+API 速查表\s*$/m.exec(source)
+  if (!heading) return ''
+  const afterHeading = source.slice(heading.index + heading[0].length)
+  const nextSection = afterHeading.search(/^##\s/m)
+  return nextSection < 0 ? afterHeading : afterHeading.slice(0, nextSection)
+}
+
+function contractSubsection(quickReference, subsection) {
+  const heading = new RegExp(`^###\\s+${subsection}\\s*$`, 'm').exec(quickReference)
+  if (!heading) return null
+  const afterHeading = quickReference.slice(heading.index + heading[0].length)
+  const nextHeading = afterHeading.search(/^#{1,3}\s/m)
+  return nextHeading < 0 ? afterHeading : afterHeading.slice(0, nextHeading)
+}
+
+function hasSubstantiveMarkdownTable(source) {
+  return /^\|[^\n]+\|\s*\n\|\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|\s*\n\|[^\n]+\|/m.test(source)
 }
 
 export function checkSDKReadmes(root) {
@@ -62,6 +144,23 @@ export function checkSDKReadmes(root) {
     for (const section of requiredSections) {
       if (!new RegExp(`^#{2,3}\\s+${section}`, 'm').test(source)) {
         errors.push(`${readmeLabel}: missing required section "${section}"`)
+      }
+    }
+    const quickReference = apiQuickReference(source)
+    for (const subsection of requiredContractSubsections) {
+      const contract = contractSubsection(quickReference, subsection)
+      if (contract === null) {
+        errors.push(`${readmeLabel}: missing required API quick-reference subsection "${subsection}"`)
+      } else if (!hasSubstantiveMarkdownTable(contract)) {
+        errors.push(`${readmeLabel}: API quick-reference subsection "${subsection}" must contain a substantive Markdown 表格`)
+      }
+    }
+    const { methods, error } = publicClientMethods(root, language)
+    if (error) errors.push(error)
+    const methodContract = contractSubsection(quickReference, '方法契约') ?? ''
+    for (const method of methods) {
+      if (!new RegExp(`\\b${method}\\b`).test(methodContract)) {
+        errors.push(`${readmeLabel}: public client method "${method}" is not documented`)
       }
     }
   }

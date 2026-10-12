@@ -96,7 +96,7 @@ finally:
 
 ```python
 client.mkdir(uri="viking://resources/demo-dir")
-page = client.ls_page(uri="viking://resources", options={"limit": 50})
+page = client.ls_page(uri="viking://resources", limit=50)
 client.write(
     uri="viking://resources/demo-dir/note.md",
     content="# 笔记",
@@ -172,17 +172,72 @@ except OpenVikingError as exc:
 
 ## API 速查表
 
-| 场景 | 主要方法 |
-|---|---|
-| 资源、技能、Watch | `add_resource`, `add_skill`, `list_skills`, `find_skills`, `validate_skill`, `get_skill`, `update_skill`, `delete_skill`, `list_watches`, `get_watch`, `update_watch`, `trigger_watch`, `delete_watch` |
-| 文件与权限 | `ls`, `ls_page`, `tree`, `tree_page`, `stat`, `attrs`, `mkdir`, `rm`, `mv`, `read`, `download_bytes`, `abstract`, `overview`, `write`, `batch_write`, `set_tags`, `reindex`, `acl_get`, `acl_set`, `acl_grant`, `acl_revoke`, `acl_delete` |
-| 检索 | `find`, `search`, `search_context`, `grep`, `glob` |
-| Session 与任务 | `create_session`, `list_sessions`, `get_session`, `update_session_config`, `session_exists`, `delete_session`, `get_task`, `list_tasks`, `cancel_task`, `wait_processed`，以及 `client.session(...)` 上的消息与 commit 方法 |
-| 数据包与系统 | `export_ovpack`, `backup_ovpack`, `import_ovpack`, `restore_ovpack`, `health`, `is_healthy`, `check_consistency`, observer 状态方法 |
-| 编译与快照 | `compile`, `git_commit`, `git_restore`, `git_show`, `git_log`, `git_diff`, `git_get_ignore`, `git_set_ignore`, `git_delete_ignore` |
-| 管理与演进 | `admin_create_account`、用户/组管理、Account Settings、Agent Evolution、Experience 与资产方法 |
+以下表格以 `SyncHTTPClient`、`SyncSession`、`SyncHTTPSnapshotNamespace` 和 `options.py` 为准。`AsyncHTTPClient` 的网络调用须 `await`（`session(...)` 本身是同步返回 wrapper 的工厂）；Session wrapper 的两个例外见表中说明。除表中明确写出的 `ListPage`、`TreePage`、标量或列表外，`Dict[str, Any]` 都表示**服务端 `result` 原样映射，不承诺任何键**；服务端升级可增删其中的业务字段。`SearchContextResult` 是已建模的 `TypedDict`，但其字段均可缺失。
 
-完整方法签名和 `TypedDict` options 定义位于 `openviking_sdk` 包的类型注释中；IDE 类型提示是调用时的首选参考。
+### 方法契约
+
+除下列例外外，可选参数为 `None` 时不会写入请求；不传 `options` 或在 `options` 中不放某个键也是省略。所有列出的普通默认值都会传给服务端。`CreateSessionOptions` / `UpdateSessionConfigOptions` 中**键存在**的 `auto_commit_policy` 是例外：值为 `None` 会显式发送 JSON `null`，从而禁用该策略；键缺失才是省略。`wait_processed(timeout=None)` 也是例外：请求体始终含 `{"timeout": timeout}`，故 `None` 会发送 JSON `null`；其 HTTP 超时按 `timeout if timeout else 600.0` 计算，因此 `None` 和 `0` 都使用 600 秒（但请求体分别是 `null`、`0`）。`options.extra` 是受控的扩展字段，不能覆盖 SDK 已固定的参数。
+
+| 分组与方法 | 参数名与默认/省略语义 | 返回类型 / 稳定关键字段 |
+|---|---|---|
+| 生命周期：`initialize()`、`close()` | 无参数；分别初始化、关闭 HTTP client。 | `None` |
+| Session wrapper：`session(session_id=None, must_exist=False)`、`session_exists(session_id)` | `session_id=None` 返回空 ID wrapper；仅 `SyncHTTPClient.session(..., must_exist=True)` 会先读取 Session 并可失败。`AsyncHTTPClient.session` 接受同一参数但当前不执行该检查。 | `SyncSession` / `bool` |
+| 资源：`add_resource(path, to=None, parent=None, wait=False, timeout=None, options=None)` | `path` 必填；`to`、`parent`、`timeout` 省略；`wait=False`。`options: AddResourceOptions`。 | `Dict[str, Any]`（服务端 result 原样映射） |
+| 技能：`add_skill(data, wait=False, timeout=None, options=None)`；`update_skill(skill_name, data, wait=False, timeout=None, options=None)` | `data` 可为数据、文件或目录；`wait=False`；`timeout=None` 省略。options 分别为 `AddSkillOptions`、`UpdateSkillOptions`。 | `Dict[str, Any]`（原样映射） |
+| 技能：`list_skills(node_limit=1000, target_uri=None)`；`find_skills(query, limit=10, score_threshold=None, level=None, telemetry=False, target_uri=None)` | `target_uri`、阈值和 `level` 均可省略；其余使用表内默认值。 | `Dict[str, Any]`（原样映射） |
+| 技能：`validate_skill(data, strict=False, source_path=None, skill_dir_name=None, target_uri=None)`；`get_skill(skill_name, include_content=None, include_files=True, include_source=False, level=None, target_uri=None, include_integrity=False)`；`delete_skill(skill_name, target_uri=None)` | `strict=False`；`include_content=None` 真正省略；其余布尔值按默认值发送。 | `Dict[str, Any]`（原样映射） |
+| Watch：`list_watches(active_only=False, to_uri=None)`；`get_watch(task_id, to_uri=None)` | `active_only=False`；`to_uri=None` 省略。 | `Dict[str, Any]`（原样映射） |
+| Watch：`update_watch(task_id=None, *, to_uri=None, watch_interval=None, is_active=None, reason=None, instruction=None)`；`delete_watch(task_id=None, *, to_uri=None)`；`trigger_watch(task_id=None, *, to_uri=None)` | 三者都要求 `task_id` 或 `to_uri` 至少一个；更新时所有 `None` 字段省略。 | `Dict[str, Any]`（原样映射） |
+| 等待：`wait_processed(timeout=None)` | 请求体始终包含 `timeout`：`None` 发送 JSON `null`；`timeout=0` 发送 `0`。HTTP 超时使用 `timeout if timeout else 600.0`，所以二者均为 600 秒；它不是某个任务的完成证明。 | `Dict[str, Any]`（原样映射） |
+| 文件列表：`ls(uri, simple=False, recursive=False, output="original", abs_limit=256, show_all_hidden=False, node_limit=1000, sort_by=None, sort_order="asc", extra_fields=None, tags=None, include_tags=False, offset=0, limit=None, include_abstract=None, include_overview=None, overview_limit=4000)` | 分页与筛选参数都是**直接命名参数**；`sort_by`、列表字段、`limit`、`include_*` 为 `None` 时省略。`ls` 只取分页结果的 `result`。 | `List[Any]`；元素是服务端节点原样映射 |
+| 文件分页：`ls_page(...)` | 签名与 `ls` 完全相同；尤其是 `limit` 为直接参数，例如 `ls_page(uri, limit=50)`，**不是** `options={"limit": 50}`。 | `ListPage`：稳定键 `result`、`has_more` |
+| 树：`tree(uri, output="original", abs_limit=128, show_all_hidden=False, node_limit=1000, level_limit=3, extra_fields=None, tags=None, include_tags=False, offset=0, limit=None, include_abstract=None, include_overview=None, overview_limit=4000, directories_only=False)` | 与 `ls` 相同的直接分页/筛选语义，另有 `level_limit=3`、`directories_only=False`。 | `List[Dict[str, Any]]`；元素原样映射 |
+| 树分页：`tree_page(...)` | 签名与 `tree` 完全相同；`limit=None` 省略。 | `TreePage`：稳定键 `result`、`has_more` |
+| 文件元数据：`stat(uri)`、`attrs(uri)`；目录：`mkdir(uri, description=None, *, acl=None)` | `description`、`acl` 可省略。 | 前二者 `Dict[str, Any]`（原样映射）；`mkdir` 为 `None` |
+| 文件变更：`rm(uri, recursive=False, wait=False, timeout=None)`；`mv(from_uri, to_uri)` | 真实名称是 `rm`、`mv`（没有 `remove`、`move`）；`timeout=None` 省略。 | `None` |
+| 内容读取：`read(uri, offset=0, limit=-1)`；`read_raw(uri, offset=0, limit=-1)`；`download_bytes(uri)`；`abstract(uri)`；`overview(uri)` | `offset=0`；`limit=-1` 为 SDK 默认。 | 依次为 `str`、`str`、`bytes`、`str`、`str` |
+| 内容写入：`write(uri, content, mode="replace", wait=False, timeout=None, options=None)`；`batch_write(root_uri, operations, wait=True, timeout=None, options=None)` | `mode="replace"`；单写 `wait=False`，批量写 `wait=True`；`timeout=None` 省略。options 分别为 `WriteOptions`、`BatchWriteOptions`。 | `Dict[str, Any]`（原样映射） |
+| Tags：`set_tags(uri, tags=None, mode="replace", recursive=False, options=None)` | `tags=None` 不写入；`mode` 可为 `replace`、`append`、`clear`。 | `Dict[str, Any]`（原样映射） |
+| ACL：`acl_get(uri)`；`acl_set(uri, entries=None, *, acl_mode=None)`；`acl_grant(uri, principal, level)`；`acl_revoke(uri, principal)`；`acl_delete(uri)` | `acl_set` 至少需 `entries` 或 `acl_mode`；`acl_mode` 仅 `inherit` / `restricted`。 | `Dict[str, Any]`（原样映射） |
+| 检索：`find(query="", target_uri="", limit=10, image=None, options=None)` | `target_uri` 可为 `str` 或 `List[str]`；`image=None` 省略，非空值写入 options。`options: FindOptions`。 | `Dict[str, Any]`（原样映射） |
+| 检索：`search(query="", session_id=None, target_uri="", limit=10, image=None, options=None)` | 比 `find` 多 `session_id=None`（省略）；`options: SearchOptions`。 | `Dict[str, Any]`（原样映射） |
+| 检索上下文：`search_context(query="", session_id=None, target_uri="", limit=10, image=None, options=None)` | 以 context 模式调用；`options: SearchContextOptions`。 | `SearchContextResult`：已建模的可选字段 `entries`、`rendered`、`digest`、`stats`（均可缺失） |
+| 路径/文本检索：`grep(uri, pattern, case_insensitive=False, node_limit=256, exclude_uri=None, tags=None, include_tags=False, level_limit=None)`；`glob(pattern, uri="viking://", node_limit=256, extra_fields=None, tags=None, include_tags=False)` | 所有 `None` 的可选筛选参数省略；布尔和数值使用表内默认值。 | `Dict[str, Any]`（原样映射） |
+| Session：`create_session(session_id=None, options=None)`；`list_sessions()`；`get_session(session_id, *, auto_create=False)`；`update_session_config(session_id, options=None)`；`delete_session(session_id)` | `session_id=None` 由服务端处理；`auto_create=False`；options 为 `CreateSessionOptions` / `UpdateSessionConfigOptions`，其中 `auto_commit_policy` 的 `None` 特例见本节首段。 | 创建/读取/更新：`Dict[str, Any]`（原样映射）；列表：`List[Any]`（元素原样映射）；删除：`None` |
+| Session 内容：`get_session_context(session_id, token_budget=128_000)`；`get_session_archive(session_id, archive_id)` | `token_budget=128_000`。 | `Dict[str, Any]`（原样映射） |
+| Session 写入：`add_message(session_id, role, content=None, parts=None, options=None, peer_id=None)`；`batch_add_messages(session_id, messages, options=None)`；`commit_session(session_id, keep_recent_count=0, options=None)` | `content` 与 `parts` 均可省略；`peer_id` 不能同时出现在参数和 options；`options` 分别为 `AddMessageOptions`、`BatchAddMessagesOptions`、`CommitSessionOptions`。 | `Dict[str, Any]`（原样映射） |
+| 任务与编译：`get_task(task_id)`；`list_tasks(task_type=None, status=None, resource_id=None, limit=50)`；`cancel_task(task_id)`；`compile(from_uris, to, skill, options=None)` | 列表筛选的 `None` 省略；`get_task` 对 HTTP 404 返回 `None`；`options: CompileOptions`。 | get：`Optional[Dict[str, Any]]`；列表：`List[Dict[str, Any]]`；其余：`Dict[str, Any]`（均为原样映射） |
+| 数据包与一致性：`export_ovpack(uri, to, include_vectors=False)`；`backup_ovpack(to, include_vectors=False)`；`import_ovpack(file_path, parent, on_conflict=None, vector_mode=None)`；`restore_ovpack(file_path, on_conflict=None, vector_mode=None)`；`check_consistency(uri)` | `include_vectors=False`；冲突和向量模式为 `None` 时省略。 | `export_ovpack` / `backup_ovpack`：`str` 本地输出路径；`import_ovpack` / `restore_ovpack`：`str` 服务端返回的 URI；一致性检查：`Dict[str, Any]`（原样映射） |
+| 重建与健康：`reindex(uri, mode="vectors_only", wait=True, recursive=True, force=False, options=None)`；`health()`；`is_healthy()` | Python 的真实默认值为 `mode="vectors_only"`、`wait=True`、`recursive=True`；`force=False` 时不写入。 | 重建：`Dict[str, Any]`（原样映射）；健康：`bool` |
+| 状态：`queue_status(format=None)`、`vikingdb_status(format=None)`、`models_status(format=None)`、`get_status(format=None)`；`observer` | `format` 为 `None` 或 `"table"` / `"json"`；`observer.queue`、`.vikingdb`、`.models`、`.system` 为对应无参状态，`.is_healthy()` 返回布尔值。 | 状态为 `Dict[str, Any]`（原样映射）；observer 健康为 `bool` |
+| 管理账户：`admin_create_account(account_id, admin_user_id, user_config=None, seed=None)`；`admin_list_accounts(name=None, limit=None, page=1, query=None)`；`admin_delete_account(account_id)` | `user_config`、`seed`、筛选字段为 `None` 时省略；`page=1`。root key 所需。 | 创建/删除：`Dict[str, Any]`（原样映射）；列表：`List[Any]`（元素原样映射） |
+| 管理用户：`admin_register_user(account_id, user_id, role="user", user_config=None, seed=None)`；`admin_list_users(account_id, limit=None, name=None, role=None, page=1, query=None)`；`admin_remove_user(account_id, user_id)`；`admin_set_role(account_id, user_id, role)`；`admin_regenerate_key(account_id, user_id, seed=None)` | `role="user"`；所有 Optional 字段省略规则同上。 | list 为 `List[Any]`；其他为 `Dict[str, Any]`（原样映射） |
+| 管理组与迁移：`admin_create_group(account_id, group_id)`；`admin_list_groups(account_id)`；`admin_delete_group(account_id, group_id)`；`admin_list_group_members(account_id, group_id)`；`admin_add_group_member(account_id, group_id, user_id)`；`admin_remove_group_member(account_id, group_id, user_id)`；`admin_migrate(cleanup=False)` | `cleanup=False`。 | `admin_list_groups` 为 `List[Any]`（元素原样映射）；`admin_list_group_members` 及其余方法为 `Dict[str, Any]`（原样映射） |
+| Account Settings / 演进：`admin_get_agent_evolution()`；`admin_set_agent_evolution(enabled)`；`admin_get_account_settings(account_id)`；`admin_set_account_agent_evolution(account_id, enabled)` | `enabled` 必填。root key 所需。 | `Dict[str, Any]`（原样映射） |
+| Experience 与资产：`list_experience_trajectories(experience_uri, options=None)`；`get_experience_outcomes(experience_uri, options=None)`；`resolve_openviking_assets(manifest_yaml, options=None)`；`preflight_openviking_asset(name, repo_url, options=None)` | options 分别为 `ExperienceTrajectoryOptions`、`ExperienceOutcomeOptions`、`ResolveAssetsOptions`、`PreflightAssetOptions`。 | `Dict[str, Any]`（原样映射） |
+| 快照 namespace：`snapshot.commit(*, message, paths=None, branch="main", author_name=None, author_email=None)`；`snapshot.restore(*, project_dir=None, source_commit, branch="main", dry_run=False, message=None, author_name=None, author_email=None)` | 所有 Optional 字段省略；默认分支 `main`，`dry_run=False`。 | `Dict[str, Any]`（原样映射） |
+| 快照 namespace：`snapshot.show(target_ref, *, path=None)`；`snapshot.log(*, branch="main", limit=20, paths=None)`；`snapshot.diff(path, *, to_ref, from_ref=None)` | `show(path=None)` 返回提交元数据；有 path 时二进制分支稳定返回 `oid`、`size`、`bytes`。`log` 默认 `main` / `20`。 | show：`Any`；log：`List[Dict[str, Any]]`；diff：`Dict[str, Any]`（其他均原样映射） |
+| 快照 namespace：`snapshot.get_gitignore()`；`snapshot.set_gitignore(*, content)`；`snapshot.delete_gitignore()` | 无默认参数；`content` 必填。同步 client 也经 `__getattr__` 支持同签名的 `git_commit`、`git_restore`、`git_show`、`git_log`、`git_diff`、`git_get_ignore`、`git_set_ignore`、`git_delete_ignore`。 | `str` / `None` / `None` |
+| Session wrappers：`SyncSession.add_message(role, content=None, parts=None, options=None, peer_id=None)`；`batch_add_messages(messages)`；`commit(keep_recent_count=0, options=None)`；`commit_async(keep_recent_count=0, options=None)` | 均固定使用 wrapper 的 `session_id`；参数语义与 client 同名 Session 写入方法一致。`commit_async` **仅 `SyncSession` 提供**，仍同步执行，是 `commit` 的别名；异步 `Session` 只有 `await commit(...)`，没有 `commit_async`。 | `Dict[str, Any]`（原样映射） |
+| `SyncSession`：`delete()`；`load()`；`get_session_context(token_budget=128_000)`；`get_archive(archive_id)` | 无额外 Session ID；`token_budget=128_000`。 | delete：`None`；其余 `Dict[str, Any]`（原样映射） |
+
+### 字段契约
+
+`TypedDict(..., total=False)` 的全部键都可省略。下面的类型名称可直接从 `openviking_sdk` 导入；`Dict[str, Any]`、`Any` 和 `extra` 的内部结构不由 Python SDK 固定。
+
+| 形状 / 使用位置 | 字段契约 |
+|---|---|
+| `FindOptions` / `SearchOptions` | `FindOptions`：`image`、`node_limit`、`score_threshold`、`filter`、`context_type`、`include_provenance`、`tags`、`since`、`until`、`time_field`（`updated_at` / `created_at`）、`level`、`read_content`、`telemetry`、`events_time_decay_protection`、`extra`。`SearchOptions` 另有 `search_type`（`semantic` / `keywords`）。 |
+| `SearchContextOptions` / `SearchContextResult` | options：`search_type`、`image`、`node_limit`、`score_threshold`、`filter`、`context_type`、`include_provenance`、`tags`、`since`、`until`、`time_field`、`events_time_decay_protection`、`query_expansion`（`off` / `auto`）、`max_tokens`、`quotas`、`purpose`（`chat` / `coding`）、`detail`、`dedup_turns`、`exclude_uris`、`peer_scope`（`actor` / `all`）、`other_peer_penalty`、`rewrite`、`rewrite_max_bullets`、`telemetry`、`extra`。`SearchContextResult` 为 `total=False`：已建模的可选字段是 `entries`、`rendered`、`digest`、`stats`，它们均可缺失；每个 `SearchContextEntry` 也为 `total=False`，可有 `uri`、`category`、`score`、`detail`、`text`、`origin`。 |
+| 导入/写入 options | `AddResourceOptions`：`acl`、`reason`、`instruction`、`create_parent`、`strict`、`ignore_dirs`、`include`、`exclude`、`directly_upload_media`、`preserve_structure`、`watch_interval`、`args`、`telemetry`、`processing_mode`（`semantic_and_vectors` / `vectors_only`）、`add_type`、`tags`、`tag_mode`（`replace` / `append` / `clear`）、`extra`。`AddSkillOptions`：`telemetry`、`target_uri`、`extra`；`UpdateSkillOptions` 另有 `source_metadata`。`WriteOptions`：`acl`、`telemetry`、`processing_mode`、`tags`、`tag_mode`、`extra`；`BatchWriteOptions`：`telemetry`、`skip_conflicts`、`extra`。 |
+| 其他内容 options | `CompileOptions`：`instruction`、`args`、`extra`；`SetTagsOptions`：`telemetry`、`extra`；`ReindexOptions`：`force`、`tags`、`tag_mode`、`extra`。 |
+| 分页形状 | `ListPage` 的稳定键为 `result: List[Any]`、`has_more: bool`；`TreePage` 为 `result: List[Dict[str, Any]]`、`has_more: bool`。SDK 会在缺失时分别归一为 `[]`、`False`；节点字典内部不承诺字段。 |
+| Session 配置 | `CreateSessionOptions`：`memory_policy`、`auto_commit_policy`、`memory_extraction_config`、`telemetry`、`extra`；`UpdateSessionConfigOptions`：`auto_commit_policy`、`memory_extraction_config`、`telemetry`、`extra`。只有 `auto_commit_policy` 在**键存在**时保留 `None` 为显式 `null`；其它普通 `None` 省略。 |
+| 消息形状 | `Message` 仅 `role` 必填；可选 `content`、`parts`、`created_at`、`peer_id`、`turn_id`、`message_kind`（`user_query` / `assistant_step` / `tool_transport` / `checkpoint`）、`source_message_ids`、`telemetry`。`AddMessageOptions` 是除 `content`/`parts` 外的相同元数据加 `extra`；`BatchAddMessagesOptions` 为 `telemetry`、`extra`。 |
+| commit 配置 | `CommitSessionOptions`：`enable_working_memory`、`retention_mode`（`turn_budget`）、`keep_recent_turn_count`、`retained_message_token_budget`、`min_raw_tail_steps`、`event_tags`、`telemetry`、`extra`。只要任一 turn 保留字段存在，必须同时设 `retention_mode="turn_budget"`；`event_tags=[]` 会显式写入空 tags。 |
+| Experience / 资产 | `ExperienceTrajectoryOptions`：`limit`、`offset`、`start_date`、`end_date`；`ExperienceOutcomeOptions`：`start_date`、`end_date`；`ResolveAssetsOptions`：`catalog_yaml`、`manifest_label`、`catalog_label`、`extra`；`PreflightAssetOptions`：`branch`、`commit`、`auth_config`、`extra`，其中 `AssetGitAuth` 可有 `username`、`token`。 |
+| 任务 | SDK 未定义 Task TypedDict。`get_task` 的 404 为 `None`，否则任务字典；`list_tasks` 为任务字典列表。`status` 等服务端字段均是原样映射，不应把未在 SDK 类型中定义的键作为稳定契约。 |
+| 错误 | 所有 SDK 映射错误继承 `OpenVikingError`，稳定实例属性为 `message`、`code`、`details`。具体类型为 `InvalidArgumentError`、`InvalidURIError`、`NotFoundError`、`AlreadyExistsError`、`ConflictError`、`FailedPreconditionError`、`AbortedError`、`UnauthenticatedError`、`PermissionDeniedError`、`UnavailableError`、`ResourceExhaustedError`、`InternalError`、`DeadlineExceededError`、`UnimplementedError`、`ProcessingError`、`EmbeddingFailedError`、`VLMFailedError`、`SessionExpiredError`、`NotInitializedError`。 |
 
 ## 兼容性、升级与开发
 

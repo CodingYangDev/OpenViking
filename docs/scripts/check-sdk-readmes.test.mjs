@@ -16,6 +16,7 @@ const requiredSections = [
   'API 速查表',
   '兼容性',
 ]
+const requiredContractSubsections = ['方法契约', '字段契约']
 
 function withFixture(buildFixture, assertion) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openviking-sdk-readmes-'))
@@ -27,14 +28,53 @@ function withFixture(buildFixture, assertion) {
   }
 }
 
-function writeReadme(root, language, sections = requiredSections) {
+function writeReadme(
+  root,
+  language,
+  sections = requiredSections,
+  contractSubsections = requiredContractSubsections,
+) {
   const directory = path.join(root, 'sdk', language)
   fs.mkdirSync(directory, { recursive: true })
   fs.writeFileSync(
     path.join(directory, 'README.md'),
     `# OpenViking ${language} SDK\n\n这是中文 SDK 使用文档，用于说明安装、认证、任务、错误处理和兼容性。`.repeat(4) +
-      `\n\n${sections.map((section) => `## ${section}`).join('\n\n')}\n`,
+      `\n\n${sections
+        .flatMap((section) => [
+          `## ${section}`,
+          ...(section === 'API 速查表'
+            ? contractSubsections.map((subsection) => (
+              `### ${subsection}\n\n| 名称 | 说明 |\n| --- | --- |\n| 示例 | ${subsection}说明 |`
+            ))
+            : []),
+        ])
+        .join('\n\n')}\n`,
   )
+}
+
+function addToMethodContract(root, language, content) {
+  const readme = path.join(root, 'sdk', language, 'README.md')
+  const source = fs.readFileSync(readme, 'utf8')
+  fs.writeFileSync(readme, source.replace('### 方法契约', `### 方法契约\n\n${content}`))
+}
+
+function writeClientSource(root, language, source) {
+  const filename = language === 'go'
+    ? path.join(root, 'sdk', 'go', 'client.go')
+    : path.join(
+      root,
+      'sdk',
+      language,
+      language === 'python' ? 'openviking_sdk/client.py' : 'src/client.ts',
+    )
+  fs.mkdirSync(path.dirname(filename), { recursive: true })
+  fs.writeFileSync(filename, source)
+}
+
+function writeEmptyClientSources(root) {
+  writeClientSource(root, 'go', 'package openviking\n\ntype Client struct{}\n')
+  writeClientSource(root, 'python', 'class SyncHTTPClient:\n    pass\n')
+  writeClientSource(root, 'typescript', 'export class OpenVikingClient {}\n')
 }
 
 test('reports duplicate localized readmes and missing user-guide sections', () => {
@@ -58,6 +98,145 @@ test('accepts one Chinese complete README for every supported SDK', () => {
   withFixture(
     (root) => {
       for (const language of ['go', 'python', 'typescript']) writeReadme(root, language)
+      writeEmptyClientSources(root)
+    },
+    (root) => assert.deepEqual(checkSDKReadmes(root), []),
+  )
+})
+
+test('requires method and field contracts beneath the API quick reference', () => {
+  withFixture(
+    (root) => {
+      writeReadme(root, 'go', requiredSections, [])
+      writeReadme(root, 'python')
+      writeReadme(root, 'typescript')
+    },
+    (root) => {
+      const errors = checkSDKReadmes(root)
+
+      assert.ok(errors.some((error) => error.includes('sdk/go/README.md') && error.includes('方法契约')))
+      assert.ok(errors.some((error) => error.includes('sdk/go/README.md') && error.includes('字段契约')))
+    },
+  )
+})
+
+test('reports public client methods that are absent from the corresponding README', () => {
+  withFixture(
+    (root) => {
+      for (const language of ['go', 'python', 'typescript']) writeReadme(root, language)
+      writeClientSource(
+        root,
+        'go',
+        'package openviking\n\ntype Client struct{}\n\nfunc (c *Client) Documented() {}\nfunc (c *Client) Undocumented() {}\n',
+      )
+      writeClientSource(
+        root,
+        'python',
+        'class SyncHTTPClient:\n    def documented(self):\n        pass\n\n    def undocumented(self):\n        pass\n',
+      )
+      writeClientSource(
+        root,
+        'typescript',
+        'export class OpenVikingClient {\n  async documented() {}\n  async undocumented() {}\n}\n',
+      )
+      addToMethodContract(root, 'go', '`Documented`')
+      addToMethodContract(root, 'python', '`documented`')
+      addToMethodContract(root, 'typescript', '`documented`')
+    },
+    (root) => {
+      const errors = checkSDKReadmes(root)
+
+      assert.ok(errors.some((error) => error.includes('sdk/go/README.md') && error.includes('Undocumented')))
+      assert.ok(!errors.some((error) => error.includes('sdk/go/README.md') && error.includes('Documented')))
+      assert.ok(errors.some((error) => error.includes('sdk/python/README.md') && error.includes('undocumented')))
+      assert.ok(!errors.some((error) => error.includes('sdk/python/README.md') && error.includes('"documented" is not documented')))
+      assert.ok(errors.some((error) => error.includes('sdk/typescript/README.md') && error.includes('undocumented')))
+      assert.ok(!errors.some((error) => error.includes('sdk/typescript/README.md') && error.includes('"documented" is not documented')))
+    },
+  )
+})
+
+test('requires a substantive table for both API quick-reference contracts', () => {
+  withFixture(
+    (root) => {
+      for (const language of ['go', 'python', 'typescript']) writeReadme(root, language)
+      writeEmptyClientSources(root)
+      const readme = path.join(root, 'sdk', 'go', 'README.md')
+      const source = fs.readFileSync(readme, 'utf8')
+      fs.writeFileSync(
+        readme,
+        source
+          .replace(/### 方法契约\n\n\| 名称 \| 说明 \|\n\| --- \| --- \|\n\| 示例 \| 方法契约说明 \|/, '### 方法契约\n\n只有说明，没有表格。')
+          .replace(/### 字段契约\n\n\| 名称 \| 说明 \|\n\| --- \| --- \|\n\| 示例 \| 字段契约说明 \|/, '### 字段契约'),
+      )
+    },
+    (root) => {
+      const errors = checkSDKReadmes(root)
+
+      assert.ok(errors.some((error) => error.includes('sdk/go/README.md') && error.includes('方法契约') && error.includes('表格')))
+      assert.ok(errors.some((error) => error.includes('sdk/go/README.md') && error.includes('字段契约') && error.includes('表格')))
+    },
+  )
+})
+
+test('requires every public client method in the 方法契约 subsection', () => {
+  withFixture(
+    (root) => {
+      for (const language of ['go', 'python', 'typescript']) writeReadme(root, language)
+      writeEmptyClientSources(root)
+      writeClientSource(
+        root,
+        'go',
+        'package openviking\n\ntype Client struct{}\n\nfunc (c *Client) Documented() {}\n',
+      )
+      fs.appendFileSync(path.join(root, 'sdk', 'go', 'README.md'), '\n`Documented` 出现在方法契约之外。\n')
+    },
+    (root) => {
+      const errors = checkSDKReadmes(root)
+
+      assert.ok(errors.some((error) => error.includes('sdk/go/README.md') && error.includes('"Documented" is not documented')))
+    },
+  )
+})
+
+test('reports missing client source files and classes explicitly', () => {
+  withFixture(
+    (root) => {
+      for (const language of ['go', 'python', 'typescript']) writeReadme(root, language)
+      writeClientSource(root, 'go', 'package openviking\n\ntype Client struct{}\n')
+      writeClientSource(root, 'typescript', 'export class DifferentClient {}\n')
+    },
+    (root) => {
+      const errors = checkSDKReadmes(root)
+
+      assert.ok(errors.includes('sdk/python/openviking_sdk/client.py: required public client source file is missing'))
+      assert.ok(errors.includes('sdk/typescript/src/client.ts: required public client class "OpenVikingClient" is missing'))
+    },
+  )
+})
+
+test('ignores non-public client members in Go, Python, and TypeScript', () => {
+  withFixture(
+    (root) => {
+      for (const language of ['go', 'python', 'typescript']) writeReadme(root, language)
+      writeClientSource(
+        root,
+        'go',
+        'package openviking\n\ntype Client struct{}\n\nfunc (c *Client) Documented() {}\nfunc (c *Client) hidden() {}\n',
+      )
+      writeClientSource(
+        root,
+        'python',
+        'class SyncHTTPClient:\n    def documented(self):\n        pass\n\n    @property\n    def status(self):\n        return "ok"\n\n    def __init__(self):\n        pass\n\n    def _private(self):\n        pass\n',
+      )
+      writeClientSource(
+        root,
+        'typescript',
+        'export class OpenVikingClient {\n  constructor() {}\n  documented() {}\n  private hidden() {}\n  protected guarded() {}\n}\n',
+      )
+      addToMethodContract(root, 'go', '`Documented`')
+      addToMethodContract(root, 'python', '`documented`')
+      addToMethodContract(root, 'typescript', '`documented`')
     },
     (root) => assert.deepEqual(checkSDKReadmes(root), []),
   )
