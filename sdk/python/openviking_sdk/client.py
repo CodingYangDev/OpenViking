@@ -960,6 +960,120 @@ class AsyncHTTPClient:
         response = await self._request("DELETE", f"/api/v1/skills/{skill_name}", params=params)
         return self._handle_response(response)
 
+    async def add_mcp(
+        self,
+        name: str,
+        url: str,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> Dict[str, Any]:
+        response = await self._request(
+            "POST",
+            "/api/v1/mcps",
+            json={"name": name, "url": url, "headers": dict(headers or {})},
+        )
+        return self._handle_response(response)
+
+    async def remove_mcp(self, name: str) -> Dict[str, Any]:
+        name_path = self._path_segment(name)
+        response = await self._request("DELETE", f"/api/v1/mcps/{name_path}")
+        return self._handle_response(response)
+
+    async def list_mcps(self) -> Dict[str, Any]:
+        response = await self._request("GET", "/api/v1/mcps")
+        return self._handle_response(response)
+
+    async def find_mcp_tools(self, query: str, limit: int = 10) -> Dict[str, Any]:
+        response = await self._request(
+            "POST",
+            "/api/v1/mcps/find",
+            json={"query": query, "limit": limit},
+        )
+        return self._handle_response(response)
+
+    async def validate_mcp(
+        self,
+        name: str,
+        url: str,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> Dict[str, Any]:
+        response = await self._request(
+            "POST",
+            "/api/v1/mcps/validate",
+            json={"name": name, "url": url, "headers": dict(headers or {})},
+        )
+        return self._handle_response(response)
+
+    async def get_mcp(self, name: str) -> Dict[str, Any]:
+        name_path = self._path_segment(name)
+        response = await self._request("GET", f"/api/v1/mcps/{name_path}")
+        return self._handle_response(response)
+
+    async def sync_mcp(self, name: str) -> Dict[str, Any]:
+        name_path = self._path_segment(name)
+        response = await self._request("POST", f"/api/v1/mcps/{name_path}/sync")
+        return self._handle_response(response)
+
+    async def get_mcp_status(self, name: str) -> Dict[str, Any]:
+        response = await self._request("GET", "/api/v1/mcps/status", params={"name": name})
+        return self._handle_response(response)
+
+    async def invoke_mcp_tool(
+        self,
+        tool_uri: str,
+        arguments: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        response = await self._request(
+            "POST",
+            "/api/v1/mcps/invoke",
+            json={
+                "uri": VikingURI.normalize(tool_uri),
+                "arguments": dict(arguments or {}),
+            },
+        )
+        return self._handle_response(response)
+
+    async def mount_mcp_tool(
+        self,
+        tool_uri: str,
+        node_uri: str,
+        title: str,
+        description: Optional[str] = None,
+        timeout_seconds: int = 60,
+        arguments: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        response = await self._request(
+            "POST",
+            "/api/v1/mcps/mount",
+            json={
+                "tool_uri": VikingURI.normalize(tool_uri),
+                "node_uri": VikingURI.normalize(node_uri),
+                "title": title,
+                "description": description,
+                "timeout_seconds": timeout_seconds,
+                "arguments": dict(arguments or {}),
+            },
+        )
+        return self._handle_response(response)
+
+    async def unmount_mcp_tool(self, node_uri: str) -> Dict[str, Any]:
+        response = await self._request(
+            "DELETE",
+            "/api/v1/mcps/mount",
+            params={"node_uri": VikingURI.normalize(node_uri)},
+        )
+        return self._handle_response(response)
+
+    async def list_mcp_mounts(
+        self,
+        mcp: str,
+        tool: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"mcp": mcp}
+        if tool is not None:
+            params["tool"] = tool
+        response = await self._request("GET", "/api/v1/mcps/mounts", params=params)
+        return self._handle_response(response)
+
     async def list_watches(
         self,
         active_only: bool = False,
@@ -2394,6 +2508,77 @@ class SyncHTTPClient:
         target_uri: Optional[str] = None,
     ) -> Dict[str, Any]:
         return run_async(self._async_client.delete_skill(skill_name, target_uri=target_uri))
+
+    def add_mcp(
+        self,
+        name: str,
+        url: str,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.add_mcp(name, url, headers=headers))
+
+    def remove_mcp(self, name: str) -> Dict[str, Any]:
+        return run_async(self._async_client.remove_mcp(name))
+
+    def list_mcps(self) -> Dict[str, Any]:
+        return run_async(self._async_client.list_mcps())
+
+    def find_mcp_tools(self, query: str, limit: int = 10) -> Dict[str, Any]:
+        return run_async(self._async_client.find_mcp_tools(query, limit=limit))
+
+    def validate_mcp(
+        self,
+        name: str,
+        url: str,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.validate_mcp(name, url, headers=headers))
+
+    def get_mcp(self, name: str) -> Dict[str, Any]:
+        return run_async(self._async_client.get_mcp(name))
+
+    def sync_mcp(self, name: str) -> Dict[str, Any]:
+        return run_async(self._async_client.sync_mcp(name))
+
+    def get_mcp_status(self, name: str) -> Dict[str, Any]:
+        return run_async(self._async_client.get_mcp_status(name))
+
+    def invoke_mcp_tool(
+        self,
+        tool_uri: str,
+        arguments: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.invoke_mcp_tool(tool_uri, arguments=arguments))
+
+    def mount_mcp_tool(
+        self,
+        tool_uri: str,
+        node_uri: str,
+        title: str,
+        description: Optional[str] = None,
+        timeout_seconds: int = 60,
+        arguments: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return run_async(
+            self._async_client.mount_mcp_tool(
+                tool_uri,
+                node_uri,
+                title,
+                description=description,
+                timeout_seconds=timeout_seconds,
+                arguments=arguments,
+            )
+        )
+
+    def unmount_mcp_tool(self, node_uri: str) -> Dict[str, Any]:
+        return run_async(self._async_client.unmount_mcp_tool(node_uri))
+
+    def list_mcp_mounts(
+        self,
+        mcp: str,
+        tool: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.list_mcp_mounts(mcp, tool=tool))
 
     def list_watches(
         self,

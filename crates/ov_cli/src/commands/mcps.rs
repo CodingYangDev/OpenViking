@@ -363,21 +363,98 @@ pub async fn sync(
     compact: bool,
 ) -> Result<()> {
     validate_server_name(name)?;
-    post_name_action(client, name, "sync", output_format, compact).await
+    let response: Value = client
+        .post(&format!("/api/v1/mcps/{name}/sync"), &json!({}))
+        .await?;
+    if let Some(rendered) = render_sync_for_table(&response, output_format) {
+        println!("{rendered}");
+    } else {
+        print_response(&response, output_format, compact);
+    }
+    Ok(())
 }
 
-async fn post_name_action(
-    client: &HttpClient,
-    name: &str,
-    action: &str,
-    output_format: OutputFormat,
-    compact: bool,
-) -> Result<()> {
-    let response: Value = client
-        .post(&format!("/api/v1/mcps/{name}/{action}"), &json!({}))
-        .await?;
-    print_response(&response, output_format, compact);
-    Ok(())
+fn render_sync_for_table(response: &Value, output_format: OutputFormat) -> Option<String> {
+    if matches!(output_format, OutputFormat::Json) {
+        return None;
+    }
+    let payload = response_payload(response).as_object()?;
+    let name = payload.get("name")?.as_str()?;
+    let tool_count = payload.get("tool_count")?.as_u64()?;
+    let changes = payload.get("changes")?.as_object()?;
+    let added = sync_change_names(changes, "added")?;
+    let changed = sync_change_names(changes, "changed")?;
+    let unchanged = sync_change_names(changes, "unchanged")?;
+    let removed = sync_change_names(changes, "removed")?;
+    let affected = payload.get("affected_mounts")?.as_array()?;
+    let tool_noun = if tool_count == 1 { "tool" } else { "tools" };
+
+    let mut lines = vec![
+        theme::success(format!("Synced {name}: {tool_count} {tool_noun}"))
+            .bold()
+            .to_string(),
+        format!(
+            "{} added, {} changed, {} unchanged, {} removed",
+            added.len(),
+            changed.len(),
+            unchanged.len(),
+            removed.len()
+        ),
+    ];
+    push_sync_change_line(&mut lines, "Added", &added);
+    push_sync_change_line(&mut lines, "Changed", &changed);
+    push_sync_change_line(&mut lines, "Unchanged", &unchanged);
+    push_sync_change_line(&mut lines, "Removed", &removed);
+
+    if affected.is_empty() {
+        lines.push(String::new());
+        lines.push(theme::muted("No affected live context mounts.").to_string());
+        return Some(lines.join("\n"));
+    }
+
+    lines.push(String::new());
+    lines.push(
+        theme::warning(format!(
+            "{} affected live context mount{}",
+            affected.len(),
+            if affected.len() == 1 { "" } else { "s" }
+        ))
+        .bold()
+        .to_string(),
+    );
+    for (index, mount) in affected.iter().enumerate() {
+        let mount = mount.as_object()?;
+        let node_uri = mount.get("node_uri")?.as_str()?;
+        let tool_uri = mount.get("tool_uri")?.as_str()?;
+        let status = mount.get("status")?.as_str()?;
+        let reason = mount.get("reason")?.as_str()?;
+        let rendered_status = match status {
+            "INVALID" | "REMOVED" => theme::error(status).bold().to_string(),
+            _ => theme::warning(status).bold().to_string(),
+        };
+        lines.push(format!("{}. [{rendered_status}] {node_uri}", index + 1));
+        lines.push(format!("   tool: {tool_uri}"));
+        lines.push(format!("   reason: {reason}"));
+    }
+    Some(lines.join("\n"))
+}
+
+fn sync_change_names<'a>(
+    changes: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<Vec<&'a str>> {
+    changes
+        .get(key)?
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect()
+}
+
+fn push_sync_change_line(lines: &mut Vec<String>, label: &str, names: &[&str]) {
+    if !names.is_empty() {
+        lines.push(format!("{label}: {}", names.join(", ")));
+    }
 }
 
 pub async fn status(
@@ -521,7 +598,7 @@ pub async fn invoke(
 mod tests {
     use super::{
         parse_add_config, parse_arguments, render_list_for_table, render_mounts_for_table,
-        render_show_for_table, validate_server_name,
+        render_show_for_table, render_sync_for_table, validate_server_name,
     };
     use crate::output::OutputFormat;
     use serde_json::json;
@@ -660,5 +737,58 @@ mod tests {
         assert!(rendered.contains("viking://resources/demo/weather.md"));
         assert!(rendered.contains("viking://agent/tools/weather/current.json"));
         assert!(render_mounts_for_table(&response, OutputFormat::Json).is_none());
+    }
+
+    #[test]
+    fn sync_renders_changes_and_affected_mounts_in_table_mode() {
+        let response = json!({
+            "result": {
+                "name": "weather",
+                "tool_count": 3,
+                "changes": {
+                    "added": ["forecast"],
+                    "changed": ["current"],
+                    "unchanged": ["alerts"],
+                    "removed": ["legacy"]
+                },
+                "affected_mounts": [{
+                    "node_uri": "viking://resources/demo/weather.md",
+                    "tool_uri": "viking://agent/tools/weather/current.json",
+                    "tool": "current",
+                    "status": "INVALID",
+                    "reason": "Tool revision changed; 'unit' is a required property",
+                    "mounted_revision": "old",
+                    "current_revision": "new"
+                }]
+            }
+        });
+
+        let rendered = render_sync_for_table(&response, OutputFormat::Table).expect("sync output");
+        assert!(rendered.contains("Synced weather: 3 tools"));
+        assert!(rendered.contains("1 added, 1 changed, 1 unchanged, 1 removed"));
+        assert!(rendered.contains("Added: forecast"));
+        assert!(rendered.contains("[INVALID] viking://resources/demo/weather.md"));
+        assert!(rendered.contains("tool: viking://agent/tools/weather/current.json"));
+        assert!(rendered.contains("'unit' is a required property"));
+        assert!(render_sync_for_table(&response, OutputFormat::Json).is_none());
+    }
+
+    #[test]
+    fn sync_reports_when_no_mounts_are_affected() {
+        let response = json!({
+            "name": "weather",
+            "tool_count": 1,
+            "changes": {
+                "added": [],
+                "changed": [],
+                "unchanged": ["current"],
+                "removed": []
+            },
+            "affected_mounts": []
+        });
+
+        let rendered = render_sync_for_table(&response, OutputFormat::Table).expect("sync output");
+        assert!(rendered.contains("0 added, 0 changed, 1 unchanged, 0 removed"));
+        assert!(rendered.contains("No affected live context mounts."));
     }
 }

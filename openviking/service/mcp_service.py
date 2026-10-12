@@ -322,7 +322,7 @@ class MCPService:
         self,
         server_name: str,
         tools: list[dict[str, Any]],
-        existing_names: set[str],
+        removed_names: set[str],
         ctx: RequestContext,
     ) -> None:
         server_root = f"{_TOOLS_ROOT}/{server_name}"
@@ -345,8 +345,7 @@ class MCPService:
                 wait=True,
             )
 
-        current_names = {item["tool"]["name"] for item in tools}
-        for name in sorted(existing_names - current_names):
+        for name in sorted(removed_names):
             await self._service.fs.rm(
                 f"{server_root}/{name}.json",
                 ctx=ctx,
@@ -456,6 +455,73 @@ class MCPService:
                 else ("Invalid MCP tool arguments")
             )
             raise InvalidArgumentError(f"{prefix}: {exc.message}") from exc
+
+    async def _affected_mounts(
+        self,
+        server_name: str,
+        current_tools: dict[str, dict[str, Any]],
+        ctx: RequestContext,
+    ) -> list[dict[str, Any]]:
+        connection = await self._open_mount_database(ctx)
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM live_context_nodes
+                WHERE mcp_name = ?
+                ORDER BY tool_name, node_uri
+                """,
+                (server_name,),
+            ).fetchall()
+        finally:
+            self._close_mount_database(connection)
+
+        affected: list[dict[str, Any]] = []
+        for row in rows:
+            current = current_tools.get(row["tool_name"])
+            item = {
+                "node_uri": row["node_uri"],
+                "tool_uri": row["tool_uri"],
+                "tool": row["tool_name"],
+                "mounted_revision": row["revision"],
+                "current_revision": current["revision"] if current is not None else None,
+            }
+            if current is None:
+                affected.append(
+                    {
+                        **item,
+                        "status": "REMOVED",
+                        "reason": "Tool is no longer provided by the MCP server",
+                    }
+                )
+                continue
+            if row["revision"] == current["revision"]:
+                continue
+
+            try:
+                arguments = json.loads(row["args_json"])
+                if not isinstance(arguments, dict):
+                    raise ValueError("mounted arguments are not a JSON object")
+                self._validate_tool_arguments(current, arguments)
+            except (InvalidArgumentError, RuntimeError, ValueError) as exc:
+                affected.append(
+                    {
+                        **item,
+                        "status": "INVALID",
+                        "reason": f"Tool revision changed; {exc}",
+                    }
+                )
+            else:
+                affected.append(
+                    {
+                        **item,
+                        "status": "REVIEW",
+                        "reason": (
+                            "Tool revision changed; mounted arguments remain valid "
+                            "under the current input schema"
+                        ),
+                    }
+                )
+        return affected
 
     @staticmethod
     def _validate_node_uri(uri: str, ctx: RequestContext) -> str:
@@ -683,8 +749,29 @@ class MCPService:
                 raise InvalidArgumentError(
                     f"MCP tool names are not valid OpenViking filenames: {', '.join(invalid_names)}"
                 )
-            existing_names = await self._catalog_names(name, ctx)
-            await self._publish_catalog(name, tools, existing_names, ctx)
+            existing_tools = {
+                document["tool"]["name"]: document
+                for document in await self._catalog(name, ctx)
+            }
+            current_tools = {document["tool"]["name"]: document for document in tools}
+            existing_names = set(existing_tools)
+            current_names = set(current_tools)
+            added = sorted(current_names - existing_names)
+            removed = sorted(existing_names - current_names)
+            changed = sorted(
+                tool_name
+                for tool_name in existing_names & current_names
+                if existing_tools[tool_name]["revision"]
+                != current_tools[tool_name]["revision"]
+            )
+            unchanged = sorted((existing_names & current_names) - set(changed))
+            await self._publish_catalog(
+                name,
+                [current_tools[tool_name] for tool_name in added + changed],
+                set(removed),
+                ctx,
+            )
+            affected_mounts = await self._affected_mounts(name, current_tools, ctx)
             registry = await self._load(ctx)
             current = registry["servers"][name]
             current.pop("tools", None)
@@ -695,6 +782,13 @@ class MCPService:
             "synced": True,
             "protocol_version": initialized.protocolVersion,
             "tool_count": len(tools),
+            "changes": {
+                "added": added,
+                "changed": changed,
+                "unchanged": unchanged,
+                "removed": removed,
+            },
+            "affected_mounts": affected_mounts,
         }
 
     @staticmethod

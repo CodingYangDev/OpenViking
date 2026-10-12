@@ -32,7 +32,9 @@ import type {
   GrepOptions,
   GlobOptions,
   ImportPackOptions,
+  MCPSyncResult,
   Message,
+  MountMCPToolOptions,
   ObserverFormat,
   PreflightAssetOptions,
   ReindexOptions,
@@ -297,6 +299,93 @@ export class OpenVikingClient {
   deleteSkill(name: string, targetUri?: string): Promise<JsonObject> {
     return this.request("DELETE", `/api/v1/skills/${pathPart(name)}`, {
       query: { target_uri: targetUri },
+    });
+  }
+  /** Register a Streamable HTTP MCP server and discover its tools. */
+  addMCP(
+    name: string,
+    url: string,
+    headers: Record<string, string> = {},
+  ): Promise<JsonObject> {
+    return this.request("POST", "/api/v1/mcps", {
+      body: { name, url, headers },
+    });
+  }
+  /** Remove an MCP server and its tool catalog. */
+  removeMCP(name: string): Promise<JsonObject> {
+    return this.request("DELETE", `/api/v1/mcps/${pathPart(name)}`);
+  }
+  /** List registered MCP servers. */
+  listMCPs(): Promise<JsonObject> {
+    return this.request("GET", "/api/v1/mcps");
+  }
+  /** Search the MCP tool catalog semantically. */
+  findMCPTools(query: string, limit = 10): Promise<JsonObject> {
+    return this.request("POST", "/api/v1/mcps/find", {
+      body: { query, limit },
+    });
+  }
+  /** Validate and discover an MCP server without registering it. */
+  validateMCP(
+    name: string,
+    url: string,
+    headers: Record<string, string> = {},
+  ): Promise<JsonObject> {
+    return this.request("POST", "/api/v1/mcps/validate", {
+      body: { name, url, headers },
+    });
+  }
+  /** Get a registered MCP server and its current tool catalog. */
+  getMCP(name: string): Promise<JsonObject> {
+    return this.request("GET", `/api/v1/mcps/${pathPart(name)}`);
+  }
+  /** Refresh an MCP tool catalog and report affected live context mounts. */
+  syncMCP(name: string): Promise<MCPSyncResult> {
+    return this.request("POST", `/api/v1/mcps/${pathPart(name)}/sync`);
+  }
+  /** Check whether an MCP server is reachable. */
+  getMCPStatus(name: string): Promise<JsonObject> {
+    return this.request("GET", "/api/v1/mcps/status", {
+      query: { name },
+    });
+  }
+  /** Invoke a registered MCP tool through OpenViking. */
+  invokeMCPTool(
+    toolUri: string,
+    toolArguments: JsonObject = {},
+  ): Promise<JsonObject> {
+    return this.request("POST", "/api/v1/mcps/invoke", {
+      body: { uri: normalizeURI(toolUri), arguments: toolArguments },
+    });
+  }
+  /** Create or replace a live context node backed by an MCP tool. */
+  mountMCPTool(
+    toolUri: string,
+    nodeUri: string,
+    title: string,
+    options: MountMCPToolOptions = {},
+  ): Promise<JsonObject> {
+    return this.request("POST", "/api/v1/mcps/mount", {
+      body: compact({
+        tool_uri: normalizeURI(toolUri),
+        node_uri: normalizeURI(nodeUri),
+        title,
+        description: options.description,
+        timeout_seconds: options.timeoutSeconds ?? 60,
+        arguments: options.arguments ?? {},
+      }),
+    });
+  }
+  /** Remove a live context mount and its node. */
+  unmountMCPTool(nodeUri: string): Promise<JsonObject> {
+    return this.request("DELETE", "/api/v1/mcps/mount", {
+      query: { node_uri: normalizeURI(nodeUri) },
+    });
+  }
+  /** List live context mounts for one MCP server and optional tool. */
+  listMCPMounts(mcp: string, tool?: string): Promise<JsonObject> {
+    return this.request("GET", "/api/v1/mcps/mounts", {
+      query: { mcp, tool },
     });
   }
   /** List resource watches. */

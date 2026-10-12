@@ -67,6 +67,7 @@ _, _, _ = imageResults, storedImageResults, similarPosters
 |------|---------|
 | 资源和技能导入 | `AddResource`, `AddSkill`, `WaitProcessed` |
 | 技能管理 | `ListSkills`, `FindSkills`, `ValidateSkill`, `GetSkill`, `UpdateSkill`, `DeleteSkill` |
+| MCP Server 与实时上下文 | `AddMCP`, `RemoveMCP`, `ListMCPs`, `FindMCPTools`, `ValidateMCP`, `GetMCP`, `SyncMCP`, `GetMCPStatus`, `InvokeMCPTool`, `MountMCPTool`, `UnmountMCPTool`, `ListMCPMounts` |
 | Watch 管理 | `ListWatches`, `GetWatch`, `UpdateWatch`, `DeleteWatch`, `TriggerWatch` |
 | 文件系统和内容 | `List`, `Tree`, `Stat`, `Attrs`, `Mkdir`, `Remove`, `Move`, `Read`, `Abstract`, `Overview`, `Write`, `SetTags`, `Reindex` |
 | 检索 | `Find`, `Search`, `Grep`, `Glob` |
@@ -131,6 +132,32 @@ found, err := client.FindSkills(ctx, "search the web", &openviking.FindSkillsOpt
     Limit: 5,
 })
 _, _ = skills, found
+```
+
+MCP Server 注册、工具发现和实时上下文挂载：
+
+```go
+_, err := client.AddMCP(
+    ctx,
+    "weather",
+    "https://mcp.example.com/api",
+    map[string]string{"Authorization": "Bearer token"},
+)
+tools, err := client.FindMCPTools(ctx, "当前天气", 5)
+mounted, err := client.MountMCPTool(
+    ctx,
+    "viking://agent/tools/weather/current.json",
+    "viking://resources/arranger/beijing-weather.md",
+    "北京天气",
+    &openviking.MountMCPToolOptions{
+        Description:    openviking.String("北京区域的实时天气。"),
+        TimeoutSeconds: 60,
+        Arguments:      map[string]any{"city": "Beijing"},
+    },
+)
+syncResult, err := client.SyncMCP(ctx, "weather")
+
+_, _, _, _ = tools, mounted, syncResult, err
 ```
 
 `AddResource` 在 `WatchInterval > 0` 时会创建 watch；已有任务可用专用 watch 方法管理：

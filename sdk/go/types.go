@@ -153,6 +153,13 @@ type DeleteSkillOptions struct {
 	TargetURI any
 }
 
+// MountMCPToolOptions controls a live context mount backed by an MCP tool.
+type MountMCPToolOptions struct {
+	Description    *string
+	TimeoutSeconds int
+	Arguments      map[string]any
+}
+
 // WaitProcessedOptions controls WaitProcessed.
 type WaitProcessedOptions struct {
 	Timeout *float64 `json:"timeout,omitempty"`

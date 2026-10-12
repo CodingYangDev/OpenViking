@@ -492,6 +492,179 @@ async def test_mount_validates_node_uri_and_arguments(monkeypatch):
         )
 
 
+async def test_sync_writes_only_added_and_changed_tools(monkeypatch):
+    service = MCPService(SimpleNamespace())
+    server = {"name": "demo", "url": "https://mcp.example.com/api"}
+    discovered = [
+        Tool(name="added", inputSchema={"type": "object"}),
+        Tool(
+            name="changed",
+            inputSchema={
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+        ),
+        Tool(name="unchanged", inputSchema={"type": "object"}),
+    ]
+    current = {
+        document["tool"]["name"]: document
+        for document in (service._tool_document(server, tool) for tool in discovered)
+    }
+    existing = [
+        {
+            "uri": "viking://agent/tools/demo/changed.json",
+            **current["changed"],
+            "revision": "old-changed-revision",
+        },
+        {
+            "uri": "viking://agent/tools/demo/unchanged.json",
+            **current["unchanged"],
+        },
+        {
+            "uri": "viking://agent/tools/demo/removed.json",
+            "server": "demo",
+            "revision": "removed-revision",
+            "tool": {"name": "removed", "inputSchema": {"type": "object"}},
+        },
+    ]
+    monkeypatch.setattr(
+        service,
+        "_registered",
+        AsyncMock(return_value=(server, {"Authorization": "secret"})),
+    )
+    monkeypatch.setattr(
+        service,
+        "_discover",
+        AsyncMock(
+            return_value=(
+                SimpleNamespace(protocolVersion="2025-03-26"),
+                discovered,
+            )
+        ),
+    )
+    monkeypatch.setattr(service, "_catalog", AsyncMock(return_value=existing))
+    publish = AsyncMock()
+    monkeypatch.setattr(service, "_publish_catalog", publish)
+    affected = [
+        {
+            "node_uri": "viking://resources/demo/changed.md",
+            "tool_uri": "viking://agent/tools/demo/changed.json",
+            "tool": "changed",
+            "status": "REVIEW",
+        }
+    ]
+    monkeypatch.setattr(service, "_affected_mounts", AsyncMock(return_value=affected))
+    registry = {
+        "version": 1,
+        "servers": {
+            "demo": {
+                "name": "demo",
+                "url": "https://mcp.example.com/api",
+                "headers": {},
+            }
+        },
+    }
+    monkeypatch.setattr(service, "_load", AsyncMock(return_value=registry))
+    monkeypatch.setattr(service, "_write_document", AsyncMock())
+
+    result = await service.sync("demo", _ctx())
+
+    assert result["changes"] == {
+        "added": ["added"],
+        "changed": ["changed"],
+        "unchanged": ["unchanged"],
+        "removed": ["removed"],
+    }
+    assert result["affected_mounts"] == affected
+    published = publish.await_args.args[1]
+    assert [document["tool"]["name"] for document in published] == ["added", "changed"]
+    publish.assert_awaited_once_with("demo", published, {"removed"}, _ctx())
+
+
+async def test_affected_mounts_are_recomputed_without_updating_revisions(monkeypatch):
+    service = MCPService(SimpleNamespace())
+
+    def mount_database(_ctx):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE live_context_nodes (
+                node_uri TEXT PRIMARY KEY,
+                mcp_name TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_uri TEXT NOT NULL,
+                revision TEXT NOT NULL,
+                args_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO live_context_nodes VALUES
+                ('viking://resources/demo/valid.md', 'demo', 'valid',
+                 'viking://agent/tools/demo/valid.json', 'old-valid',
+                 '{"city": "Beijing"}', '2026-10-09T00:00:00+00:00'),
+                ('viking://resources/demo/invalid.md', 'demo', 'invalid',
+                 'viking://agent/tools/demo/invalid.json', 'old-invalid',
+                 '{"city": "Beijing"}', '2026-10-09T00:00:00+00:00'),
+                ('viking://resources/demo/removed.md', 'demo', 'removed',
+                 'viking://agent/tools/demo/removed.json', 'old-removed',
+                 '{}', '2026-10-09T00:00:00+00:00'),
+                ('viking://resources/demo/current.md', 'demo', 'current',
+                 'viking://agent/tools/demo/current.json', 'current-revision',
+                 '{}', '2026-10-09T00:00:00+00:00');
+            """
+        )
+        return connection
+
+    monkeypatch.setattr(
+        service,
+        "_open_mount_database",
+        AsyncMock(side_effect=mount_database),
+    )
+    current_tools = {
+        "valid": {
+            "revision": "new-valid",
+            "tool": {
+                "name": "valid",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        },
+        "invalid": {
+            "revision": "new-invalid",
+            "tool": {
+                "name": "invalid",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"unit": {"type": "string"}},
+                    "required": ["unit"],
+                },
+            },
+        },
+        "current": {
+            "revision": "current-revision",
+            "tool": {"name": "current", "inputSchema": {"type": "object"}},
+        },
+    }
+
+    first = await service._affected_mounts("demo", current_tools, _ctx())
+    second = await service._affected_mounts("demo", current_tools, _ctx())
+
+    assert second == first
+    assert {item["tool"]: item["status"] for item in first} == {
+        "invalid": "INVALID",
+        "removed": "REMOVED",
+        "valid": "REVIEW",
+    }
+    invalid = next(item for item in first if item["tool"] == "invalid")
+    assert "required property" in invalid["reason"]
+    assert invalid["mounted_revision"] == "old-invalid"
+    assert invalid["current_revision"] == "new-invalid"
+    assert all(item["tool"] != "current" for item in first)
+
+
 async def test_router_exposes_and_delegates_only_requested_operations(monkeypatch):
     methods = {
         name: AsyncMock(return_value={"operation": name})

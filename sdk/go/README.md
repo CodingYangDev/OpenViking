@@ -151,6 +151,7 @@ Implemented:
 |------|------------|
 | Resource and skill import | `AddResource`, `AddSkill`, `WaitProcessed` |
 | Skill management | `ListSkills`, `FindSkills`, `ValidateSkill`, `GetSkill`, `UpdateSkill`, `DeleteSkill` |
+| MCP servers and live context | `AddMCP`, `RemoveMCP`, `ListMCPs`, `FindMCPTools`, `ValidateMCP`, `GetMCP`, `SyncMCP`, `GetMCPStatus`, `InvokeMCPTool`, `MountMCPTool`, `UnmountMCPTool`, `ListMCPMounts` |
 | Watch management | `ListWatches`, `GetWatch`, `UpdateWatch`, `DeleteWatch`, `TriggerWatch` |
 | Filesystem and content | `List`, `Tree`, `Stat`, `Attrs`, `Mkdir`, `Remove`, `Move`, `Read`, `Abstract`, `Overview`, `Write`, `SetTags`, `Reindex` |
 | Retrieval | `Find`, `Search`, `Grep`, `Glob` |
@@ -226,6 +227,32 @@ restored, err := client.RestoreOVPack(ctx, exported, &openviking.ImportPackOptio
 })
 
 _, _ = exported, restored
+```
+
+## MCP Servers and Live Context
+
+```go
+_, err := client.AddMCP(
+	ctx,
+	"weather",
+	"https://mcp.example.com/api",
+	map[string]string{"Authorization": "Bearer token"},
+)
+tools, err := client.FindMCPTools(ctx, "current weather", 5)
+mounted, err := client.MountMCPTool(
+	ctx,
+	"viking://agent/tools/weather/current.json",
+	"viking://resources/arranger/beijing-weather.md",
+	"Beijing Weather",
+	&openviking.MountMCPToolOptions{
+		Description:    openviking.String("Current weather for the Beijing region."),
+		TimeoutSeconds: 60,
+		Arguments:      map[string]any{"city": "Beijing"},
+	},
+)
+syncResult, err := client.SyncMCP(ctx, "weather")
+
+_, _, _, _ = tools, mounted, syncResult, err
 ```
 
 ## Watch Management
