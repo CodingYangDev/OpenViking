@@ -47,6 +47,8 @@ _LEVEL_MASK = {
 }
 _MASK_LEVEL = {mask: level for level, mask in _LEVEL_MASK.items()}
 ACL_GRANT_FIELDS = ("acl_direct_grants", "acl_inherited_grants")
+# VikingDB reads back an empty list<string> field as this type default.
+_EMPTY_LIST_PLACEHOLDER = ["default"]
 ACL_MODE_FIELD = "acl_mode"
 ACL_CONTEXT_FIELDS = frozenset((ACL_MODE_FIELD, *ACL_GRANT_FIELDS))
 _ACL_OUTPUT_FIELDS = ["uri", *sorted(ACL_CONTEXT_FIELDS)]
@@ -116,6 +118,8 @@ class DirectAcl:
         raw_grants = record.get(f"{prefix}_grants") or []
         if not isinstance(raw_grants, (list, tuple)):
             raise RuntimeError(f"Invalid ACL grants for {prefix}: expected a list")
+        if list(raw_grants) == _EMPTY_LIST_PLACEHOLDER:
+            raw_grants = []
         return cls.from_entries(_decode_grant(grant) for grant in raw_grants)
 
 
