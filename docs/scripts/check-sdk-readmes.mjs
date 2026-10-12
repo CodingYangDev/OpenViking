@@ -117,7 +117,32 @@ function contractSubsection(quickReference, subsection) {
 }
 
 function hasSubstantiveMarkdownTable(source) {
-  return /^\|[^\n]+\|\s*\n\|\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|\s*\n\|[^\n]+\|/m.test(source)
+  return substantiveMarkdownTables(source).length > 0
+}
+
+function substantiveMarkdownTables(source) {
+  return [...source.matchAll(/^(\|[^\n]+\|)[ \t]*\n\|[ \t]*:?-{3,}:?[ \t]*(?:\|[ \t]*:?-{3,}:?[ \t]*)+\|[ \t]*\n((?:\|[^\n]*\|[ \t]*(?:\n|$))*)/gm)]
+    .filter((match) => match[2].trim())
+    .map((match) => ({
+      headers: match[1].split('|').slice(1, -1).map((header) => header.trim()),
+      rows: match[2].trim().split('\n').map((row) => row.split('|').slice(1, -1).map((cell) => cell.trim())),
+    }))
+}
+
+function hasTableHeaders(source, requiredHeaderGroups) {
+  return substantiveMarkdownTables(source).some((table) => (
+    requiredHeaderGroups.every((group) => group.some((header) => table.headers.includes(header)))
+  ))
+}
+
+function emptyContractCells(source, requiredHeaders) {
+  return substantiveMarkdownTables(source).flatMap((table) => {
+    const columnIndexes = requiredHeaders.map((headers) => table.headers.findIndex((header) => headers.includes(header)))
+    if (columnIndexes.some((index) => index < 0)) return []
+    return table.rows.flatMap((row, rowIndex) => columnIndexes.flatMap((columnIndex) => (
+      row[columnIndex] ? [] : [{ row: rowIndex + 1, column: table.headers[columnIndex] }]
+    )))
+  })
 }
 
 export function checkSDKReadmes(root) {
@@ -153,6 +178,17 @@ export function checkSDKReadmes(root) {
         errors.push(`${readmeLabel}: missing required API quick-reference subsection "${subsection}"`)
       } else if (!hasSubstantiveMarkdownTable(contract)) {
         errors.push(`${readmeLabel}: API quick-reference subsection "${subsection}" must contain a substantive Markdown 表格`)
+      } else if (subsection === '方法契约' && !hasTableHeaders(contract, [['参数'], ['含义', '说明']])) {
+        errors.push(`${readmeLabel}: API quick-reference subsection "方法契约" must contain a substantive Markdown 表格 with "参数" and "含义" or "说明" columns`)
+      } else if (subsection === '字段契约' && !hasTableHeaders(contract, [['字段'], ['含义', '说明']])) {
+        errors.push(`${readmeLabel}: API quick-reference subsection "字段契约" must contain a substantive Markdown 表格 with "字段" and "含义" or "说明" columns`)
+      } else {
+        const requiredHeaders = subsection === '方法契约'
+          ? [['参数'], ['含义', '说明']]
+          : [['字段'], ['含义', '说明']]
+        for (const { row, column } of emptyContractCells(contract, requiredHeaders)) {
+          errors.push(`${readmeLabel}: API quick-reference subsection "${subsection}" table row ${row} has an empty required "${column}" cell`)
+        }
       }
     }
     const { methods, error } = publicClientMethods(root, language)

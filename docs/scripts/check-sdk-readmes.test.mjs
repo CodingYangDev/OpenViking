@@ -44,7 +44,9 @@ function writeReadme(
           `## ${section}`,
           ...(section === 'API 速查表'
             ? contractSubsections.map((subsection) => (
-              `### ${subsection}\n\n| 名称 | 说明 |\n| --- | --- |\n| 示例 | ${subsection}说明 |`
+              subsection === '方法契约'
+                ? `### ${subsection}\n\n| 方法 | 参数 | 说明 |\n| --- | --- | --- |\n| 示例 | 参数 | 方法说明 |`
+                : `### ${subsection}\n\n| 字段 | 说明 |\n| --- | --- |\n| 示例 | 字段契约说明 |`
             ))
             : []),
         ])
@@ -166,8 +168,8 @@ test('requires a substantive table for both API quick-reference contracts', () =
       fs.writeFileSync(
         readme,
         source
-          .replace(/### 方法契约\n\n\| 名称 \| 说明 \|\n\| --- \| --- \|\n\| 示例 \| 方法契约说明 \|/, '### 方法契约\n\n只有说明，没有表格。')
-          .replace(/### 字段契约\n\n\| 名称 \| 说明 \|\n\| --- \| --- \|\n\| 示例 \| 字段契约说明 \|/, '### 字段契约'),
+          .replace(/### 方法契约\n\n\| 方法 \| 参数 \| 说明 \|\n\| --- \| --- \| --- \|\n\| 示例 \| 参数 \| 方法说明 \|/, '### 方法契约\n\n只有说明，没有表格。')
+          .replace(/### 字段契约\n\n\| 字段 \| 说明 \|\n\| --- \| --- \|\n\| 示例 \| 字段契约说明 \|/, '### 字段契约'),
       )
     },
     (root) => {
@@ -175,6 +177,82 @@ test('requires a substantive table for both API quick-reference contracts', () =
 
       assert.ok(errors.some((error) => error.includes('sdk/go/README.md') && error.includes('方法契约') && error.includes('表格')))
       assert.ok(errors.some((error) => error.includes('sdk/go/README.md') && error.includes('字段契约') && error.includes('表格')))
+    },
+  )
+})
+
+test('requires parameter and meaning columns in API quick-reference contract tables', () => {
+  withFixture(
+    (root) => {
+      for (const language of ['go', 'python', 'typescript']) writeReadme(root, language)
+      writeEmptyClientSources(root)
+      const readme = path.join(root, 'sdk', 'go', 'README.md')
+      const source = fs.readFileSync(readme, 'utf8')
+      fs.writeFileSync(
+        readme,
+        source
+          .replace('| 方法 | 参数 | 说明 |\n| --- | --- | --- |\n| 示例 | 参数 | 方法说明 |', '| 方法 | 说明 |\n| --- | --- |\n| 示例 | 方法说明 |')
+          .replace('| 字段 | 说明 |\n| --- | --- |\n| 示例 | 字段契约说明 |', '| 字段 | 类型 |\n| --- | --- |\n| 示例 | string |'),
+      )
+    },
+    (root) => {
+      const errors = checkSDKReadmes(root)
+
+      assert.ok(errors.some((error) => error.includes('sdk/go/README.md') && error.includes('方法契约') && error.includes('参数')))
+      assert.ok(errors.some((error) => error.includes('sdk/go/README.md') && error.includes('字段契约') && error.includes('含义')))
+    },
+  )
+})
+
+test('reports empty required cells in API quick-reference contract table rows', () => {
+  withFixture(
+    (root) => {
+      for (const language of ['go', 'python', 'typescript']) writeReadme(root, language)
+      writeEmptyClientSources(root)
+      const readme = path.join(root, 'sdk', 'go', 'README.md')
+      const source = fs.readFileSync(readme, 'utf8')
+      fs.writeFileSync(
+        readme,
+        source
+          .replace('| 方法 | 参数 | 说明 |\n| --- | --- | --- |\n| 示例 | 参数 | 方法说明 |', '| 方法 | 参数 | 说明 |\n| --- | --- | --- |\n| 示例 | 参数 | |\n| 示例二 | | 另一个说明 |')
+          .replace('| 字段 | 说明 |\n| --- | --- |\n| 示例 | 字段契约说明 |', '| 字段 | 说明 |\n| --- | --- |\n| 示例 | |\n| | 第二项说明 |'),
+      )
+    },
+    (root) => {
+      const errors = checkSDKReadmes(root)
+
+      for (const [subsection, row, column] of [
+        ['方法契约', 'row 1', '说明'],
+        ['方法契约', 'row 2', '参数'],
+        ['字段契约', 'row 1', '说明'],
+        ['字段契约', 'row 2', '字段'],
+      ]) {
+        assert.ok(errors.some((error) => (
+          error.includes('sdk/go/README.md')
+          && error.includes(subsection)
+          && error.includes(row)
+          && error.includes(column)
+        )))
+      }
+    },
+  )
+})
+
+test('does not treat a following table as data rows of the preceding contract table', () => {
+  withFixture(
+    (root) => {
+      for (const language of ['go', 'python', 'typescript']) writeReadme(root, language)
+      writeEmptyClientSources(root)
+      addToMethodContract(
+        root,
+        'go',
+        '| 参数 | 含义 |\n| --- | --- |\n| `value` | 示例参数。 |\n\n| 方法 | 参数含义 | 返回 |\n| --- | --- | --- |\n| `example()` | 无参数。 | `None` |',
+      )
+    },
+    (root) => {
+      const errors = checkSDKReadmes(root)
+
+      assert.ok(!errors.some((error) => error.includes('sdk/go/README.md') && error.includes('empty required')))
     },
   )
 })
