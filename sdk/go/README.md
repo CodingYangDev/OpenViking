@@ -408,59 +408,9 @@ fmt.Println(content)
 
 ### 字段契约
 
-#### `Config` 与通用省略规则速览
-
-| 字段/类型 | 发送或生效规则 |
-|---|---|
-| `Config.BaseURL string` | 必填，去掉末尾 `/` 后必须有 scheme 与 host，否则 `NewClient` 返回错误。 |
-| `APIKey`、`Account`、`User`、`ActorPeerID string` | 非空时分别写入 `X-API-Key`、`X-OpenViking-Account`、`X-OpenViking-User`、`X-OpenViking-Actor-Peer`。 |
-| `Timeout time.Duration`、`HTTPClient *http.Client` | HTTPClient 非 nil 时直接使用（Timeout 忽略）；否则 Timeout=0 为 60 秒。 |
-| `ExtraHeaders map[string]string`、`Profile bool`、`UploadMode string` | ExtraHeaders 复制后写入每个请求；Profile=true 附 `profile=1`；UploadMode 非空写入临时上传 multipart 字段。 |
-| `*bool`、`*int`、`*float64`、`*string` | nil 通常表示省略，非 nil 区分显式 `false`/0/空串；用 `Bool`、`Int`、`Float64`、`String` 构造。具体非指针 bool 的发送规则以方法表为准。 |
-| `map[string]any`、`Extra` | 多数 map 为 nil 时省略，非 nil 空 map 会发送 `{}`；`Extra` 中 nil 值跳过，且不能覆盖已有/受保护字段（会本地报错）。`Map(nil)` 只适用于 `*map[string]any` 字段，能把 JSON null 与省略区分开。 |
-| `[]string` / slices | 大多数请求中 nil 省略、非 nil `[]` 明确发送空数组；Tags 的精确例外见 `SetTags`、`Write`、`Reindex` 和 `CommitSession`。 |
-| URI | 除 `Compile` 外，URI 参数通常经 `NormalizeURI`：无 `viking://` 前缀时补上并去掉开头 `/`。 |
-
-#### 分页、文件操作与 Tags Options 省略语义速览
-
-| 类型 | 字段 | 契约 |
-|---|---|---|
-| `ListOptions` | `Simple, Recursive, ShowAllHidden, IncludeTags bool` | ListPage 都会发送前三项（含 false）；IncludeTags 仅 true 发送。 |
-|  | `Output, AbsLimit, OverviewLimit, NodeLimit` | 空/0 分别为 `original`、256、4000、1000。 |
-|  | `Offset, Limit, SortBy, SortOrder, ExtraFields, Tags` | 前四项零值/空省略；slices nil 省略、非 nil 发送。 |
-|  | `IncludeAbstract, IncludeOverview *bool` | nil 省略，指针可显式 false。 |
-| `TreeOptions` | `Output, AbsLimit, OverviewLimit, NodeLimit, LevelLimit` | 默认 `original`、128、4000、1000、3；LevelLimit 指针可显式 0。其余字段的 bool/slice/分页语义同 List；`DirectoriesOnly` 仅 true 发送。 |
-| `WriteOptions` | `ACL, Mode, Wait, Timeout, Telemetry, ProcessingMode, Tags, TagMode, Extra` | Mode 空为 replace；Wait 始终发（零值 false）；Timeout 指针；Tags/TagMode 的发送规则见方法表。 |
-| `BatchWriteOperation` / `BatchWriteOptions` | `URI`；`Content *string`；`ContentBase64 *string`；`Mode`；`Wait *bool`、`Timeout *float64`、`Telemetry`、`Extra` | operation 的 Content/ContentBase64 nil 省略；Wait 使用指针，nil 和 false 不同。 |
-| `RemoveOptions` / `ReindexOptions` | `Recursive, Wait, Timeout` / `Mode, Wait, Force, Recursive *bool, Tags, TagMode, Extra` | Remove 的 bool 始终作为 query 发送。Reindex 的 nil options 与非 nil options 的 Wait 差异必须按方法表处理；Force 仅 true 发送。 |
-| `SetTagsOptions` / `ACLSpec` / `ACLEntry` | `Mode, Recursive, Telemetry, Extra` / `ACLMode, Entries` / `Principal, Level` | SetTags Mode 空为 replace。ACLSpec 的 Entries nil 表示由嵌入 API 省略，非 nil 空 slice 表示清空；ACLEntry 两字段按 JSON 必填编码。 |
-
-#### 检索与上下文字段省略语义速览
-
-| 类型 | 字段 | 契约 |
-|---|---|---|
-| `FindOptions`、`SearchOptions` | 共用 `TargetURI any, Image, Limit, NodeLimit, ScoreThreshold, Filter, ContextType, IncludeProvenance, ReadContent, Telemetry, Since, Until, TimeField, Level, Tags, Extra` | TargetURI 仅非 nil 发送，string 或 `[]string` 会规范化；Image 可为 data URI/http(s)/viking URI 或本地文件；本地文件读为 data URI。Limit 默认 10，`NodeLimit != nil` 覆盖；指针和 nil slice/map 省略。Search 另有 `SearchType, SessionID`，Find 另有 `EventsTimeDecayProtection`（Search 也有）。 |
-| `SearchContextOptions` | `Image, SessionID, SearchType, Limit, NodeLimit, ScoreThreshold, Filter, ContextType, IncludeProvenance, Tags, Since, Until, TimeField, EventsTimeDecayProtection, QueryExpansion, MaxTokens, Quotas, Purpose, Detail, DedupTurns, ExcludeURIs, PeerScope, OtherPeerPenalty, Rewrite, RewriteMaxBullets, Telemetry, Extra` | 只将非空字符串、非 nil 指针/map/slice/interface 发往服务端；`mode=context` 不可由 options 改写。 |
-| `FindResult` | `Memories, Resources, Skills []MatchedContext`；`QueryPlan *QueryPlan`；`QueryResults []map[string]any`；`Total int` | 这些是 SDK 声明的稳定字段；QueryResults 内 map 仍不承诺键，Total 缺失解为 0。 |
-| `MatchedContext` | `URI, ContextType, Level, Abstract, Content, Overview, Category, OriginScore *float64, TimeScore *float64, Score, MatchReason, Tags` | 命中条目的稳定字段；OriginScore/TimeScore nil 表示未返回，Tags JSON 键为 `tags`。 |
-| `SearchContextResult` | `Entries []SearchContextEntry`、`Rendered string`、`Digest string`、`Stats map[string]any` | Entries 的稳定字段为 `URI, Category, Score, Detail, Text, Origin`；Stats 的键不承诺。 |
-| `GrepOptions` / `GlobOptions` | Grep：`CaseInsensitive, NodeLimit, LevelLimit, ExcludeURI, Tags, IncludeTags`；Glob：`NodeLimit, Tags, IncludeTags` | Grep 的 CaseInsensitive 总发送；其他指针/nil slice 省略；IncludeTags 只在 true 发送。 |
-
-#### Session、消息、任务与错误字段省略语义速览
-
-| 类型 | 字段 | 契约 |
-|---|---|---|
-| `CreateSessionOptions` | `SessionID, MemoryPolicy, AutoCommitPolicy, DisableAutoCommit, MemoryExtractionConfig, Telemetry, Extra` | 三个 map/interface nil 时省略；DisableAutoCommit=true 覆盖 AutoCommitPolicy 并发送 null。 |
-| `GetSessionOptions` / `UpdateSessionConfigOptions` | `AutoCreate` / `MemoryExtractionConfig, AutoCommitPolicy *map[string]any, Telemetry, Extra` | AutoCreate 只有 true 发；`AutoCommitPolicy` 使用指针以区分 omit 与 null：`Map(nil)` 可发 null。 |
-| `AddMessageOptions` / `Message` | `Content *string, Parts []map[string]any, CreatedAt, PeerID, TurnID, MessageKind, SourceMessageIDs, Telemetry` | AddMessage 要 Content 或非空 Parts；Message 仅按 JSON omitempty 编码，Content 可为 `String("")`，Parts nil/空都因 omitempty 不编码。 |
-| `CommitSessionOptions` | `KeepRecentCount, KeepRecentTurnCount, RetainedMessageTokenBudget, MinRawTailSteps *int`；`RetentionMode, Telemetry, EventTags, Extra` | 指针 nil 省略、可显式 0；EventTags 的 nil 与 [] 区别见方法表。 |
-| `ListTasksOptions` | `TaskType, Status, ResourceID string`；`Limit int` | 空条件、非正 Limit 均省略。 |
-| `Error` | `Code string`、`Message string`、`Details map[string]any`、`StatusCode int` | 服务端/API 失败使用 `*Error`；Code 空时 Error() 只返回 Message。Details 的键不承诺；`IsCode(err, code)` 仅匹配此类型。 |
-| `ErrorInfo` | `Code`、`Message`、`Details` | 响应 envelope 内部错误对象；会转换为 `*Error`，空 Code 变为 `UNKNOWN`，空 Message 变为 `Unknown error`。 |
-
 #### 逐字段业务含义
 
-下列是速览表的可直接照用版本：每个 Options、配置和结构化结果字段均单列；未特别写明时，`string` 的空值、`map`/slice 的 nil 都省略，`Extra` 的 nil value 会跳过且不能覆盖 SDK 已设置的保留字段。
+每个 Options、配置和结构化结果字段均单列；未特别写明时，`string` 的空值、`map`/slice 的 nil 都省略，`Extra` 的 nil value 会跳过且不能覆盖 SDK 已设置的保留字段。
 
 ##### `Config`、ACL、Watch 与文件 Options
 

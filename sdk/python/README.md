@@ -235,8 +235,9 @@ except OpenVikingError as exc:
 | `FindOptions` | `read_content` | `bool` | 省略 | 是否读取命中内容。 |
 | `FindOptions` | `telemetry` | `Any` | 省略 | 遥测上下文。 |
 | `FindOptions` | `events_time_decay_protection` | `Optional[str]` | `None` 省略 | 事件时间衰减保护配置。 |
-| `FindOptions` 及所有带 `_ExtraOptions` 的 Options | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段；不可覆盖 SDK 字段。 |
-| `SearchOptions` | `search_type` | `"semantic" \| "keywords"` | 省略 | 语义或关键词搜索；其余字段继承 `FindOptions`。 |
+| `FindOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段；不可覆盖 SDK 字段。 |
+| `SearchOptions` | `search_type` | `"semantic" \| "keywords"` | 省略 | 语义或关键词搜索。 |
+| `SearchOptions` | `extra` | `Mapping[str, Any]` | 省略 | 从 `FindOptions` 继承的受控透传字段。 |
 | `SearchContextOptions` | `search_type` | `"semantic" \| "keywords"` | 省略 | 搜索方式。 |
 | `SearchContextOptions` | `image` | `Any` | 省略 | 图像检索输入。 |
 | `SearchContextOptions` | `node_limit` | `int` | 省略 | 检索遍历节点上限。 |
@@ -261,6 +262,7 @@ except OpenVikingError as exc:
 | `SearchContextOptions` | `rewrite` | `bool \| "auto"` | 省略 | 是否改写结果。 |
 | `SearchContextOptions` | `rewrite_max_bullets` | `int` | 省略 | 改写要点上限。 |
 | `SearchContextOptions` | `telemetry` | `Any` | 省略 | 遥测上下文。 |
+| `SearchContextOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段；不可覆盖 SDK 字段。 |
 | `AddResourceOptions` | `acl` | `Dict[str, Any]` | 省略 | 导入资源 ACL。 |
 | `AddResourceOptions` | `reason` | `str` | 省略 | 导入原因。 |
 | `AddResourceOptions` | `instruction` | `str` | 省略 | 处理指令。 |
@@ -278,22 +280,30 @@ except OpenVikingError as exc:
 | `AddResourceOptions` | `add_type` | `str` | 省略 | 特殊导入类型；与 `parent` 互斥且要求精确 `to`。 |
 | `AddResourceOptions` | `tags` | `List[str]` | 省略 | 写入的 tags。 |
 | `AddResourceOptions` | `tag_mode` | `"replace" \| "append" \| "clear"` | 省略 | tags 合并方式。 |
+| `AddResourceOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段；不可覆盖 SDK 字段。 |
 | `AddSkillOptions` | `telemetry` | `Any` | 省略 | 遥测上下文。 |
 | `AddSkillOptions` | `target_uri` | `str` | 省略 | 技能目标根 URI。 |
+| `AddSkillOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段；不可覆盖 SDK 字段。 |
 | `UpdateSkillOptions` | `source_metadata` | `Dict[str, Any]` | 省略 | 更新的来源元数据；继承 `AddSkillOptions`。 |
+| `UpdateSkillOptions` | `extra` | `Mapping[str, Any]` | 省略 | 从 `AddSkillOptions` 继承的受控透传字段。 |
 | `WriteOptions` | `acl` | `Dict[str, Any]` | 省略 | 写入 ACL。 |
 | `WriteOptions` | `telemetry` | `Any` | 省略 | 遥测上下文。 |
 | `WriteOptions` | `processing_mode` | `"semantic_and_vectors" \| "vectors_only"` | 省略 | 写入处理模式。 |
 | `WriteOptions` | `tags` | `List[str]` | 省略 | 写入 tags。 |
 | `WriteOptions` | `tag_mode` | `"replace" \| "append" \| "clear"` | 省略 | tags 合并方式。 |
+| `WriteOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段；不可覆盖 SDK 字段。 |
 | `BatchWriteOptions` | `telemetry` | `Any` | 省略 | 遥测上下文。 |
 | `BatchWriteOptions` | `skip_conflicts` | `bool` | 省略 | 返回冲突而不覆盖或阻塞兼容写入。 |
+| `BatchWriteOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段；不可覆盖 SDK 字段。 |
 | `CompileOptions` | `instruction` | `str` | 省略 | 编译指令。 |
 | `CompileOptions` | `args` | `Dict[str, Any]` | 空字典也省略 | 编译处理参数。 |
+| `CompileOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段；不可覆盖 SDK 字段。 |
 | `SetTagsOptions` | `telemetry` | `Any` | 省略 | tags 操作遥测。 |
+| `SetTagsOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段；不可覆盖 SDK 字段。 |
 | `ReindexOptions` | `force` | `bool` | 省略 | 强制重建。 |
 | `ReindexOptions` | `tags` | `List[str]` | 省略 | 重建同步的 tags。 |
 | `ReindexOptions` | `tag_mode` | `"replace" \| "append" \| "clear"` | 省略 | tags 合并方式。 |
+| `ReindexOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段；不可覆盖 SDK 字段。 |
 | `ListPage` | `result` | `List[Any]` | 必有；缺失归一为 `[]` | 当前页节点。 |
 | `ListPage` | `has_more` | `bool` | 必有；缺失归一为 `False` | 是否还有下一页。 |
 | `TreePage` | `result` | `List[Dict[str, Any]]` | 必有；缺失归一为 `[]` | 当前页树节点。 |
@@ -302,28 +312,63 @@ except OpenVikingError as exc:
 | `CreateSessionOptions` | `auto_commit_policy` | `Optional[Dict[str, Any]]` | 缺键省略；存在且 `None` 发 `null` | 自动 commit 策略；`null` 明确禁用。 |
 | `CreateSessionOptions` | `memory_extraction_config` | `Dict[str, Any]` | 省略 | 初始抽取配置。 |
 | `CreateSessionOptions` | `telemetry` | `Any` | 省略 | 遥测上下文。 |
+| `CreateSessionOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段。 |
 | `UpdateSessionConfigOptions` | `auto_commit_policy` | `Optional[Dict[str, Any]]` | 缺键省略；存在且 `None` 发 `null` | 自动 commit 策略；`null` 明确禁用。 |
 | `UpdateSessionConfigOptions` | `memory_extraction_config` | `Dict[str, Any]` | 省略 | 更新抽取配置。 |
 | `UpdateSessionConfigOptions` | `telemetry` | `Any` | 省略 | 遥测上下文。 |
+| `UpdateSessionConfigOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段。 |
 | `Message` | `role` | `str` | **必填** | 消息角色。 |
-| `Message` | `content` / `parts` | `str` / `List[Any]` | 省略；实际消息至少一项有效 | 文本 / 结构化分段。 |
-| `Message` / `AddMessageOptions` | `created_at` / `peer_id` / `turn_id` | `str` | 省略 | 创建时间 / 主体 / 会话轮次。 |
-| `Message` / `AddMessageOptions` | `message_kind` | `"user_query" \| "assistant_step" \| "tool_transport" \| "checkpoint"` | 省略 | 消息类别。 |
-| `Message` / `AddMessageOptions` | `source_message_ids` / `telemetry` | `List[str]` / `Any` | 省略 | 来源消息 ID / 遥测。 |
+| `Message` | `content` | `str` | 省略；实际消息至少一项有效 | 文本内容。 |
+| `Message` | `parts` | `List[Any]` | 省略；实际消息至少一项有效 | 结构化内容分段。 |
+| `Message` | `created_at` | `str` | 省略 | 创建时间。 |
+| `Message` | `peer_id` | `str` | 省略 | 消息主体。 |
+| `Message` | `turn_id` | `str` | 省略 | 会话轮次。 |
+| `Message` | `message_kind` | `"user_query" \| "assistant_step" \| "tool_transport" \| "checkpoint"` | 省略 | 消息类别。 |
+| `Message` | `source_message_ids` | `List[str]` | 省略 | 来源消息 ID。 |
+| `Message` | `telemetry` | `Any` | 省略 | 遥测上下文。 |
+| `AddMessageOptions` | `created_at` | `str` | 省略 | 消息创建时间。 |
+| `AddMessageOptions` | `peer_id` | `str` | 省略 | 消息主体。 |
+| `AddMessageOptions` | `turn_id` | `str` | 省略 | 会话轮次。 |
+| `AddMessageOptions` | `message_kind` | `"user_query" \| "assistant_step" \| "tool_transport" \| "checkpoint"` | 省略 | 消息类别。 |
+| `AddMessageOptions` | `source_message_ids` | `List[str]` | 省略 | 来源消息 ID。 |
+| `AddMessageOptions` | `telemetry` | `Any` | 省略 | 遥测上下文。 |
 | `AddMessageOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传字段。 |
-| `BatchAddMessagesOptions` | `telemetry` / `extra` | `Any` / `Mapping[str, Any]` | 省略 | 批写遥测 / 受控透传字段。 |
+| `BatchAddMessagesOptions` | `telemetry` | `Any` | 省略 | 批写遥测。 |
+| `BatchAddMessagesOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段。 |
 | `CommitSessionOptions` | `enable_working_memory` | `Optional[bool]` | `None` 省略 | 是否启用工作记忆。 |
 | `CommitSessionOptions` | `retention_mode` | `"turn_budget"` | 省略 | 启用 turn 保留字段时必填的模式。 |
-| `CommitSessionOptions` | `keep_recent_turn_count` / `retained_message_token_budget` / `min_raw_tail_steps` | `int` | 省略 | 保留轮数、token 预算、原始尾部步数。 |
+| `CommitSessionOptions` | `keep_recent_turn_count` | `int` | 省略 | 保留的最近轮数。 |
+| `CommitSessionOptions` | `retained_message_token_budget` | `int` | 省略 | 保留消息的 token 预算。 |
+| `CommitSessionOptions` | `min_raw_tail_steps` | `int` | 省略 | 原始尾部最少步骤数。 |
 | `CommitSessionOptions` | `event_tags` | `List[str]` | 省略；`[]` 显式发送 | 抽取事件 tags。 |
-| `CommitSessionOptions` | `telemetry` / `extra` | `Any` / `Mapping[str, Any]` | 省略 | 遥测 / 受控透传字段。 |
-| `ExperienceTrajectoryOptions` | `limit` / `offset` / `start_date` / `end_date` | `int` / `int` / `str` / `str` | 省略 | 轨迹分页和日期范围。 |
-| `ExperienceOutcomeOptions` | `start_date` / `end_date` | `str` | 省略 | outcome 日期范围。 |
-| `ResolveAssetsOptions` | `catalog_yaml` / `manifest_label` / `catalog_label` / `extra` | `str` / `str` / `str` / `Mapping[str, Any]` | 省略 | 资产目录 YAML、manifest/目录标签、受控透传字段。 |
-| `AssetGitAuth` | `username` / `token` | `str` / `str` | 省略 | Git 仓库认证用户名 / 凭据。 |
-| `PreflightAssetOptions` | `branch` / `commit` / `auth_config` / `extra` | `str` / `str` / `AssetGitAuth` / `Mapping[str, Any]` | 省略 | 预检 Git 分支、提交、认证和受控透传字段。 |
-| `SearchContextEntry` | `uri` / `category` / `score` / `detail` / `text` / `origin` | `str` / `str` / `float` / `str` / `str` / `str` | 均可缺失 | 上下文条目的位置、分类、得分、细节、文本和来源。 |
-| `SearchContextResult` | `entries` / `rendered` / `digest` / `stats` | `List[SearchContextEntry]` / `str` / `str` / `Dict[str, Any]` | 均可缺失 | 条目、渲染文本、摘要、统计。 |
+| `CommitSessionOptions` | `telemetry` | `Any` | 省略 | 遥测上下文。 |
+| `CommitSessionOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段。 |
+| `ExperienceTrajectoryOptions` | `limit` | `int` | 省略 | 轨迹页大小。 |
+| `ExperienceTrajectoryOptions` | `offset` | `int` | 省略 | 轨迹分页偏移。 |
+| `ExperienceTrajectoryOptions` | `start_date` | `str` | 省略 | 轨迹日期范围起点。 |
+| `ExperienceTrajectoryOptions` | `end_date` | `str` | 省略 | 轨迹日期范围终点。 |
+| `ExperienceOutcomeOptions` | `start_date` | `str` | 省略 | outcome 日期范围起点。 |
+| `ExperienceOutcomeOptions` | `end_date` | `str` | 省略 | outcome 日期范围终点。 |
+| `ResolveAssetsOptions` | `catalog_yaml` | `str` | 省略 | 资产目录 YAML。 |
+| `ResolveAssetsOptions` | `manifest_label` | `str` | 省略 | manifest 标签。 |
+| `ResolveAssetsOptions` | `catalog_label` | `str` | 省略 | 目录标签。 |
+| `ResolveAssetsOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段。 |
+| `AssetGitAuth` | `username` | `str` | 省略 | Git 仓库认证用户名。 |
+| `AssetGitAuth` | `token` | `str` | 省略 | Git 仓库认证凭据。 |
+| `PreflightAssetOptions` | `branch` | `str` | 省略 | 预检 Git 分支。 |
+| `PreflightAssetOptions` | `commit` | `str` | 省略 | 预检 Git 提交。 |
+| `PreflightAssetOptions` | `auth_config` | `AssetGitAuth` | 省略 | Git 仓库认证配置。 |
+| `PreflightAssetOptions` | `extra` | `Mapping[str, Any]` | 省略 | 受控透传的新服务端字段。 |
+| `SearchContextEntry` | `uri` | `str` | 省略 | 上下文条目的 URI。 |
+| `SearchContextEntry` | `category` | `str` | 省略 | 上下文条目分类。 |
+| `SearchContextEntry` | `score` | `float` | 省略 | 命中得分。 |
+| `SearchContextEntry` | `detail` | `str` | 省略 | 条目细节。 |
+| `SearchContextEntry` | `text` | `str` | 省略 | 条目文本。 |
+| `SearchContextEntry` | `origin` | `str` | 省略 | 条目来源。 |
+| `SearchContextResult` | `entries` | `List[SearchContextEntry]` | 省略 | 上下文条目。 |
+| `SearchContextResult` | `rendered` | `str` | 省略 | 渲染后的上下文文本。 |
+| `SearchContextResult` | `digest` | `str` | 省略 | 上下文摘要。 |
+| `SearchContextResult` | `stats` | `Dict[str, Any]` | 省略 | 上下文统计。 |
 
 `Task` 没有 SDK TypedDict：`get_task` 的 404 是 `None`，其余任务字典是服务端原样映射。所有映射错误继承 `OpenVikingError`，稳定实例属性为 `message`、`code`、`details`；具体类型见 `openviking_sdk.errors`。
 

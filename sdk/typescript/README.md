@@ -379,7 +379,8 @@ try {
 | `FindOptions` | `filter` | `JsonObject` | 可省略 | 服务端结构化过滤条件。 |
 | `FindOptions` | `contextType` | `unknown` | 可省略 | 限制检索上下文类别。 |
 | `FindOptions` | `telemetry` | `unknown` | 可省略 | 调用观测信息。 |
-| `FindOptions` | `since` / `until` | `string` | 可省略 | 时间范围下界 / 上界。 |
+| `FindOptions` | `since` | `string` | 可省略 | 时间范围下界。 |
+| `FindOptions` | `until` | `string` | 可省略 | 时间范围上界。 |
 | `FindOptions` | `timeField` | `string` | 可省略 | 时间过滤使用的字段名。 |
 | `FindOptions` | `level` | `number[]` | 可省略 | 限制检索的资源层级。 |
 | `FindOptions` | `tags` | `string[]` | 可省略 | 必须匹配的检索 Tags。 |
@@ -389,10 +390,19 @@ try {
 | `FindOptions` | `extra` | `JsonObject` | 可省略 | 未建模检索扩展字段。 |
 | `SearchOptions` | `sessionId` | `string` | 可省略 | 为 search 提供会话上下文。 |
 | `SearchOptions` | `searchType` | `"semantic" \| "keywords"` | 可省略 | 选择语义检索或关键词检索。 |
-| `SearchContextOptions` | `searchType` / `image` / `sessionId` | 同 `SearchOptions` | 可省略 | 上下文组装的检索类型、图片和会话。 |
-| `SearchContextOptions` | `limit` / `nodeLimit` / `scoreThreshold` | `number` | 可省略 | 结果数、扫描数和最低分预算。 |
-| `SearchContextOptions` | `filter` / `contextType` / `tags` | `JsonObject` / `unknown` / `string[]` | 可省略 | 结构化、类别和标签筛选。 |
-| `SearchContextOptions` | `since` / `until` / `timeField` | `string` | 可省略 | 时间范围和时间字段。 |
+| `SearchContextOptions` | `searchType` | `"semantic" \| "keywords"` | 可省略 | 上下文组装的检索类型。 |
+| `SearchContextOptions` | `image` | `string` | 可省略 | 图文检索图片；本地路径会转 data URI。 |
+| `SearchContextOptions` | `sessionId` | `string` | 可省略 | 组装上下文时使用的会话。 |
+| `SearchContextOptions` | `limit` | `number` | 可省略 | 结果数上限。 |
+| `SearchContextOptions` | `nodeLimit` | `number` | 可省略 | 扫描节点上限。 |
+| `SearchContextOptions` | `scoreThreshold` | `number` | 可省略 | 最低命中分数。 |
+| `SearchContextOptions` | `filter` | `JsonObject` | 可省略 | 结构化过滤条件。 |
+| `SearchContextOptions` | `contextType` | `unknown` | 可省略 | 限制检索上下文类别。 |
+| `SearchContextOptions` | `includeProvenance` | `boolean` | 可省略 | 是否附带溯源信息。 |
+| `SearchContextOptions` | `tags` | `string[]` | 可省略 | 必须匹配的检索 Tags。 |
+| `SearchContextOptions` | `since` | `string` | 可省略 | 时间范围下界。 |
+| `SearchContextOptions` | `until` | `string` | 可省略 | 时间范围上界。 |
+| `SearchContextOptions` | `timeField` | `string` | 可省略 | 时间过滤使用的字段名。 |
 | `SearchContextOptions` | `eventsTimeDecayProtection` | `string \| null` | null 被省略 | 事件时效保护设置。 |
 | `SearchContextOptions` | `queryExpansion` | `"off" \| "auto"` | 可省略 | 是否自动扩展查询。 |
 | `SearchContextOptions` | `maxTokens` | `number` | 可省略 | 输出上下文 token 预算。 |
@@ -403,21 +413,40 @@ try {
 | `SearchContextOptions` | `excludeUris` | `string[]` | 可省略 | 排除的资源 URI。 |
 | `SearchContextOptions` | `peerScope` | `"actor" \| "all"` | 可省略 | peer 检索范围。 |
 | `SearchContextOptions` | `otherPeerPenalty` | `number \| Record<string,number>` | 可省略 | 非当前 peer 的分数惩罚。 |
-| `SearchContextOptions` | `rewrite` / `rewriteMaxBullets` | `boolean \| "auto"` / `number` | 可省略 | 上下文改写开关 / 改写条目上限。 |
-| `SearchContextOptions` | `telemetry` / `extra` | `unknown` / `JsonObject` | 可省略 | 观测数据 / 未建模扩展字段。 |
-| `ListOptions` | `simple` / `recursive` | `boolean` | `false` | 简化条目 / 是否递归列目录。 |
+| `SearchContextOptions` | `rewrite` | `boolean \| "auto"` | 可省略 | 上下文改写开关。 |
+| `SearchContextOptions` | `rewriteMaxBullets` | `number` | 可省略 | 改写时最多输出的条目数。 |
+| `SearchContextOptions` | `telemetry` | `unknown` | 可省略 | 调用观测信息。 |
+| `SearchContextOptions` | `extra` | `JsonObject` | 可省略 | 未建模检索扩展字段。 |
+| `ListOptions` | `simple` | `boolean` | `false` | 是否返回简化条目。 |
+| `ListOptions` | `recursive` | `boolean` | `false` | 是否递归列出子目录。 |
 | `ListOptions` | `output` | `string` | `"original"` | 条目输出形式。 |
-| `ListOptions` | `absLimit` / `overviewLimit` | `number` | `256` / `4000` | 摘要和概览长度预算。 |
-| `ListOptions` | `includeAbstract` / `includeOverview` | `boolean` | 可省略 | 是否附带摘要 / 概览。 |
+| `ListOptions` | `absLimit` | `number` | `256` | 摘要长度预算。 |
+| `ListOptions` | `overviewLimit` | `number` | `4000` | 概览长度预算。 |
+| `ListOptions` | `includeAbstract` | `boolean` | 可省略 | 是否附带摘要。 |
+| `ListOptions` | `includeOverview` | `boolean` | 可省略 | 是否附带概览。 |
 | `ListOptions` | `showAllHidden` | `boolean` | `false` | 是否返回隐藏节点。 |
-| `ListOptions` | `nodeLimit` / `offset` / `limit` | `number` | `1000` / 可省略 / 可省略 | 扫描上限、分页偏移和页大小。 |
-| `ListOptions` | `sortBy` / `sortOrder` | `"name"\|"mtime"` / `"asc"\|"desc"` | 可省略 | 排序键和方向。 |
-| `ListOptions` | `extraFields` / `tags` / `includeTags` | `("locked"\|"id"\|"count")[]` / `string[]` / `boolean` | includeTags 仅 true 发送 | 额外列、标签筛选及返回标签。 |
-| `TreeOptions` | `output` / `absLimit` / `overviewLimit` | `string` / `number` / `number` | `"original"` / `128` / `4000` | 树输出形式及文本预算。 |
-| `TreeOptions` | `includeAbstract` / `includeOverview` / `showAllHidden` | `boolean` | 可省略 / 可省略 / `false` | 是否附带摘要、概览和隐藏节点。 |
+| `ListOptions` | `nodeLimit` | `number` | `1000` | 扫描节点上限。 |
+| `ListOptions` | `offset` | `number` | 可省略 | 分页偏移。 |
+| `ListOptions` | `limit` | `number` | 可省略 | 页大小。 |
+| `ListOptions` | `sortBy` | `"name"\|"mtime"` | 可省略 | 排序键。 |
+| `ListOptions` | `sortOrder` | `"asc"\|"desc"` | 可省略 | 排序方向。 |
+| `ListOptions` | `extraFields` | `("locked"\|"id"\|"count")[]` | 可省略 | 请求额外返回的条目字段。 |
+| `ListOptions` | `tags` | `string[]` | 可省略 | 标签筛选。 |
+| `ListOptions` | `includeTags` | `boolean` | 仅 true 发送 | 是否返回条目标签。 |
+| `TreeOptions` | `output` | `string` | `"original"` | 树节点输出形式。 |
+| `TreeOptions` | `absLimit` | `number` | `128` | 摘要长度预算。 |
+| `TreeOptions` | `includeAbstract` | `boolean` | 可省略 | 是否附带摘要。 |
+| `TreeOptions` | `includeOverview` | `boolean` | 可省略 | 是否附带概览。 |
+| `TreeOptions` | `overviewLimit` | `number` | `4000` | 概览长度预算。 |
+| `TreeOptions` | `showAllHidden` | `boolean` | `false` | 是否返回隐藏节点。 |
 | `TreeOptions` | `directoriesOnly` | `boolean` | 仅 true 发送 | 是否只返回目录。 |
-| `TreeOptions` | `nodeLimit` / `levelLimit` / `offset` / `limit` | `number` | `1000` / `3` / 可省略 / 可省略 | 扫描、深度和分页预算。 |
-| `TreeOptions` | `extraFields` / `tags` / `includeTags` | 同 `ListOptions` | includeTags 仅 true 发送 | 额外列、标签筛选及返回标签。 |
+| `TreeOptions` | `nodeLimit` | `number` | `1000` | 扫描节点上限。 |
+| `TreeOptions` | `levelLimit` | `number` | `3` | 树遍历深度上限。 |
+| `TreeOptions` | `offset` | `number` | 可省略 | 分页偏移。 |
+| `TreeOptions` | `limit` | `number` | 可省略 | 页大小。 |
+| `TreeOptions` | `extraFields` | `("locked"\|"id"\|"count")[]` | 可省略 | 请求额外返回的节点字段。 |
+| `TreeOptions` | `tags` | `string[]` | 可省略 | 标签筛选。 |
+| `TreeOptions` | `includeTags` | `boolean` | 仅 true 发送 | 是否返回节点标签。 |
 
 #### Session、结果、快照、Assets 与错误字段明细
 
@@ -541,64 +570,6 @@ try {
 | `adminListAccounts` 内联 options | `name` / `limit` / `page` | `string` / `number` / `number` | 可省略；给 limit 时 page=1 | 通配账户名、页大小、页号。 |
 | `adminRegisterUser` 内联 options | `userConfig` / `seed` | `JsonObject` / `string` | 可省略 | 注册用户配置 / 可复现密钥种子。 |
 | `adminListUsers` 内联 options | `limit` / `name` / `role` / `page` | `number` / `string` / `string` / `number` | 可省略；给 limit 时 page=1 | 页大小、通配用户名、角色和页号。 |
-
-#### 共享配置、选项与 ACL
-
-| 类型 | 字段 | 类型/可选值 | 默认值与含义 |
-|---|---|---|---|
-| `ClientConfig` | `baseUrl` | `string` | 必填服务端地址；其余为可选：`apiKey`、`account`、`user`、`actorPeerId`、`timeout`、`headers`、`fetch`、`profile`、`uploadMode: "local" \| "shared"`。 |
-| `WaitOptions` | `wait`, `timeout`, `telemetry` | `boolean`、`number`、`unknown` | 无共享默认；具体方法覆盖时以方法表为准。 |
-| `AclSpec` | `acl_mode`, `entries` | `"inherit" \| "restricted"`；`{ principal, level }[]` | 每个 `level` 只能是 `read/write/manage`。 |
-| `AddResourceOptions` | `acl`, `to`, `parent`, `createParent`, `reason`, `instruction`, `strict`, `ignoreDirs`, `include`, `exclude`, `directlyUploadMedia`, `preserveStructure`, `watchInterval`, `processingMode`, `args`, `tags`, `tagMode`, `extra` | 对应同名 camelCase TypeScript 字段；`processingMode` 为 `semantic_and_vectors \| vectors_only`，`tagMode` 为 `replace \| append \| clear` | 继承 `WaitOptions`；`to/parent` 互斥，tags/tagMode 的发送规则见 `addResource`。 |
-| `WriteOptions` / `BatchWriteOptions` | `acl`, `mode`, `processingMode`, `tags`, `tagMode`, `extra` / `extra` | 写入专用字段，均可选 | 两者都继承 `WaitOptions`；`BatchWriteOperation` 为 `{ uri, content?, contentBase64?, mode?: "replace" \| "append" \| "create" \| "upsert" }`。 |
-| `ReindexOptions` / `SetTagsOptions` | `mode`, `wait`, `force`, `recursive`, `tags`, `tagMode`, `extra` / `mode`, `recursive`, `telemetry`, `extra` | 都可选 | `reindex` 的实际默认见方法表；`setTags.mode` 默认 `replace`。 |
-| `ImportPackOptions` | `onConflict`, `vectorMode` | `fail \| overwrite \| skip`；`auto \| recompute \| require` | 都可选。 |
-| `RequestOptions` | `signal` | `AbortSignal` | 可取消支持该参数的方法。 |
-| `GetSkillOptions` / `UpdateWatchOptions` | `includeContent`, `includeFiles`, `includeSource`, `level`, `targetUri` / `watchInterval`, `isActive`, `reason`, `instruction` | 都可选 | `getSkill` 的三个布尔默认值见方法表；Watch 更新只发送提供的字段。 |
-| `GrepOptions` / `GlobOptions` | `caseInsensitive`, `nodeLimit`, `levelLimit`, `excludeUri`, `tags`, `includeTags` / `nodeLimit`, `tags`, `includeTags` | 都可选 | `grep/glob` 的 `nodeLimit` 默认 `256`；`includeTags=false` 时不发送。 |
-| `ListOptions` | `simple`, `recursive`, `output`, `absLimit`, `includeAbstract`, `includeOverview`, `overviewLimit`, `showAllHidden`, `nodeLimit`, `offset`, `limit`, `sortBy`, `sortOrder`, `extraFields`, `tags`, `includeTags` | `sortBy=name\|mtime`；`sortOrder=asc\|desc`；`extraFields` 仅 `locked\|id\|count` | 默认值和只在 true 发送的字段见 `listPage`。 |
-| `TreeOptions` | `output`, `absLimit`, `includeAbstract`, `includeOverview`, `overviewLimit`, `showAllHidden`, `directoriesOnly`, `nodeLimit`, `levelLimit`, `offset`, `limit`, `extraFields`, `tags`, `includeTags` | `extraFields` 仅 `locked\|id\|count` | 默认值和只在 true 发送的字段见 `treePage`。 |
-| `CompileOptions` | `instruction?`, `args?`, `extra?` | `args: JsonObject` | 空 `args` 不发送。 |
-
-#### 分页与检索结果
-
-| 类型 | 稳定字段 | 契约 |
-|---|---|---|
-| `ListPage` | `result: unknown[]`, `hasMore: boolean` | SDK 把服务端 `result` 缺省为 `[]`，`has_more` 缺省为 `false`。列表项没有进一步字段承诺。 |
-| `TreePage` | `result: JsonObject[]`, `hasMore: boolean` | 同上；每个树节点是未建模的原样对象。 |
-| `MatchedContext` | `uri?`, `context_type?`, `level?`, `abstract?`, `score?`, `origin_score?`, `time_score?`, `tags?` | 单条检索命中；其余服务端字段允许存在但不构成 SDK 承诺。 |
-| `FindResult` | `memories?`, `resources?`, `skills?` | 每项都是 `MatchedContext[]`；其他 result 字段不保证。 |
-| `SearchContextEntry` | `uri?`, `category?`, `score?`, `detail?`, `text?`, `origin?` | 一个可注入上下文条目。 |
-| `SearchContextResult` | `entries?`, `rendered?`, `digest?`, `stats?` | `entries` 为 `SearchContextEntry[]`，`stats` 为 `JsonObject`。 |
-| `FindOptions` / `SearchOptions` | `targetUri`, `image`, `limit`, `nodeLimit`, `scoreThreshold`, `filter`, `contextType`, `telemetry`, `since`, `until`, `timeField`, `level`, `tags`, `includeProvenance`, `readContent`, `eventsTimeDecayProtection`, `extra`；另加 `sessionId`, `searchType` | 全部可选；`targetUri: string \| string[]`。`searchType` 只能是 `semantic \| keywords`；`null` 的 `eventsTimeDecayProtection` 会被 compact 删除。 |
-| `SearchContextOptions` | `searchType`, `image`, `sessionId`, `limit`, `nodeLimit`, `scoreThreshold`, `filter`, `contextType`, `includeProvenance`, `tags`, `since`, `until`, `timeField`, `eventsTimeDecayProtection`, `queryExpansion`, `maxTokens`, `quotas`, `purpose`, `detail`, `dedupTurns`, `excludeUris`, `peerScope`, `otherPeerPenalty`, `rewrite`, `rewriteMaxBullets`, `telemetry`, `extra` | 全部可选；`queryExpansion=off\|auto`，`purpose=chat\|coding`，`peerScope=actor\|all`；nullable time-decay 字段的 `null` 不发送。 |
-
-#### Session、消息与任务
-
-| 类型 | 字段 | 契约 |
-|---|---|---|
-| `Message` | `role` | 必填 `string`。 |
-|  | `content?`, `parts?` | 二者至少一个有效；非空 `parts: JsonObject[]` 时优先并抑制 `content`。 |
-|  | `createdAt?`, `peerId?`, `turnId?`, `messageKind?`, `sourceMessageIds?`, `telemetry?` | `messageKind` 仅 `user_query \| assistant_step \| tool_transport \| checkpoint`。 |
-| `CreateSessionOptions` | `sessionId?`, `memoryPolicy?`, `autoCommitPolicy?`, `memoryExtractionConfig?`, `telemetry?`, `extra?` | `autoCommitPolicy` 的“属性存在即发送（含 null）”语义见方法表。 |
-| `UpdateSessionConfigOptions` | `memoryExtractionConfig?`, `autoCommitPolicy?`, `telemetry?`, `extra?` | 同样保留 `autoCommitPolicy` 的存在性语义。 |
-| `MemoryExtractionConfig` | `events?.tags?` | 事件记忆提取 tags。 |
-| `CommitSessionOptions` | `enableWorkingMemory?`, `keepRecentCount?`, `retentionMode?`, `keepRecentTurnCount?`, `retainedMessageTokenBudget?`, `minRawTailSteps?`, `eventTags?`, `telemetry?`, `extra?` | `retentionMode` 仅 `turn_budget`；`enableWorkingMemory` 允许 `boolean \| null`，但 `null` 在 wire 上会被删除并继承策略。 |
-| `TaskListOptions` | `taskType?`, `status?`, `resourceId?`, `limit?` | 任务列表过滤 query；单个任务由 `getTask` 返回 `JsonObject \| null`，无稳定任务字段。 |
-| `BatchAddMessagesOptions` | `telemetry?`, `extra?` | call-level 选项；批量消息对象不会逐项发送 `Message.telemetry`。 |
-| `ExperienceTrajectoryOptions` / `ExperienceOutcomeOptions` | `limit`, `offset`, `startDate`, `endDate` / `startDate`, `endDate` | 都可选日期/分页 query。 |
-
-#### 快照、Assets、响应与错误
-
-| 类型 | 字段 | 契约 |
-|---|---|---|
-| `GitCommitOptions` | `message`, `paths?`, `branch?`, `authorName?`, `authorEmail?` | `message` 必填。 |
-| `GitRestoreOptions` | `sourceCommit`, `projectDir?`, `branch?`, `dryRun?`, `message?`, `authorName?`, `authorEmail?` | `sourceCommit` 必填。 |
-| `GitBlob` | `oid: string`, `size: number`, `bytes: Uint8Array` | 仅 `gitShow` 命中 octet-stream 分支时返回。 |
-| `ResolveAssetsOptions` | `catalogYaml?`, `manifestLabel?`, `catalogLabel?`, `extra?` | Assets manifest 解析选项。 |
-| `PreflightAssetOptions` | `branch?`, `commit?`, `authConfig?`, `extra?` | `authConfig` 为 `{ username?, token? }`；只用于本次 Git 预检请求。 |
-| `ResponseEnvelope<T>` | `status?`, `result?`, `has_more?`, `error?`, `telemetry?`, `profile?`, `detail?` | transport 内部响应信封；业务方法通常已解包 `result`。`APIErrorInfo` 仅建模 `code?/message?/details?`。 |
-| `OpenVikingError` | `name`, `message`, `code`, `details`, `statusCode` | SDK 抛出的错误：`name="OpenVikingError"`，`code` 默认 `"UNKNOWN"`，`details` 默认 `{}`，`statusCode` 可为 `undefined`。使用 `isOpenVikingError(error, code?)` 缩窄类型。 |
 
 ## 兼容性、升级与测试
 
