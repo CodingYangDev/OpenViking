@@ -107,7 +107,7 @@ test("every shared module is reachable from some plugin", async () => {
   );
 });
 
-test("vendored skills are byte-identical to examples/skills", async () => {
+test("vendored skills are byte-identical to examples/memory-plugin-shared/skills", async () => {
   for (const { skill, dir } of SKILL_TARGETS) {
     const files = (await readdir(join(SKILLS_DIR, skill))).sort();
     assert.ok(files.includes("SKILL.md"), `${skill} must ship a SKILL.md`);
@@ -135,7 +135,7 @@ test("synced skills keep a flat file layout", async () => {
     assert.deepEqual(
       entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name),
       [],
-      `examples/skills/${skill} must not contain subdirectories`,
+      `examples/memory-plugin-shared/skills/${skill} must not contain subdirectories`,
     );
   }
 });

@@ -281,7 +281,7 @@ proxy 入口不得拥有自己的工具 schema、副本 API client、SSE parser 
 
 `viking://` 是虚拟 URI。本地文件工具的路径参数是 `viking://` URI 时必然失败，所以宿主支持工具执行前检查时，用 `evaluateUriGuard()` 拒绝这次调用。shell 命令里的 `viking://` URI 可能只是数据（`ov` 命令参数、HTTP 请求体、搜索模式），所以命令照常执行，再通过宿主的模型可见上下文通道附上 `evaluateUriNotice()` 生成的提示；`PreToolUse` 类宿主直接用 `preToolUseOutput()`，它返回拒绝或提示 envelope。适配器中只定义替代工具提示和 envelope。检查器不能扩展成一般命令拦截器；普通文件路径应保持原有行为。宿主不支持该事件时，明确限制并通过 Skill 指引模型使用 MCP，不得宣称具备等效拦截。
 
-共享 Skill 的源文件放在 [`examples/skills/`](https://github.com/volcengine/OpenViking/tree/main/examples/skills/)，通过 `SKILL_TARGETS` 交付，禁止在多个插件副本里分别修改同一段指导。Skill 只描述真实可调用工具和实际能力；自动 hook 已处理的捕获、提交不应再要求模型每轮手动重复执行。不同工具集确有不同操作语义时，可以保留独立 Skill，并说明理由。生成 Skill 时不能在 YAML frontmatter 前插入生成标记。
+共享 Skill 的源文件放在 [`examples/memory-plugin-shared/skills/`](https://github.com/volcengine/OpenViking/tree/main/examples/memory-plugin-shared/skills/)，通过 `SKILL_TARGETS` 交付，禁止在多个插件副本里分别修改同一段指导。Skill 只描述真实可调用工具和实际能力；自动 hook 已处理的捕获、提交不应再要求模型每轮手动重复执行。不同工具集确有不同操作语义时，可以保留独立 Skill，并说明理由。生成 Skill 时不能在 YAML frontmatter 前插入生成标记。
 
 存放在 OpenViking 里的 skill 只通过服务端的 `add_skill` MCP 工具新建、安装、共享和替换，它和 REST `POST /api/v1/skills` 共用同一套安装代码。宿主不得自己实现安装：适配器不能把 `SKILL.md` 写进 skills 子树，也不能自行解包或上传 skill 目录。服务端的 `write`、`edit` 拒绝写用户根下的 skills 子树；本地 write/edit 指向 skill URI 而被拒绝时，URI guard 通过 `isSkillUri()` 把模型引导到 `add_skill`。`openviking-skills` 这个 Skill 负责教模型走这套流程，所以 `SKILL_TARGETS` 只把它交付给自带 Skill、且 `add_skill` 确实可用的 MCP 宿主。
 

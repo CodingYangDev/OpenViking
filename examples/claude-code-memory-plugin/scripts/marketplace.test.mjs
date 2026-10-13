@@ -11,7 +11,7 @@ const repoRoot = resolve(scriptsDir, "..", "..", "..");
 const rootCatalogPath = join(repoRoot, ".claude-plugin", "marketplace.json");
 const localCatalogPath = join(repoRoot, "examples", ".claude-plugin", "marketplace.json");
 const manifestPath = join(pluginDir, ".claude-plugin", "plugin.json");
-const canonicalExperienceSkillPath = join(repoRoot, "examples", "skills", "ov-experience-memory", "SKILL.md");
+const canonicalExperienceSkillPath = join(repoRoot, "examples", "memory-plugin-shared", "skills", "ov-experience-memory", "SKILL.md");
 const packagedExperienceSkillPath = join(pluginDir, "skills", "ov-experience-memory", "SKILL.md");
 
 const PLUGIN_NAME = "openviking-memory";
@@ -51,7 +51,7 @@ test("marketplace package ships the canonical Experience skill", () => {
   assert.equal(
     readFileSync(packagedExperienceSkillPath, "utf-8"),
     readFileSync(canonicalExperienceSkillPath, "utf-8"),
-    "packaged Experience skill must stay byte-identical to examples/skills/ov-experience-memory",
+    "packaged Experience skill must stay byte-identical to examples/memory-plugin-shared/skills/ov-experience-memory",
   );
 });
 
@@ -60,8 +60,8 @@ test("marketplace package ships the canonical OpenViking skills skill", () => {
   assert.ok(existsSync(packaged), "Claude plugin must package the openviking-skills skill");
   assert.equal(
     readFileSync(packaged, "utf-8"),
-    readFileSync(join(repoRoot, "examples", "skills", "openviking-skills", "SKILL.md"), "utf-8"),
-    "packaged skill must stay byte-identical to examples/skills/openviking-skills",
+    readFileSync(join(repoRoot, "examples", "memory-plugin-shared", "skills", "openviking-skills", "SKILL.md"), "utf-8"),
+    "packaged skill must stay byte-identical to examples/memory-plugin-shared/skills/openviking-skills",
   );
 });
 

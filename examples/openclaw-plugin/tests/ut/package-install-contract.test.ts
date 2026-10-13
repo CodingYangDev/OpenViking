@@ -117,7 +117,7 @@ describe("OpenClaw plugin package and install contract", () => {
     const pluginManifest = readJson("openclaw.plugin.json");
     const installManifest = readJson("install-manifest.json");
     const packagedSkillPath = join(rootDir, "skills/ov-experience-memory/SKILL.md");
-    const canonicalSkillPath = join(repoRoot, "examples/skills/ov-experience-memory/SKILL.md");
+    const canonicalSkillPath = join(repoRoot, "examples/memory-plugin-shared/skills/ov-experience-memory/SKILL.md");
 
     expect(pluginManifest.skills).toContain("./skills/ov-experience-memory");
     expect(installManifest.files.optional).toContain("skills/ov-experience-memory/SKILL.md");

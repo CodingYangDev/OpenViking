@@ -44,7 +44,7 @@ const REFERENCES = [
 
 test("every surface that teaches the peer file quotes the same snippet", () => {
   const carriers = [
-    "examples/skills/openviking-memory/SKILL.md",
+    "examples/memory-plugin-shared/skills/openviking-memory/SKILL.md",
     ...REFERENCES,
     "docs/en/configuration/02-client.md",
     "docs/zh/configuration/02-client.md",
@@ -61,7 +61,7 @@ test("no document still promises the working directory, or a command that does n
   const files = [
     ...walk(join(ROOT, "docs"), (p) => p.endsWith(".md")),
     ...walk(join(ROOT, "examples"), (p) => /README(_CN)?\.md$/.test(p)),
-    ...walk(join(ROOT, "examples", "skills"), (p) => p.endsWith(".md")),
+    ...walk(join(ROOT, "examples", "memory-plugin-shared", "skills"), (p) => p.endsWith(".md")),
     ...REFERENCES.map((rel) => join(ROOT, rel)),
     join(ROOT, "examples/schemas/workspace-config-v1.json"),
     join(ROOT, "examples/workspace-config.example.json"),

@@ -78,9 +78,9 @@ export const GENERATED_HEADER = "// GENERATED FROM examples/memory-plugin-shared
 // kinds of generated file. `committed` is true for every skill copy: .gitignore
 // covers the vendored shared/ directories only, and each host installs a skill
 // by copying its path out of this repository, so a copy git does not hold ships
-// nothing. Being a skill under examples/skills is not what ships it — an entry
+// nothing. Being a skill under examples/memory-plugin-shared/skills is not what ships it — an entry
 // here is.
-export const SKILLS_DIR = join(ROOT, "examples", "skills");
+export const SKILLS_DIR = join(ROOT, "examples", "memory-plugin-shared", "skills");
 export const SKILL_TARGETS = [
   // openviking-memory is not shipped to openclaw-plugin: its REST tool surface
   // has its own operator skill (openviking-context-database) with different

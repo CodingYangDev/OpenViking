@@ -15,7 +15,7 @@ on:
     paths:
       - "examples/memory-plugin-shared/lib/**"
       - "examples/memory-plugin-shared/sync.mjs"
-      - "examples/skills/**"
+      - "examples/memory-plugin-shared/skills/**"
       - "examples/claude-code-memory-plugin/**"
       - "examples/codex-memory-plugin/**"
       - "examples/openclaw-plugin/**"
