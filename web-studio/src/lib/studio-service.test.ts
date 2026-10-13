@@ -5,10 +5,39 @@ import {
   featureForPath,
   identifyServiceProvider,
   isStudioFeatureVisible,
+  resolveConfiguredServiceProvider,
 } from './studio-service'
+import { resolveApiKeyAuth } from './studio-auth'
 import { resolveStudioManagementCapabilities } from './studio-permissions'
 
 describe('service and permission boundaries', () => {
+  it.each([
+    'http://10.37.244.186:8020',
+    'http://172.16.0.1:1933',
+    'http://172.31.255.255:1933',
+    'http://192.168.1.20:1933',
+    'http://127.0.0.2:1933',
+    'http://[::1]:1933',
+    'http://203.0.113.1:1933',
+    'https://custom.company.example/openviking',
+    'https://api.vikingdb.cn-beijing.volces.com.evil.example/openviking',
+  ])(
+    'defaults non-hosted deployment %s to open source with header authentication',
+    (url) => {
+      expect(resolveConfiguredServiceProvider(url)).toBe('opensource')
+      expect(resolveApiKeyAuth(url)).toBe('header')
+      expect(resolveConfiguredServiceProvider(url, 'volcengine')).toBe(
+        'volcengine',
+      )
+      expect(resolveApiKeyAuth(url, 'volcengine')).toBe('bearer')
+    },
+  )
+  it.each(['not a URL', '', 'file:///tmp/openviking'])(
+    'keeps ambiguous deployment %s unconfirmed',
+    (url) => {
+      expect(identifyServiceProvider(url)).toBe('unknown')
+    },
+  )
   it('recognizes the official hosted URL without discarding its path', () => {
     expect(
       identifyServiceProvider(
@@ -19,10 +48,10 @@ describe('service and permission boundaries', () => {
       identifyServiceProvider(
         'https://api.vikingdb.cn-beijing.volces.com.evil.example/openviking',
       ),
-    ).toBe('unknown')
+    ).toBe('opensource')
     expect(
       identifyServiceProvider('https://custom.company.example/openviking'),
-    ).toBe('unknown')
+    ).toBe('opensource')
     expect(identifyServiceProvider('http://localhost:1933')).toBe('opensource')
   })
   it.each(['volcengine', 'unknown'] as const)(
@@ -57,7 +86,7 @@ describe('service and permission boundaries', () => {
   })
   it('guards nested deep links with the same domain as navigation', () => {
     expect(featureForPath('/users/memory-templates')?.domain).toBe('management')
-    expect(featureForPath('/filesystem')?.domain).toBe('extensions')
+    expect(featureForPath('/filesystem')?.domain).toBe('workspace')
     expect(featureForPath('/directory')?.domain).toBe('workspace')
   })
 })
@@ -79,7 +108,7 @@ describe('hosted feature visibility', () => {
     expect(
       isStudioFeatureVisible(
         'volcengine',
-        featureForPath('/filesystem')!,
+        featureForPath('/compile')!,
         'supported',
       ),
     ).toBe(false)

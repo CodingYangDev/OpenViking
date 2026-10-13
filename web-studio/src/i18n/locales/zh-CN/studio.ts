@@ -33,7 +33,7 @@ const studio = {
   serviceType: '服务类型',
   auto: '自动检测',
   serviceHint:
-    '验证 API Key 后，自动识别火山官方地址和本地服务。自定义域名或代理地址请指定服务类型；版本号本身不能确定服务类型。',
+    '自动检测优先识别火山官方域名，其余地址默认开源服务。火山代理地址请选择火山托管；连接验证成功后展示对应功能。',
   cloudManagement:
     '火山管理功能需要连接独立管理服务。数据 API Key 不会自动开放管理权限。',
   connectionSettings: '连接设置',

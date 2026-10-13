@@ -29,7 +29,6 @@ import {
   SheetTitle,
 } from '#/components/ui/sheet'
 import { useAppConnection } from '#/hooks/use-app-connection'
-import { useStudioService } from '#/hooks/use-studio-service'
 import { getOvResult, isOvClientError, ovClient } from '#/lib/ov-client'
 
 import {
@@ -184,7 +183,6 @@ async function fetchSkillDetail(skill: SkillItem): Promise<SkillDetail> {
 
 function SkillsRoute() {
   const { t } = useTranslation('skillsPage')
-  const { provider } = useStudioService()
   const { identityScopeKey } = useAppConnection()
   const [selectedSkill, setSelectedSkill] = React.useState<SkillItem | null>(
     null,
@@ -387,7 +385,7 @@ function SkillsRoute() {
               <SheetDescription className="min-w-0 flex-1 truncate font-mono text-xs">
                 {selectedSkill?.uri}
               </SheetDescription>
-              {selectedSkill && provider === 'opensource' ? (
+              {selectedSkill ? (
                 <Button
                   render={
                     <Link

@@ -41,6 +41,9 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }))
 
+vi.mock('#/hooks/use-studio-service', () => ({
+  useStudioService: () => ({ provider: 'opensource', ready: true }),
+}))
 vi.mock('#/hooks/use-app-connection', () => ({
   useAppConnection: () => ({ identityScopeKey: 'test' }),
 }))

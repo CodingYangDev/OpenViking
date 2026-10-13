@@ -1,3 +1,4 @@
+import { useStudioService } from '#/hooks/use-studio-service'
 import { Navigate, createFileRoute } from '@tanstack/react-router'
 
 export const Route = createFileRoute('/')({
@@ -5,5 +6,11 @@ export const Route = createFileRoute('/')({
 })
 
 function IndexRoute() {
-  return <Navigate replace to="/directory" />
+  const { provider } = useStudioService()
+  return (
+    <Navigate
+      replace
+      to={provider === 'opensource' ? '/home' : '/filesystem'}
+    />
+  )
 }

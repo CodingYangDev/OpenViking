@@ -11,13 +11,13 @@ export type CapabilityState =
 // Version numbers and encoded key contents are not provider identifiers.
 export function identifyServiceProvider(baseUrl: string): ServiceProvider {
   try {
-    const { hostname } = new URL(baseUrl)
+    const { hostname, protocol } = new URL(baseUrl)
+    if (!['http:', 'https:'].includes(protocol)) return 'unknown'
     if (/^api\.vikingdb\.[a-z0-9-]+\.volces\.com$/.test(hostname)) {
       return 'volcengine'
     }
-    if (['localhost', '127.0.0.1', '[::1]'].includes(hostname)) {
-      return 'opensource'
-    }
+    // All other HTTP deployments default to open source; hosted proxies can override this.
+    return 'opensource'
   } catch {
     // An unfinished URL is not a deployment classification.
   }
@@ -38,6 +38,7 @@ export function resolveConfiguredServiceProvider(
 }
 
 export const STUDIO_FEATURES = [
+  { id: 'filesystem', domain: 'workspace', to: '/filesystem' },
   { id: 'directory', domain: 'workspace', to: '/directory' },
   { id: 'memories', domain: 'workspace', to: '/memories' },
   { id: 'retrieval', domain: 'workspace', to: '/retrieval' },
@@ -47,7 +48,7 @@ export const STUDIO_FEATURES = [
   // These pages need additional endpoints or mutations that have not been
   // adapted for hosted deployments. One healthy endpoint cannot enable them.
   { id: 'home', domain: 'extensions', to: '/home' },
-  { id: 'filesystem', domain: 'extensions', to: '/filesystem' },
+
   { id: 'vikingbot', domain: 'extensions', to: '/vikingbot' },
   { id: 'compile', domain: 'extensions', to: '/compile' },
   { id: 'agentExperience', domain: 'extensions', to: '/agent-experience' },

@@ -1,4 +1,5 @@
-import { createFileRoute } from '@tanstack/react-router'
-import { DirectoryPage } from './-directory-page'
+import { Navigate, createFileRoute } from '@tanstack/react-router'
 
-export const Route = createFileRoute('/directory')({ component: DirectoryPage })
+export const Route = createFileRoute('/directory')({
+  component: () => <Navigate replace to="/filesystem" />,
+})

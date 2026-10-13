@@ -1,10 +1,8 @@
 import { useCallback, useEffect } from 'react'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { ArrowLeftIcon, CompassIcon } from 'lucide-react'
+import { CompassIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
-import { Button } from '#/components/ui/button'
-import { cn } from '#/lib/utils'
 import { useStudioService } from '#/hooks/use-studio-service'
 import { useAppConnection } from '#/hooks/use-app-connection'
 import { useCreateSession } from '#/lib/sessions/use-sessions'
@@ -53,28 +51,9 @@ function SessionsPage() {
   }, [handleNewSession, provider])
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+    <div className="-mx-4 -my-6 flex h-[calc(100svh-3rem)] min-w-0 overflow-hidden md:-mx-6">
       <ThreadList activeSessionId={activeSessionId} />
-      <section
-        className={cn(
-          'min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background',
-          activeSessionId ? 'flex' : 'hidden md:flex',
-        )}
-      >
-        {activeSessionId ? (
-          <div className="shrink-0 border-b px-3 py-2 md:hidden">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() =>
-                void navigate({ to: '/sessions', search: { s: undefined } })
-              }
-            >
-              <ArrowLeftIcon />
-              {t('threadList.title')}
-            </Button>
-          </div>
-        ) : null}
+      <section className="min-w-0 flex-1 bg-background">
         {activeSessionId ? (
           <Thread sessionId={activeSessionId} />
         ) : (

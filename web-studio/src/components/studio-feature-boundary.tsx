@@ -82,7 +82,7 @@ export function StudioFeatureBoundary({ children }: { children: ReactNode }) {
         <Button
           nativeButton={false}
           variant="outline"
-          render={<Link to="/directory" />}
+          render={<Link to="/filesystem" />}
         >
           {t('directory')}
         </Button>

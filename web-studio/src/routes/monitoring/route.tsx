@@ -19,13 +19,7 @@ import { useTranslation } from 'react-i18next'
 import { Alert, AlertDescription, AlertTitle } from '#/components/ui/alert'
 import { Badge } from '#/components/ui/badge'
 import { Button } from '#/components/ui/button'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '#/components/ui/select'
+
 import { Card, CardContent, CardHeader, CardTitle } from '#/components/ui/card'
 import { useAppConnection } from '#/hooks/use-app-connection'
 import { getHealth, getObserverSystem, getOvResult } from '#/lib/ov-client'
@@ -284,27 +278,10 @@ function MonitoringRoute() {
             </CardContent>
           </Card>
 
-          <div className="sm:hidden">
-            <Select
-              value={activeType}
-              onValueChange={(value) => setActiveType(value as MonitorType)}
-            >
-              <SelectTrigger className="w-full" aria-label={t('tabs.label')}>
-                <SelectValue>{t(`tabs.${activeType}`)}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {MONITOR_TYPES.map(([name]) => (
-                  <SelectItem key={name} value={name}>
-                    {t(`tabs.${name}`)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
           <div
             role="tablist"
             aria-label={t('tabs.label')}
-            className="hidden max-w-full gap-1 overflow-x-auto sm:flex rounded-xl border bg-muted/20 p-1"
+            className="flex max-w-full gap-1 overflow-x-auto rounded-xl border bg-muted/20 p-1"
           >
             {MONITOR_TYPES.map(([name, Icon]) => (
               <button

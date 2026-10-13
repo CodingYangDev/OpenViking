@@ -13,6 +13,8 @@ import {
 import { toast } from 'sonner'
 
 import { Button } from '#/components/ui/button'
+import { useStudioService } from '#/hooks/use-studio-service'
+import { HostedFilesystem } from './-components/hosted-filesystem'
 import { useAppConnection } from '#/hooks/use-app-connection'
 import {
   Dialog,
@@ -95,6 +97,9 @@ export const Route = createFileRoute('/filesystem')({
 })
 
 function FilesystemRoute() {
+  const { provider } = useStudioService()
+  const search = Route.useSearch()
+  if (provider === 'volcengine') return <HostedFilesystem search={search} />
   return (
     <ResourceUploadProvider>
       <FilesystemWorkbench />
@@ -550,7 +555,7 @@ function FilesystemWorkbench() {
   }, [])
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col bg-background">
+    <div className="-mx-4 -my-6 flex h-[calc(100svh-3rem)] min-h-0 flex-col bg-background md:-mx-6">
       <div
         ref={layoutRef}
         className="flex min-h-0 flex-1 flex-col bg-background lg:flex-row"

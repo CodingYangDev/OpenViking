@@ -41,7 +41,7 @@ const studio = {
   serviceType: 'Service type',
   auto: 'Detect automatically',
   serviceHint:
-    'After verifying your key, official Volcengine endpoints and local services are identified automatically. For a custom domain or proxy, select its service type. Versions alone do not identify providers.',
+    'Automatic detection uses Volcengine for official endpoints and open source for other addresses. For a hosted proxy, select Volcengine hosted. Features appear after connection verification.',
   cloudManagement:
     'Hosted management requires a separate management service. A data key does not enable management.',
   connectionSettings: 'Connection settings',

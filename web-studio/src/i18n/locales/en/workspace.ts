@@ -56,7 +56,7 @@ const workspace = {
         title: 'Agent Experience',
       },
       tasks: {
-        title: 'Processing tasks',
+        title: 'Task Center',
       },
       watches: {
         title: 'Scheduled Sync',
@@ -429,7 +429,7 @@ const workspace = {
         'No new task created: this session has no pending messages',
       commitSkipped: 'No new task created: this session commit was skipped',
     },
-    title: 'Processing tasks',
+    title: 'Task Center',
     description:
       'Track background work such as resource processing, session commits, and reindexing.',
     refresh: 'Refresh',

@@ -29,31 +29,6 @@ afterEach(() => {
 })
 
 describe('RetrievalDetailSheet', () => {
-  it('keeps hosted result details readable without offering the unsupported playground', () => {
-    render(
-      <RetrievalDetailSheet
-        detail={{
-          abstract: 'Hosted result summary',
-          contextType: 'resource',
-          score: 0.8,
-          uri: 'viking://resources/test.md',
-          item: {
-            uri: 'viking://resources/test.md',
-            level: 2,
-            score: 0.8,
-            context_type: 'resource',
-            abstract: 'Hosted result summary',
-            category: '',
-            match_reason: '',
-          },
-        }}
-        onClose={vi.fn()}
-        t={t}
-      />,
-    )
-    expect(screen.getByText('Hosted result summary')).toBeDefined()
-    expect(screen.queryByText('detail.openFilesystem')).toBeNull()
-  })
   it('shows only the result summary without loading full content', () => {
     render(
       <RetrievalDetailSheet

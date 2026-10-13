@@ -19,8 +19,20 @@ vi.mock('./use-app-connection', () => ({
 afterEach(() => {
   cleanup()
   state.selection = 'auto'
+  state.url = 'https://api.vikingdb.cn-beijing.volces.com/openviking'
   state.mode = 'api_key'
   state.health = null
+})
+it('recognizes an authenticated private deployment without enabling it while offline', () => {
+  state.url = 'http://10.37.244.186:8020'
+  const view = renderHook(useStudioService)
+  expect(view.result.current.provider).toBe('unknown')
+  state.health = { auth_mode: 'api_key', version: '0.5.1.dev32' }
+  view.rerender()
+  expect(view.result.current.provider).toBe('opensource')
+  state.mode = 'offline'
+  view.rerender()
+  expect(view.result.current.provider).toBe('unknown')
 })
 it('identifies a hosted deployment from the connection owner health result', () => {
   const view = renderHook(useStudioService)
