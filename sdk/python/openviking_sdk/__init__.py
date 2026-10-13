@@ -3,6 +3,7 @@
 
 from .actor_peer import get_actor_peer_id, use_actor_peer
 from .client import AsyncHTTPClient, SyncHTTPClient
+from .arranger import AsyncContextArranger, ContextArranger
 from .errors import (
     AbortedError,
     ConflictError,
@@ -41,6 +42,7 @@ __all__ = [
     "AddMessageOptions",
     "AddResourceOptions",
     "AddSkillOptions",
+    "AsyncContextArranger",
     "AsyncHTTPClient",
     "BatchAddMessagesOptions",
     "BatchWriteOptions",
@@ -48,6 +50,7 @@ __all__ = [
     "CompileOptions",
     "ConflictError",
     "ContextPart",
+    "ContextArranger",
     "CreateSessionOptions",
     "ExperienceOutcomeOptions",
     "ExperienceTrajectoryOptions",
