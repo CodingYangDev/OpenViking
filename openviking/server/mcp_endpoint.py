@@ -62,7 +62,6 @@ from openviking.server.auth import (
     _extract_api_key,
     get_api_key_manager_or_raise,
     normalize_actor_peer_header,
-    registry_watcher_running,
     resolve_identity,
     should_expose_user_key,
 )
@@ -200,7 +199,7 @@ class _IdentityASGIMiddleware:
             actor_peer_id = normalize_actor_peer_header(
                 request.headers.get("x-openviking-actor-peer")
             )
-            ctx = _build_request_context(
+            ctx = await _build_request_context(
                 request,
                 identity,
                 actor_peer_id=actor_peer_id,
@@ -373,9 +372,7 @@ async def list_users(
     if include_credentials and not should_expose_user_key(request):
         raise PermissionDeniedError("Credential disclosure is disabled in trusted auth mode")
     manager = get_api_key_manager_or_raise(request)
-    if not registry_watcher_running(request):
-        await manager.refresh_account_users_from_store(ctx.account_id)
-    result = manager.get_users_page(
+    result = await manager.list_users_page(
         ctx.account_id,
         limit=limit,
         page=page,
@@ -397,10 +394,8 @@ async def list_groups(context: Context) -> dict[str, Any]:
     """
     ctx = _get_ctx()
     manager = get_api_key_manager_or_raise(context.request_context.request)
-    await manager.ensure_account_groups_loaded(ctx.account_id)
-    return {
-        "groups": [{"group_id": group["group_id"]} for group in manager.get_groups(ctx.account_id)]
-    }
+    groups = await manager.get_groups(ctx.account_id)
+    return {"groups": [{"group_id": group["group_id"]} for group in groups]}
 
 
 @_mcp_error_results()
@@ -648,6 +643,7 @@ async def search(
         limit=limit,
         score_threshold=0.35 if min_score is None else min_score,
         filter=context_filter,
+        context_types=[ContextType(value) for value in resolve_context_types(context_type)],
         level=level,
         events_time_decay_protection=events_time_decay_protection,
     )
@@ -1164,7 +1160,7 @@ class StoreMessage(BaseModel):
 @_mcp_error_results()
 @mcp.tool(annotations=_DESTRUCTIVE_TOOL_ANNOTATIONS)
 async def remember(messages: list[StoreMessage]) -> str:
-    """Store information into OpenViking long-term memory. Use when the user says 'remember this', shares preferences, important facts, or decisions worth persisting."""
+    """Submit information for OpenViking long-term memory extraction. Use when the user says 'remember this', shares preferences, important facts, or decisions worth persisting. Extraction runs in the background and decides which memories to create or update."""
     import uuid
 
     from openviking.message.part import TextPart
@@ -1173,6 +1169,7 @@ async def remember(messages: list[StoreMessage]) -> str:
     ctx = _get_ctx()
     session_id = f"mcp-store-{uuid.uuid4().hex[:12]}"
     session = await service.sessions.get(session_id, ctx, auto_create=True)
+    added = 0
     for msg in messages:
         if msg.content:
             add_async = getattr(session, "add_message_async", None)
@@ -1180,8 +1177,17 @@ async def remember(messages: list[StoreMessage]) -> str:
                 await add_async(msg.role, [TextPart(text=msg.content)])
             else:
                 session.add_message(msg.role, [TextPart(text=msg.content)])
-    await service.sessions.commit_async(session_id, ctx)
-    return f"Stored {len(messages)} message(s) and committed for memory extraction."
+            added += 1
+    result = await service.sessions.commit_async(session_id, ctx)
+    task_id = result.get("task_id")
+    if not task_id:
+        reason = result.get("reason") or result.get("status") or "unknown"
+        return f"Nothing was committed for memory extraction (reason: {reason})."
+    return (
+        f"Submitted {added} message(s) for memory extraction (session {session_id}, "
+        f"task_id={task_id}). Extraction runs in the background and decides which memories "
+        "to create or update."
+    )
 
 
 # -- write -----------------------------------------------------------------
@@ -1197,7 +1203,7 @@ async def write(
     timeout: Optional[float] = None,
     acl: Optional[AclSpec] = None,
 ) -> str:
-    """Write text to a viking:// file. Use this to save files (notes, profiles, knowledge, state) in OpenViking the same way you would use a working directory. To change part of an existing file, prefer the edit tool over a full rewrite.
+    """Write text to a viking:// file. Use this for files you author yourself (notes, profiles, state), the same way you would use a working directory. To change part of an existing file, prefer the edit tool over a full rewrite. To store a file, document, URL, or repo the user gives you, use add_resource; for a skill, use add_skill. Do not copy its text into a file here instead.
 
     - mode="replace" (default): overwrite the file; creates it and any missing parent directories if needed.
     - mode="create": fail if the file already exists.
@@ -1425,7 +1431,8 @@ async def add_resource(
     """Add a resource to OpenViking. Asynchronous — processing happens in the background.
 
     For an agent skill, use add_skill instead: a skill added here is stored as an ordinary
-    resource and never becomes an installed skill.
+    resource and never becomes an installed skill. Copying a source's text into a file with
+    write instead skips parsing and stores a plain file.
 
     Where it goes: ``viking://resources/`` is shared with the whole account and is the
     default when ``to`` and ``parent`` are empty (unless a default add target is

@@ -239,17 +239,13 @@ export function resolveInitialApiKey({
 }
 
 export function resolveConnectionRoleProbeState({
-  accountId = '',
   apiKey,
   baseUrl,
   serverMode,
-  userId = '',
 }: {
-  accountId?: string
   apiKey: string
   baseUrl: string
   serverMode: ServerMode
-  userId?: string
 }): {
   isLoading: boolean
   role: ConnectionRole
@@ -264,9 +260,7 @@ export function resolveConnectionRoleProbeState({
   if (serverMode === 'dev') {
     return { isLoading: false, role: 'root', shouldProbe: false }
   }
-  const hasTrustedIdentity =
-    serverMode === 'trusted' && Boolean(accountId.trim() && userId.trim())
-  if (!apiKey && !hasTrustedIdentity) {
+  if (!apiKey) {
     return { isLoading: false, role: 'unknown', shouldProbe: false }
   }
   return { isLoading: true, role: 'unknown', shouldProbe: true }
@@ -340,10 +334,9 @@ export function createConnectionHealthHeaders(
       : credential === 'data'
         ? connection.apiKey || connection.adminApiKey
         : connection.adminApiKey || connection.apiKey
-  if (apiKey) {
-    headers[auth === 'bearer' ? 'Authorization' : 'X-API-Key'] =
-      auth === 'bearer' ? `Bearer ${apiKey}` : apiKey
-  }
+  if (!apiKey) return headers
+  headers[auth === 'bearer' ? 'Authorization' : 'X-API-Key'] =
+    auth === 'bearer' ? `Bearer ${apiKey}` : apiKey
   const isHosted = auth === 'bearer'
   if (!isHosted && connection.accountId) {
     headers['X-OpenViking-Account'] = connection.accountId
@@ -650,11 +643,9 @@ export function AppConnectionProvider({
     const isCancelled = () => cancelled
     const apiKey = connection.adminApiKey || connection.apiKey
     const roleProbe = resolveConnectionRoleProbeState({
-      accountId: connection.accountId,
       apiKey,
       baseUrl: connection.baseUrl,
       serverMode,
-      userId: connection.userId,
     })
     const probeKey = createConnectionRoleProbeKey(connection, serverMode)
     const synchronizedProbe = synchronizedRoleProbeRef.current
@@ -809,11 +800,11 @@ export function AppConnectionProvider({
         if (pathname === '/directory' || pathname === '/memories') {
           await navigate({ replace: true, to: pathname })
         }
-        if (pathname === '/playground') {
+        if (pathname === '/filesystem') {
           await navigate({
             replace: true,
             search: { upload: false },
-            to: '/playground',
+            to: '/filesystem',
           })
         }
         commitConnection({

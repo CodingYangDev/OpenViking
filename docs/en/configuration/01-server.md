@@ -1,4 +1,4 @@
-# Server Configuration
+# Server configuration fields
 
 For initial setup, run `openviking-server init`, then run `openviking-server doctor` after saving the configuration.
 
@@ -17,7 +17,15 @@ openviking-server --config /path/to/ov.conf
 
 The server reads the file at startup. Restart the server after changing models, retrieval, storage, or `server` settings, then run `openviking-server doctor`.
 
+Studio's **Server configuration** page offers **Save and restart** for a single-worker `openviking-server` process. The existing ROOT-only `GET /api/v1/admin/configuration?source=file` includes restart capability and instance identity. Only ROOT can request a restart (`POST /api/v1/admin/restart`, body `{"revision":"<saved file revision>"}`). The server validates the current file and its revision, returns HTTP 202, drains active requests, stops its managed Bot, then replaces itself using the original interpreter, arguments, environment and working directory. Studio waits for a new service instance before reporting success. **Save configuration** alone continues to save without restarting.
+
+Multi-worker or embedded ASGI applications report restart as unsupported; restart these through the deployment platform. Startup can still fail because of external dependencies even after schema validation. If the address, port or ROOT credential changes, update Studio's connection settings to reconnect. Account and cluster overrides continue to take precedence over file defaults.
+
+Configurations containing environment references are read-only in the Studio form. Use file mode to edit the original text; quoted/unquoted references, escapes and formatting are saved as submitted. Windows `%VAR%` references and dollar/percent literals (including `\u0024` and `\u0025`) also use file mode to avoid introducing new references during form serialization.
+
 ## Configuration Structure
+
+This outline shows common top-level groups, not a runnable configuration. For a first deployment, start with the [minimal example](#minimal-example) and supply your models and credentials. Merge later snippets into the same `ov.conf`.
 
 ```json
 {
@@ -36,7 +44,7 @@ The server reads the file at startup. Restart the server after changing models, 
 }
 ```
 
-Optional sections use their defaults when omitted. Unknown fields in `ov.conf` and persisted account settings are ignored for upgrade compatibility. Known fields still validate types and values. Misspelled field names are also ignored, but the server logs a warning listing every field it did not apply.
+Optional sections use their defaults when omitted. Unknown fields in `ov.conf` and persisted account settings are ignored for upgrade compatibility, except in the `gateway` section. Known fields still validate types and values. Misspelled field names are also ignored, but the server logs a warning listing every field it did not apply.
 
 ## Top-Level Settings
 
@@ -46,7 +54,7 @@ Optional sections use their defaults when omitted. Unknown fields in `ov.conf` a
 | `default_user` | string | `"default"` | Default user for the service context |
 | `embedding` | object | built-in local dense model | Dense, sparse, and hybrid embedding; defaults to `local` / `bge-small-zh-v1.5-f16` |
 | `vlm` | object | empty config | Content understanding, summaries, and memory extraction; configure a working model before using these capabilities |
-| `query_planner` | object / `null` | `null` | Retrieval intent model; falls back to `vlm` |
+| `query_planner` | object / `null` | `null` | Model for retrieval intent analysis and recall rewriting. Falls back to `vlm` when omitted or empty; recall rewrite in `auto` mode requires a configured cluster `query_planner` or an account-level `query_planner` or `vlm` override |
 | `rerank` | object | disabled | Retrieval result reranking |
 | `retrieval` | object | see below | Ranking and intent-analysis behavior |
 | `grep` | object | built-in defaults | Text search engine |
@@ -65,6 +73,7 @@ Optional sections use their defaults when omitted. Unknown fields in `ov.conf` a
 | `log` | object | console | Log level, format, and file output |
 | `telemetry` | object | disabled | OpenTelemetry tracing |
 | `oauth` | object | disabled | MCP OAuth 2.1 |
+| `gateway` | object | disabled | OpenViking Gateway, the model API gateway that adds OpenViking memory to API-key clients. Unknown keys in this section are errors. See the [configuration reference](../guides/22-gateway-operations.md#configuration-reference) |
 | `prompts` | object | built-in templates | Custom prompt template directory |
 | `ingest` | object | built-in defaults | Conversation-log ingestion |
 | `output_language_override` | string | `""` | Force summary/memory language; empty means auto-detect |
@@ -357,13 +366,15 @@ See [Encryption](../guides/08-encryption.md) for provider and key-management set
 
 | Field | Type / values | Default | Purpose |
 |---|---|---|---|
-| `custom_templates_dir` | path | `""` | Additional memory template directory |
+| `custom_templates_dir` | path | `""` | Custom memory template directory; a matching `memory_type` overrides the loaded template |
 | `experimental_memory_switch` | boolean | `false` | Enable experimental templates |
 | `eager_prefetch` | boolean | `true` | Search and read memories before extraction |
 | `prefetch_search_topn` | integer, `>= 1` | `5` | Results read during prefetch |
 | `extraction_enabled` | boolean | `true` | Extract long-term memories on session commit |
 | `session_skill_extraction_enabled` | boolean | `false` | Also extract reusable skills |
 | `link_enabled` | boolean | `false` | Generate and resolve memory links |
+
+Automatic commits require a separate policy; enabling memory extraction does not make sessions commit automatically. See `memory.session_auto_commit` in [Configuration](../guides/01-configuration.md) and the [Sessions API](../api/05-sessions.md). For template loading order and when changes take effect, see the [Prompt Guide](../guides/10-prompt-guide.md).
 
 ## Parser Settings
 

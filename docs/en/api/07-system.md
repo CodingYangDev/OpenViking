@@ -8,14 +8,13 @@ The OpenViking System API provides health, readiness, consistency, and multi-wri
 
 #### 1. API Implementation Overview
 
-Basic health check endpoint. No authentication required. Returns service version and health status. If authentication is provided, also returns auth mode and identity information.
+Basic liveness check; no authentication is required. Returns the service version, health status, and auth mode. Supplied credentials trigger identity resolution; successful resolution adds identity fields, and invalid credentials are rejected with an authentication error.
 
 In trusted mode, a complete `X-OpenViking-Account` and `X-OpenViking-User` header pair
-requests identity resolution, including on localhost deployments with `root_api_key`
-omitted. Configured Root keys remain required for authenticated requests. The optional
-`root_api_key_required` boolean reports that trusted-server configuration requirement;
-the resolved `role` describes the caller's permissions. Older servers may omit this field.
-Anonymous health probes return basic liveness information.
+requests identity resolution and requires the matching root API key, including on
+localhost. `root_api_key_required` is always `true` in trusted mode; the resolved `role`
+describes the caller's permissions. Anonymous health probes return basic liveness
+information without identity fields.
 
 **Code Entry Points**:
 - `openviking/server/routers/system.py:health_check` - HTTP route
@@ -190,7 +189,6 @@ Get system status including initialization state and authenticated user info. `r
 
 **Code Entry Points**:
 - `openviking/server/routers/system.py:system_status` - HTTP route
-- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.get_status` - SDK entry
 - `crates/ov_cli/src/commands/system.rs` - CLI command
 
 #### 2. Interface and Parameters
@@ -309,11 +307,11 @@ ov system consistency viking://resources/my-project
 {
   "status": "ok",
   "result": {
-	    "ok": false,
-	    "expected_count": 3,
-	    "missing_record_count": 1,
-	    "missing_records_truncated": false,
-	    "missing_records": [
+    "ok": false,
+    "expected_count": 3,
+    "missing_record_count": 1,
+    "missing_records_truncated": false,
+    "missing_records": [
       {
         "uri": "viking://resources/my-project/README.md",
         "path": "README.md",
@@ -331,7 +329,7 @@ ov system consistency viking://resources/my-project
 
 #### 1. API Implementation Overview
 
-Wait for all asynchronous processing (embedding, semantic generation) to complete. This method blocks until all queued tasks are processed or timeout occurs.
+Wait until the processing queues are drained, or until the timeout. This check is not scoped to the caller’s last request and does not cover every asynchronous API. Check the returned `error_count` and `errors`; empty queues do not prove that every operation succeeded. To confirm one import or commit, poll its [task ID](17-tasks.md) instead.
 
 **Code Entry Points**:
 - `openviking/server/routers/system.py:wait_processed` - HTTP route
@@ -366,12 +364,9 @@ curl -X POST http://localhost:1933/api/v1/system/wait \
 **Python SDK**
 
 ```python
-# Add resources
-client.add_resource(path="./docs/")
-
-# Wait for all processing to complete
+# Wait for the current processing queues to drain
 status = client.wait_processed(timeout=60.0)
-print(f"Processing complete: {status}")
+print(status)  # Inspect each queue’s error_count and errors
 ```
 
 **TypeScript SDK**

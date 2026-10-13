@@ -23,7 +23,7 @@ For `/api/v1/admin/*`, `trusted` mode permits requests with no explicit identity
 | Register/remove users | Y | Y (own account) | N |
 | Manage groups and membership | Y | Y (own account) | N |
 | List agents (deprecated, returns empty list) | Y | Y (own account) | N |
-| Regenerate user key | Y | Y (own account) | N |
+| Regenerate user key (API Key mode only) | Y | Y (own account) | N |
 | Promote user to ADMIN | Y | Y (own account) | N |
 
 ## CLI `--sudo` Option
@@ -38,8 +38,7 @@ Configure `root_api_key` in `~/.openviking/ovcli.conf`:
 {
   "url": "http://localhost:1933",
   "api_key": "alice-user-key",
-  "root_api_key": "your-root-api-key",
-  ...
+  "root_api_key": "your-root-api-key"
 }
 ```
 
@@ -48,7 +47,7 @@ Configure `root_api_key` in `~/.openviking/ovcli.conf`:
 - `ov --sudo admin` - Account and user management
 - `ov --sudo system` - System utility commands
 - `ov --sudo reindex` - Rebuild indexes
-- `ov --sudo admin migrate` - Legacy agent/session migration and cleanup
+- `ov --sudo admin migrate` - Legacy session migration and cleanup
 - `ov --sudo task status/list` - Query root/system background tasks, such as migration tasks
 
 ### Usage Limitations
@@ -171,6 +170,14 @@ whether the User is named `default`.
 | PUT | `/api/v1/admin/accounts/{account_id}/memory-templates/{memory_type}` | Complete and publish one template |
 | DELETE | `/api/v1/admin/accounts/{account_id}/memory-templates/{memory_type}` | Remove that override and restore deployment defaults |
 
+To update a template while keeping existing customizations:
+
+1. GET the template and copy its `effective` object.
+2. Edit the permitted descriptions or `content_template`, then PUT the complete object. Omitted values revert to deployment defaults.
+3. Check the returned `status` and `effective` values. New extractions use the published template; existing memories are not immediately rewritten.
+
+Use DELETE to restore deployment defaults for that type.
+
 The kernel accepts the existing memory YAML structure as a JSON object and enforces
 the following editing allowlist at the API boundary. Only these six types are
 exposed. Experience, Cases, Trajectories and other types are not exposed for reading
@@ -235,6 +242,8 @@ objects using YAML field names such as `fields[].type`. List returns
 `result.account_id` and `result.templates`; single-template operations return
 `result.account_id` plus the template result.
 
+::: details Publication, storage, and concurrent extraction
+
 Storage is per Account and per type:
 
 ```text
@@ -290,6 +299,8 @@ All eligible Users/Peers in that Account share the templates; no shared deployme
 registry is mutated. Publishing/resetting does not proactively rewrite existing
 memories; subsequent commits can update them according to the effective rules.
 
+:::
+
 Editable descriptions and content templates must be nonempty strings;
 each serialized file is limited to 1 MiB. Descriptions (both type-level and
 `fields[].description`) share one restricted Jinja contract, whether they come
@@ -300,9 +311,7 @@ Only the existing `language` context variable is available; body fields,
 the same as the restricted bodies below: conditionals, local variables, bounded
 literal loops, safe string methods, approved string filters and tests, but no arbitrary calls.
 For example, <code v-pre>Use {{ language.upper() }}.</code> renders as `Use EN.` when the existing
-schema-rendering context supplies `language=en`. No new language propagation is
-introduced; the Python protocol's existing static field-description path remains
-unchanged. Missing language retains the previous undefined/empty-output behavior;
+schema-rendering context supplies `language=en`. Rendering uses the language supplied by the calling path; both Python and JSON protocols render field descriptions with that context. Missing language retains the previous undefined/empty-output behavior;
 use `language or 'English'` for a fallback. Context values are not recursively
 evaluated as Jinja. Invalid custom expressions are rejected before publication,
 and persisted overrides are revalidated before extraction. Deployment descriptions
@@ -316,8 +325,7 @@ including whitespace and template-like text. This is a per-field source-characte
 not a UTF-8 byte, rendered-output or combined-description limit. Oversized updates
 return 400 without modifying the active configuration. Publication does not invoke
 an LLM. Storage failures/corrupt files
-are reported, not silently treated as defaults. This change adds no public
-file-browser directory, SDK/CLI commands, drafts or version-history UI.
+are reported, not silently treated as defaults. These endpoints have no SDK/CLI wrappers. Use the HTTP API to read, publish, or reset templates.
 
 #### Managed content-template contract
 
@@ -420,6 +428,12 @@ active configuration remains unchanged. Structurally valid older overrides using
 unsupported Jinja can still be read, replaced or reset, but extraction refuses to
 execute them unchecked. Corrupt YAML remains an explicit error.
 
+For example, this `events` PUT body shows only the event name and summary, without ChatLog:
+
+```json
+{"content_template": "# {{ event_name.strip() }}\n\n## Summary\n{{ summary.strip() or 'Pending' }}"}
+```
+
 ### Runtime Configuration
 
 ROOT can manage Cluster configuration and any Account configuration. ADMIN can
@@ -518,8 +532,76 @@ not return business-resolved defaults. After persistence, the new
 configuration is published and matching in-process consumers are awaited.
 Consumer failures are logged without rolling back the persisted override, so
 a successful response confirms the configuration update but does not certify
-that every derived client has applied it. The current business integrations
-are documented in the [runtime configuration design](../../design/runtime-configuration-design.md).
+that every derived client has applied it. See [runtime configuration source and reload behavior](../guides/01-configuration.md#runtime-configuration-source).
+
+File-mode saves require the complete `content` and the previous `revision`.
+Draft previews (`source=file&dry_run=true`) accept optional VLM/Embedding form `settings`;
+other sections remain editable through the complete file.
+File reads and previews return `form_readonly: true` when the document contains dollar signs, Windows `%VAR%` references, or escaped dollar/percent signs. Model form data is omitted and form patches are rejected. Use file mode to edit the original text, including quoted and unquoted environment references. Validation follows startup expansion of the original text; saves do not serialize the document. CLI startup arguments are reapplied during validation, as during restart.
+
+#### Server Restart
+
+Only ROOT can restart a single-worker `openviking-server` CLI process.
+Multi-worker and embedded ASGI launch modes do not support remote restart.
+
+```http
+POST /api/v1/admin/restart
+Content-Type: application/json
+X-API-Key: <root-api-key>
+
+{"revision": "<saved-file-revision>"}
+```
+
+`revision` is a required, non-empty string. Obtain the current file revision and
+restart capability from `GET /api/v1/admin/configuration?source=file`;
+`result.restart` contains `supported`, `instance_id`, and `restarting`.
+The restart endpoint does not save configuration. Save any changes first using
+`PATCH /api/v1/admin/configuration?source=file`, with `content` and the previous
+`revision`, then submit the returned revision to the restart endpoint.
+
+The server checks the current file revision and validates the configuration before
+accepting the restart. A stale revision or invalid file returns `INVALID_ARGUMENT`;
+an unsupported launch mode or unreadable file returns `FAILED_PRECONDITION`.
+No restart is requested when these checks fail.
+
+An accepted request returns **HTTP 202**, before graceful shutdown:
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "supported": true,
+    "instance_id": "current-instance-id",
+    "restarting": true
+  }
+}
+```
+
+The CLI drains active requests, stops its managed Bot, and replaces the process
+with the original interpreter, arguments, environment, and working directory.
+File saves are rejected once restart has been requested. HTTP 202 confirms
+acceptance, not successful recovery: poll the file configuration endpoint until
+`instance_id` changes and `restarting` is false. External dependencies may still
+prevent startup. If the address, port, or ROOT credential changes, update the
+client connection before polling. See [server configuration](../configuration/01-server.md).
+
+Before accepting a restart, the CLI saves the exact file bytes loaded by the
+running process in a separate private recovery backup (0600, containing sensitive
+configuration). If the new process fails while loading configuration, starting
+the Bot, initializing the application, or binding its port, it atomically restores
+the previous running configuration and starts again once. The recovered instance
+returns `result.restart.rolled_back: true`; Studio reports the rollback.
+The recovery backup is deleted after application startup and socket binding succeed.
+Subsequent runtime failures do not trigger rollback. Remote restart cannot switch
+to multiple workers; use the deployment platform for that change.
+
+This recovery backup differs from `.studio.bak`, which only contains the file
+before the most recent save and may never have started successfully. Recovery
+only restores the configuration file, not storage or external side effects.
+It does not handle stalled startup, forced process termination, or machine failure.
+External file changes after restart prevent automatic restoration. If the restored
+configuration also fails to start, no further retry occurs; an administrator must
+recover the service on the server.
 
 #### Account Configuration Reference
 
@@ -874,8 +956,8 @@ Create a new workspace with its first admin user.
 | settings | object | No | `null` | Initial Account runtime configuration. ROOT-only; supports `feishu`, `github`, `acl`, `agent_evolution`, `vlm`, `query_planner`, `embedding`, and `vectordb`. `vectordb` and Embedding create-only fields can only be set here |
 
 **Notes:**
-- In `trusted` mode, `user_key` is omitted from the response
-- Omit `seed` for the default random API key. Treat seed values as secret material; short seeds can make the key guessable.
+- In `trusted` mode, only identity and role are created: no personal key, hash, or key index is generated. The response omits `user_key`, and `seed` is unused.
+- Omit `seed` for the default random API key. Set `OV_KEY_SEED` to a securely generated secret before running a deterministic example; the Go example also requires `import "os"`. Short or predictable seeds make the key guessable.
 - `settings` receives structural and effective Embedding/VectorDB pair validation before the Account and its directories are created. A failed validation leaves no Account, user, or configuration file.
 - Account `vlm`, `query_planner`, `embedding`, and `vectordb` are ROOT-only. See [Account Configuration Reference](#account-configuration-reference) above for their schema, lifecycle, and validation. The current Python SDK, CLI, and other SDK Account-creation wrappers do not expose a `settings` argument; use the HTTP API for this capability.
 - Account-level namespace isolation settings are no longer supported. User memory uses user-scoped namespaces, and one-to-many external participants are represented with `peer_id`.
@@ -897,8 +979,7 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts \
   -H "X-API-Key: <root-key>" \
   -d '{
     "account_id": "acme",
-    "admin_user_id": "alice",
-    "seed": "alice-seed"
+    "admin_user_id": "alice"
   }'
 ```
 
@@ -935,31 +1016,9 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts \
   }'
 ```
 
-**Trusted mode (registered gateway user)**
+**Trusted mode**
 
-```bash
-# First, register the gateway admin user in api_key mode
-curl -X POST http://localhost:1933/api/v1/admin/accounts \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: <root-key>" \
-  -d '{
-    "account_id": "platform",
-    "admin_user_id": "gateway-admin"
-  }'
-
-# Then use it in trusted mode; admin authorization comes from root_api_key
-curl -X POST http://localhost:1933/api/v1/admin/accounts \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: <root-key>" \
-  -H "X-OpenViking-Account: platform" \
-  -H "X-OpenViking-User: gateway-admin" \
-  -d '{
-    "account_id": "acme",
-    "admin_user_id": "alice"
-  }'
-```
-
-**Trusted mode (root fallback without identity headers)**
+With `server.root_api_key` configured, use the root key for Admin API requests. No gateway-user registration or switch to `api_key` mode is required. Omit identity headers for these requests to avoid a mismatch with the target account or user in the URL.
 
 ```bash
 curl -X POST http://localhost:1933/api/v1/admin/accounts \
@@ -982,7 +1041,6 @@ client.initialize()
 result = client.admin_create_account(
     account_id="acme",
     admin_user_id="alice",
-    seed="alice-seed",
 )
 print(f"Account created: {result['account_id']}")
 print(f"Admin user: {result['admin_user_id']}")
@@ -1015,7 +1073,7 @@ if err != nil {
 }
 fmt.Println(result["account_id"])
 
-seed := "alice-seed"
+seed := os.Getenv("OV_KEY_SEED")
 result, err = client.AdminCreateAccountWithOptions(ctx, "acme-private", "alice", &openviking.AdminCreateAccountOptions{
     Seed: &seed,
     UserConfig: map[string]any{
@@ -1032,7 +1090,7 @@ result, err = client.AdminCreateAccountWithOptions(ctx, "acme-private", "alice",
 ```bash
 # Requires ROOT privileges, use --sudo
 ov --sudo admin create-account acme --admin alice
-ov --sudo admin create-account acme --admin alice --seed alice-seed
+ov --sudo admin create-account acme --admin alice --seed "$OV_KEY_SEED"
 
 ov --sudo admin create-account acme-private --admin alice \
   --user-config-json '{"add_targets":{"resource_uri":"viking://~/resources","skill_uri":"viking://~/skills"}}'
@@ -1297,8 +1355,8 @@ Register a new user in a workspace.
 | user_config | object | No | `null` | Initial config for the new user. Supports `add_targets.resource_uri`, `add_targets.skill_uri`, and `memory_policy` |
 
 **Notes:**
-- In `trusted` mode, `user_key` is omitted from the response
-- Omit `seed` for the default random API key. Treat seed values as secret material; short seeds can make the key guessable.
+- In `trusted` mode, only identity and role are created: no personal key, hash, or key index is generated. The response omits `user_key`, and `seed` is unused.
+- Omit `seed` for the default random API key. Set `OV_KEY_SEED` to a securely generated secret before running a deterministic example; the Go example also requires `import "os"`. Short or predictable seeds make the key guessable.
 - ADMIN can only register users in their own account
 - The `"root"` role cannot be minted through user registration
 - `user_config.add_targets.resource_uri` must be a writable resource directory URI: `viking://resources` or `viking://resources/...`, `viking://~/resources` or `viking://~/resources/...`, `viking://user/{user_id}/resources` or `viking://user/{user_id}/resources/...`, or `viking://user/{user_id}/peers/{peer_id}/resources` or `viking://user/{user_id}/peers/{peer_id}/resources/...`.
@@ -1319,8 +1377,7 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts/acme/users \
   -H "X-API-Key: <root-or-admin-key>" \
   -d '{
     "user_id": "bob",
-    "role": "user",
-    "seed": "bob-seed"
+    "role": "user"
   }'
 ```
 
@@ -1336,7 +1393,6 @@ result = client.admin_register_user(
     account_id="acme",
     user_id="bob",
     role="user",
-    seed="bob-seed",
 )
 print(f"User registered: {result['user_id']}")
 print(f"User key: {result.get('user_key', '(not exposed in trusted mode)')}")
@@ -1364,7 +1420,7 @@ if err != nil {
 }
 fmt.Println(result["user_id"])
 
-seed := "bob-seed"
+seed := os.Getenv("OV_KEY_SEED")
 result, err = client.AdminRegisterUserWithOptions(ctx, "acme", "bob-private", "user", &openviking.AdminRegisterUserOptions{
     Seed: &seed,
     UserConfig: map[string]any{
@@ -1379,7 +1435,7 @@ result, err = client.AdminRegisterUserWithOptions(ctx, "acme", "bob-private", "u
 # Either ROOT or account ADMIN can execute
 # If using regular user's api_key who is an ADMIN of acme:
 ov admin register-user acme bob --role user
-ov admin register-user acme bob --role user --seed bob-seed
+ov admin register-user acme bob --role user --seed "$OV_KEY_SEED"
 # If using root_api_key (--sudo):
 ov --sudo admin register-user acme bob --role user
 
@@ -1429,7 +1485,9 @@ List active users in a workspace. Users with deletion in progress are omitted.
 | account_id | str | Yes | - | Workspace ID |
 | name | str | No | null | Filter by user ID (wildcard `*` and `?` matching) |
 | role | str | No | null | Filter by role |
-| include_credentials | bool | No | true | HTTP-only. Set false to return `user_id`, `role`, and `api_key_available` without credentials or key prefixes. The default preserves the existing mode-dependent response. |
+| query | str | No | null | HTTP-only, case-insensitive literal substring match on user IDs |
+| include_summary | bool | No | false | HTTP-only, return paginated users and account statistics in an object |
+| include_credentials | bool | No | true | HTTP-only. Set false to return `user_id`, `role`, and `api_key_available` without credentials or key prefixes. `api_key_available` is true only when the server can read the complete key for a server-side binding; hash-only credentials return false. The default preserves the existing mode-dependent response. |
 | limit | int | No | null | Page size (≥1). Omit to return all matches |
 | page | int | No | 1 | 1-based page number; only applies when `limit` is set |
 
@@ -1702,7 +1760,7 @@ fmt.Println(result["role"])
 **CLI**
 
 ```bash
-# Requires ROOT privileges, use --sudo
+# ROOT example; an acme ADMIN can use `ov admin set-role` without --sudo
 ov --sudo admin set-role acme bob admin
 ```
 
@@ -1725,12 +1783,12 @@ ov --sudo admin set-role acme bob admin
 
 #### 1. API Implementation Overview
 
-Regenerate a user's API key. The old key is immediately invalidated.
+Generate and store a user API key. With the default random generation, the old key stops working after a successful update. Reusing the same account, user, and seed reproduces the same key; choose a new seed or omit it when rotating credentials.
 
 **Processing Flow:**
 1. Verify requester has ROOT privileges or is an ADMIN of the account
 2. Call API Key Manager to regenerate user key
-3. Old key is immediately invalidated
+3. With random generation or a new seed, the old key stops working immediately
 4. Return new user key
 
 **Code Entry Points:**
@@ -1749,9 +1807,10 @@ Regenerate a user's API key. The old key is immediately invalidated.
 | seed | str | No | `null` | Optional deterministic API key seed in the JSON request body. When set, the key secret is `sha256(user_id + "\0" + seed)` |
 
 **Notes:**
+- `trusted` mode rejects this operation with HTTP 412 (`FAILED_PRECONDITION`) without generating or modifying credentials.
 - ADMIN can only regenerate keys for users in their own account
-- Old key is immediately invalidated, clients using it need to be updated
-- Omit `seed` for the default random regenerated key.
+- With random generation or a new seed, the old key stops working immediately; update clients that use it
+- Omit `seed` for the default random regenerated key. Deterministic examples use `OV_KEY_SEED` or `OV_NEW_KEY_SEED`; set these to a securely generated secret before use. In Go, import `os`. Do not use the example variable names as seed values.
 
 #### 3. Usage Examples
 
@@ -1765,7 +1824,7 @@ POST /api/v1/admin/accounts/{account_id}/users/{user_id}/key
 curl -X POST http://localhost:1933/api/v1/admin/accounts/acme/users/bob/key \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <root-or-admin-key>" \
-  -d '{"seed": "bob-new-seed"}'
+  -d '{}'
 ```
 
 **Python SDK**
@@ -1779,7 +1838,6 @@ client.initialize()
 result = client.admin_regenerate_key(
     account_id="acme",
     user_id="bob",
-    seed="bob-new-seed",
 )
 print(f"New user key: {result['user_key']}")
 ```
@@ -1799,7 +1857,7 @@ if err != nil {
 }
 fmt.Println(result["user_key"])
 
-seed := "bob-new-seed"
+seed := os.Getenv("OV_NEW_KEY_SEED")
 result, err = client.AdminRegenerateKeyWithOptions(ctx, "acme", "bob", &openviking.AdminRegenerateKeyOptions{
     Seed: &seed,
 })
@@ -1811,7 +1869,7 @@ result, err = client.AdminRegenerateKeyWithOptions(ctx, "acme", "bob", &openviki
 # Either ROOT or account ADMIN can execute
 # If using regular user's api_key who is an ADMIN of acme:
 ov admin regenerate-key acme bob
-ov admin regenerate-key acme bob --seed bob-new-seed
+ov admin regenerate-key acme bob --seed "$OV_NEW_KEY_SEED"
 # If using root_api_key (--sudo):
 ov --sudo admin regenerate-key acme bob
 ```
@@ -1889,7 +1947,7 @@ curl -X POST http://localhost:1933/api/v1/admin/migrate \
   -H "X-API-Key: <root-key>" \
   -d '{"action": "migrate"}'
 
-# Clean old namespaces
+# Clean old namespaces after the migration task finishes and migrated data is verified
 curl -X POST http://localhost:1933/api/v1/admin/migrate \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <root-key>" \
@@ -1924,14 +1982,16 @@ fmt.Println(result["task_id"])
 
 ```bash
 ov --sudo admin migrate --output json
+# Check the returned task with ov --sudo task status <task_id>, then verify migrated data.
 ov --sudo admin migrate --cleanup --output json
 ```
 
-**Response Example**
+**CLI Response Example (default compact output)**
 
 ```json
 {
-  "task_id": "legacy_migration_..."
+  "ok": true,
+  "result": {"task_id": "6de05fc3-0334-40d6-ba9b-dd317eb4d351"}
 }
 ```
 
@@ -1942,6 +2002,8 @@ ov --sudo admin migrate --cleanup --output json
 ## Full Example
 
 ### Typical Admin Workflow
+
+This example includes user and account deletion. Run it only against a disposable workspace; omit the deletion steps when onboarding real users.
 
 ```bash
 # Step 1: ROOT creates workspace with alice as first admin (requires --sudo)

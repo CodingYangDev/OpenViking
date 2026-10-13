@@ -6,9 +6,11 @@ import workspace from './en/workspace'
 import resources from './en/resources'
 import activity from './en/activity'
 import memoryTemplates from './en/memory-templates'
+import gateway from './en/gateway'
 
 const en = {
   studio,
+  gateway,
   compile,
   vikingbot,
   ...workspace,

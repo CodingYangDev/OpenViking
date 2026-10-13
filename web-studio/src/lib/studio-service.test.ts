@@ -57,7 +57,7 @@ describe('service and permission boundaries', () => {
   })
   it('guards nested deep links with the same domain as navigation', () => {
     expect(featureForPath('/users/memory-templates')?.domain).toBe('management')
-    expect(featureForPath('/playground')?.domain).toBe('extensions')
+    expect(featureForPath('/filesystem')?.domain).toBe('extensions')
     expect(featureForPath('/directory')?.domain).toBe('workspace')
   })
 })
@@ -79,7 +79,7 @@ describe('hosted feature visibility', () => {
     expect(
       isStudioFeatureVisible(
         'volcengine',
-        featureForPath('/playground')!,
+        featureForPath('/filesystem')!,
         'supported',
       ),
     ).toBe(false)
@@ -95,7 +95,7 @@ describe('hosted feature visibility', () => {
     ).toBe(false)
     expect(isStudioFeatureVisible('unknown', monitoring)).toBe(false)
     expect(
-      isStudioFeatureVisible('opensource', featureForPath('/playground')!),
+      isStudioFeatureVisible('opensource', featureForPath('/filesystem')!),
     ).toBe(true)
   })
 })

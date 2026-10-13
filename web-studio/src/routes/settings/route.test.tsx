@@ -48,10 +48,13 @@ vi.mock('#/hooks/use-studio-service', () => ({
     health: { refetch: vi.fn() },
   }),
 }))
+vi.mock('./-components/server-configuration', () => ({
+  ServerConfigurationEditor: () => null,
+}))
 afterEach(cleanup)
 
 it.each([false, undefined, true])(
-  'bases the Root key guide on server metadata: %s',
+  'requires the Root key in trusted mode regardless of legacy metadata: %s',
   async (required) => {
     probe.mockResolvedValue({
       admin: {
@@ -80,7 +83,7 @@ it.each([false, undefined, true])(
     )
     expect(
       Boolean(screen.queryByText('connection.keyGuide.trusted.title')),
-    ).toBe(required === true)
+    ).toBe(true)
     client.clear()
   },
 )

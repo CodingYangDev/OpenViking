@@ -22,6 +22,7 @@ import {
   SparklesIcon,
   SunIcon,
   UsersRoundIcon,
+  WaypointsIcon,
   WorkflowIcon,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -46,6 +47,7 @@ import {
   SidebarHeader,
   SidebarInset,
   SidebarMenu,
+  SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSub,
@@ -111,9 +113,9 @@ const NAV_ITEMS: readonly NavItem[] = [
   },
   {
     icon: PanelsTopLeftIcon,
-    id: 'playground',
-    titleKey: 'navigation.playground.title',
-    to: '/playground',
+    id: 'filesystem',
+    titleKey: 'navigation.filesystem.title',
+    to: '/filesystem',
   },
   {
     icon: BotIcon,
@@ -315,6 +317,8 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   const { connection, connectionRole, isConnectionRoleLoading, serverMode } =
     useAppConnection()
   const settingsActive = pathname === '/settings'
+  const gatewayActive =
+    pathname === '/gateway' || pathname.startsWith('/gateway/')
   const { provider } = useStudioService()
   const sdkApiHref =
     provider === 'volcengine'
@@ -474,6 +478,25 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                     <span>{t('footer.connection', { ns: 'appShell' })}</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
+                {provider === 'opensource' && canManageUsers ? (
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      render={<Link to="/gateway" />}
+                      isActive={gatewayActive}
+                      tooltip={t('footer.gatewayBeta', {
+                        ns: 'appShell',
+                      })}
+                      className="h-9 pr-12"
+                    >
+                      <WaypointsIcon />
+                      <span>{t('footer.gateway', { ns: 'appShell' })}</span>
+                    </SidebarMenuButton>
+                    {/* Hidden while the sidebar is collapsed; the tooltip says Beta then. */}
+                    <SidebarMenuBadge className="h-4.5 rounded-full border border-sidebar-border px-1.5 text-[10px] font-medium text-sidebar-foreground/55 peer-data-[size=default]/menu-button:top-[9px]">
+                      {t('footer.beta', { ns: 'appShell' })}
+                    </SidebarMenuBadge>
+                  </SidebarMenuItem>
+                ) : null}
                 {provider === 'opensource' ? (
                   <SidebarMenuItem>
                     <SidebarMenuButton
@@ -663,7 +686,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             {service.version}
           </span>
         </nav>
-        {pathname === '/playground' ||
+        {pathname === '/filesystem' ||
         pathname === '/vikingbot' ||
         pathname.startsWith('/vikingbot/') ||
         pathname === '/sessions' ||
