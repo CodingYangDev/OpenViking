@@ -205,8 +205,8 @@ use ragfs::core::builder::{
 use ragfs::core::{
     build_configured_stack, ConfigValue, FileInfo, FileSystem, FilesystemStats, FsContext,
     FsContextInner, FsOperation, GlobPage, GrepOptions, GrepResult, ListSortBy, MountableFS,
-    OperationStats, PathLockContext, PluginConfig, RagfsConfig, SortOrder, TreeEntry, WriteFlag,
-    FS_CTX,
+    OperationStats, PathLockContext, PluginConfig, PrefixFilePage, RagfsConfig, SortOrder,
+    TreeEntry, WriteFlag, FS_CTX,
 };
 use ragfs::lock::types::PathLockError;
 use ragfs::lock::{
@@ -2426,6 +2426,31 @@ impl RAGFSBindingClient {
             })
             .map_err(to_py_err)?;
 
+        Python::attach(|py| {
+            let value = serde_json::to_value(&page)
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+            serde_json_to_py(py, &value)
+        })
+    }
+
+    /// Return regular files below a prefix with sizes from backend listing metadata.
+    #[pyo3(signature = (path, page_size=None, continuation_token=None, ctx=None))]
+    fn list_files_by_prefix(
+        &self,
+        py: Python<'_>,
+        path: String,
+        page_size: Option<i32>,
+        continuation_token: Option<String>,
+        ctx: Option<HashMap<String, String>>,
+    ) -> PyResult<Py<PyAny>> {
+        let fs_ctx = build_fs_context(ctx);
+        let top = self.top.clone();
+        let page_size = page_size.map(|n| if n < 0 { 0 } else { n as usize });
+        let page: PrefixFilePage = self
+            .run_scoped(py, fs_ctx, move || async move {
+                top.list_files_by_prefix(&path, page_size, continuation_token).await
+            })
+            .map_err(to_py_err)?;
         Python::attach(|py| {
             let value = serde_json::to_value(&page)
                 .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;

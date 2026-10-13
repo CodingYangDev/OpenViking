@@ -35,7 +35,8 @@ use crate::core::grep::GrepLineCollector;
 use crate::core::types::GrepContextLine;
 use crate::core::{
     ConfigParameter, Error, FileInfo, FileSystem, GlobEntry, GlobPage, GrepMatch, GrepOptions,
-    GrepResult, PluginConfig, Result, ServicePlugin, TreeEntry, WriteFlag,
+    GrepResult, PluginConfig, PrefixFileEntry, PrefixFilePage, Result, ServicePlugin, TreeEntry,
+    WriteFlag,
 };
 use tree::{build_tree_entries_from_flat_listing, build_tree_entries_from_listing_page, rel_parts};
 
@@ -1169,6 +1170,48 @@ impl FileSystem for S3FileSystem {
             entries: matched,
             next_token: None,
         })
+    }
+
+    async fn list_files_by_prefix(
+        &self,
+        path: &str,
+        page_size: Option<usize>,
+        continuation_token: Option<String>,
+    ) -> Result<PrefixFilePage> {
+        if matches!(page_size, Some(0)) {
+            return Err(Error::invalid_operation("page_size must be positive"));
+        }
+        let normalized = Self::normalize_path(path);
+        if !self.stat(&normalized).await?.is_dir {
+            return Err(Error::NotADirectory(normalized));
+        }
+        let prefix = if normalized == "/" {
+            self.client.build_key("")
+        } else {
+            format!("{}/", self.client.build_key(&normalized))
+        };
+        let page = self
+            .client
+            .list_tree_objects_page(
+                &prefix,
+                continuation_token.as_deref(),
+                page_size.unwrap_or(1000),
+            )
+            .await?;
+        let entries = page
+            .objects
+            .into_iter()
+            .filter(|object| !object.is_dir_marker && !object.key.ends_with('/'))
+            .map(|object| {
+                let path = format!("/{}", self.client.strip_prefix(&object.key));
+                PrefixFileEntry {
+                    relative_path: relative_match_file(&normalized, &path),
+                    path,
+                    size: object.size as u64,
+                }
+            })
+            .collect();
+        Ok(PrefixFilePage { entries, next_token: page.next_continuation_token })
     }
 }
 

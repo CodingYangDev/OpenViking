@@ -11,7 +11,7 @@ use crate::core::grep::GrepLineCollector;
 use crate::core::types::GrepContextLine;
 use crate::core::{
     FileInfo, FileSystem, GlobPage, GrepMatch, GrepOptions, GrepResult, ListSortBy,
-    MultiWriteWrappedFS, Result, SortOrder, TreeEntry, WriteFlag,
+    MultiWriteWrappedFS, PrefixFilePage, Result, SortOrder, TreeEntry, WriteFlag,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1324,6 +1324,12 @@ impl FileSystem for CachedFileSystem {
                 continuation_token,
             )
             .await
+    }
+
+    async fn list_files_by_prefix(
+        &self, path: &str, page_size: Option<usize>, continuation_token: Option<String>,
+    ) -> Result<PrefixFilePage> {
+        self.backend.list_files_by_prefix(path, page_size, continuation_token).await
     }
 }
 

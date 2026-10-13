@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use super::{
     FileInfo, FileSystem, FsOperation, GlobPage, GrepOptions, GrepResult, OperationTimer, Result,
-    StatsCollector, TreeEntry, WriteFlag,
+    PrefixFilePage, StatsCollector, TreeEntry, WriteFlag,
 };
 
 /// A wrapper around FileSystem that automatically collects operation statistics
@@ -236,5 +236,11 @@ impl FileSystem for StatsWrappedFS {
             .await;
         timer.finish(result.is_ok()).await;
         result
+    }
+
+    async fn list_files_by_prefix(
+        &self, path: &str, page_size: Option<usize>, continuation_token: Option<String>,
+    ) -> Result<PrefixFilePage> {
+        self.inner.list_files_by_prefix(path, page_size, continuation_token).await
     }
 }

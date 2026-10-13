@@ -35,7 +35,8 @@ use super::plugin::ServicePlugin;
 use super::stats::{FilesystemStats, StatsCollector};
 use super::stats_wrapper::StatsWrappedFS;
 use super::types::{
-    BackendsConfig, FileInfo, GlobPage, GrepOptions, GrepResult, PluginConfig, TreeEntry, WriteFlag,
+    BackendsConfig, FileInfo, GlobPage, GrepOptions, GrepResult, PluginConfig, PrefixFilePage,
+    TreeEntry, WriteFlag,
 };
 #[cfg(feature = "cache")]
 use crate::cache::{CacheNamespace, CachePolicy, CacheTraversalMode, CachedFileSystem};
@@ -1242,6 +1243,26 @@ impl FileSystem for MountableFS {
                 .map_or(true, |name| !is_hidden_internal_name(name))
         });
 
+        Ok(page)
+    }
+
+    async fn list_files_by_prefix(
+        &self,
+        path: &str,
+        page_size: Option<usize>,
+        continuation_token: Option<String>,
+    ) -> Result<PrefixFilePage> {
+        let (mount_info, rel_path) = self.find_mount(path).await?;
+        let prefix = if mount_info.path == "/" { String::new() } else { mount_info.path.clone() };
+        let mut page = mount_info
+            .fs
+            .list_files_by_prefix(&rel_path, page_size, continuation_token)
+            .await?;
+        for entry in &mut page.entries {
+            if !prefix.is_empty() {
+                entry.path = format!("{}{}", prefix, entry.path);
+            }
+        }
         Ok(page)
     }
 }

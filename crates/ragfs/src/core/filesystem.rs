@@ -13,8 +13,8 @@ use std::path::{Component, Path};
 use super::errors::{Error, Result};
 use super::glob::{compare_rel_paths, decode_offset_token, encode_offset_token, PreparedGlob};
 use super::types::{
-    FileInfo, GlobEntry, GlobPage, GrepMatch, GrepOptions, GrepResult, ListSortBy, SortOrder,
-    TreeEntry, WriteFlag,
+    FileInfo, GlobEntry, GlobPage, GrepMatch, GrepOptions, GrepResult, ListSortBy,
+    PrefixFileEntry, PrefixFilePage, SortOrder, TreeEntry, WriteFlag,
 };
 
 /// Reject virtual paths that can escape a mounted backend lexically.
@@ -696,6 +696,31 @@ pub trait FileSystem: Send + Sync + Any {
             entries: matched[start..end].to_vec(),
             next_token,
         })
+    }
+
+    /// List only regular files below a prefix, with their download sizes.
+    /// Native object-store backends override this to use listing metadata;
+    /// the portable fallback remains correct for all other filesystems.
+    async fn list_files_by_prefix(
+        &self,
+        path: &str,
+        page_size: Option<usize>,
+        continuation_token: Option<String>,
+    ) -> Result<PrefixFilePage> {
+        let page = self
+            .glob_directory(path, "**", true, page_size, None, continuation_token)
+            .await?;
+        let mut entries = Vec::with_capacity(page.entries.len());
+        for entry in page.entries {
+            if !entry.is_dir {
+                entries.push(PrefixFileEntry {
+                    size: self.stat(&entry.path).await?.size,
+                    path: entry.path,
+                    relative_path: entry.rel_path,
+                });
+            }
+        }
+        Ok(PrefixFilePage { entries, next_token: page.next_token })
     }
 
     /// Internal recursive helper for tree_directory.

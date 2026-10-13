@@ -198,6 +198,26 @@ pub struct GlobPage {
     pub next_token: Option<String>,
 }
 
+/// A regular file returned from a paged prefix listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefixFileEntry {
+    /// Absolute plugin path.
+    pub path: String,
+    /// Path relative to the requested prefix.
+    pub relative_path: String,
+    /// Object length in bytes.
+    pub size: u64,
+}
+
+/// A continuation-token page of files below a prefix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefixFilePage {
+    /// Files in this page.
+    pub entries: Vec<PrefixFileEntry>,
+    /// Opaque token for the next page.
+    pub next_token: Option<String>,
+}
+
 impl GrepResult {
     /// Create a new empty GrepResult
     pub fn new() -> Self {

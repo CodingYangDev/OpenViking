@@ -349,6 +349,16 @@ class AsyncAGFSClient:
             ctx=_fs_ctx_or_default(path, fs_ctx),
         )
 
+    async def list_files_by_prefix(
+        self, path: str, page_size: int | None = None,
+        continuation_token: str | None = None, *, fs_ctx: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        """Return one file-only prefix page, including TOS listing sizes."""
+        return await self.run(
+            "list_files_by_prefix", path, page_size=page_size,
+            continuation_token=continuation_token, ctx=_fs_ctx_or_default(path, fs_ctx),
+        )
+
     async def system_sync_status(
         self, path: str, *, fs_ctx: Dict[str, str] | None = None
     ) -> Dict[str, Any]:

@@ -46,7 +46,8 @@ pub mod shape;
 pub use core::{
     ConfigParameter, ConfigValue, Error, FileInfo, FileSystem, FilesystemStats, FsOperation,
     GlobEntry, GlobPage, HealthStatus, MountableFS, OperationStats, OperationTimer, PluginConfig,
-    PluginRegistry, Result, ServicePlugin, StatsCollector, StatsWrappedFS, WriteFlag,
+    PluginRegistry, PrefixFileEntry, PrefixFilePage, Result, ServicePlugin, StatsCollector,
+    StatsWrappedFS, WriteFlag,
 };
 
 /// Version of RAGFS

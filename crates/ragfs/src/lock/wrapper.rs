@@ -14,7 +14,8 @@ use tracing::debug;
 use crate::core::filesystem::FileSystem;
 use crate::core::internal_names::is_hidden_runtime_lock_name;
 use crate::core::types::{
-    FileInfo, GlobPage, GrepOptions, GrepResult, ListSortBy, SortOrder, TreeEntry, WriteFlag,
+    FileInfo, GlobPage, GrepOptions, GrepResult, ListSortBy, PrefixFilePage, SortOrder,
+    TreeEntry, WriteFlag,
 };
 use crate::core::MountableFS;
 
@@ -388,6 +389,12 @@ impl FileSystem for PathLockWrappedFS {
                 continuation_token,
             )
             .await
+    }
+
+    async fn list_files_by_prefix(
+        &self, path: &str, page_size: Option<usize>, continuation_token: Option<String>,
+    ) -> crate::core::Result<PrefixFilePage> {
+        self.inner.list_files_by_prefix(path, page_size, continuation_token).await
     }
 
     async fn ensure_parent_dirs(&self, path: &str, mode: u32) -> crate::core::Result<()> {

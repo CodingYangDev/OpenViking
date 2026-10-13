@@ -119,6 +119,12 @@ class AGFSSyncClientProtocol(Protocol):
     ) -> Dict[str, Any]:
         """Return one page of flat glob matches for the given AGFS directory."""
 
+    def list_files_by_prefix(
+        self, path: str, page_size: int | None = None,
+        continuation_token: str | None = None,
+    ) -> Dict[str, Any]:
+        """Return one file-only page below a prefix, including each file size."""
+
     def system_sync_status(self, path: str) -> Dict[str, Any]:
         """Return multi-write sync status for a file or directory path."""
 
