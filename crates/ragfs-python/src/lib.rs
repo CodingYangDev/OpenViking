@@ -1507,17 +1507,30 @@ impl RAGFSBindingClient {
     /// `config` is an optional sectioned dict produced by the Python runtime. The `encryption`
     /// section, when present, carries `root_key` (32 bytes) + `provider_type` (int) and causes the
     /// stack to include an `EncryptionWrappedFS` layer. Runtime `cache` configuration takes
-    /// precedence over `config_path`.
+    /// precedence over `config_path`. `runtime_worker_threads`, when provided, controls the
+    /// number of Tokio async runtime workers used by this binding instance.
     #[new]
-    #[pyo3(signature = (config_path=None, config=None, git_config_path=None))]
+    #[pyo3(signature = (config_path=None, config=None, git_config_path=None, runtime_worker_threads=None))]
     fn new(
         py: Python<'_>,
         config_path: Option<&str>,
         config: Option<HashMap<String, Py<PyAny>>>,
         git_config_path: Option<&str>,
+        runtime_worker_threads: Option<usize>,
     ) -> PyResult<Self> {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?;
+        let rt = match runtime_worker_threads {
+            Some(0) => {
+                return Err(PyValueError::new_err(
+                    "runtime_worker_threads must be greater than zero",
+                ));
+            }
+            Some(worker_threads) => tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .build(),
+            None => tokio::runtime::Runtime::new(),
+        }
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?;
 
         // Phase A (holding GIL): parse the sectioned config into an owned RagfsConfig.
         let mut ragfs_cfg = RagfsConfig::default();
