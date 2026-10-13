@@ -129,13 +129,15 @@ If you already have HTTPS configured, just connect to `https://your-server.com/m
 
 ## Available MCP Tools
 
-Once connected, OpenViking exposes 16 tools:
+Once connected, OpenViking exposes 18 tools:
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
+| `find_mcp_tools` | Semantically retrieve ranked MCP tools with routing URI, revision, score, and complete definitions including inputSchema and annotations. Choose a tool and fill its arguments directly, then call `invoke_mcp_tool`; no extra `read` is needed | `query`, `limit` |
+| `invoke_mcp_tool` | Invoke a registered upstream MCP tool through OpenViking's credential-safe proxy. Calls are not retried and the upstream tool may have external side effects | `tool_uri`, `arguments` |
 | `find` | Fast semantic retrieval without session context. `context_type="skill"` on its own switches to package-level skill retrieval: one hit per skill package, its URI pointing at that package's `SKILL.md` and its summary taken from the skill itself, even when an auxiliary file inside the package is what matched. Without `target_uri` it searches both your own skills and the account-shared `viking://agent/skills`. Mixing `skill` with another context type keeps the generic retrieval path | `query`, `target_uri` (optional), `limit`, `min_score`, `level` (optional), `context_type` (optional), `read_content` (optional — inline each hit's content) |
 | `search` | Deep semantic retrieval; `mode="context"` assembles injection-ready context and replaces the former `recall` tool. `list` mode also returns one hit per skill package, its URI pointing at `SKILL.md` and its summary taken from the package itself, but `limit` applies before that merge, so a package matching in several files takes several slots and fewer than `limit` results come back | `query`, `mode` (`list` or `context`), `target_uri` (list mode only), `session_id` (optional), `limit`, `min_score`, `level` (list mode), `context_type` (optional), plus context-mode `quotas`, `purpose`, `max_tokens`, `detail` or `detail_by_category`, `dedup_turns`, `exclude_uris`, `peer_scope`, scalar `other_peer_penalty` or `other_peer_penalties` by category, and `rewrite` (`off` or `auto`) |
-| `read` | Read one or more `viking://` URIs. PNG, JPEG, GIF, and WebP return native MCP image content; WAV, MP3, FLAC, OGG, and M4A return native audio content. Video is not supported because MCP has no standard video content block | `uris` (single string or array) |
+| `read` | Read one or more `viking://` URIs. A complete read of a Live Context node transparently returns only its upstream MCP tool result, without the stored descriptor or routing labels; paginated reads only return stored descriptor text. Supported image and audio formats return native MCP content blocks | `uris` (single string or array), `offset`, `limit` |
 | `list` | List entries under a `viking://` directory | `uri`, `recursive`, `offset`, `limit`, `sort_by`, `sort_order` (optional) |
 | `tree` | Show the recursive directory tree under a `viking://` URI, indented by depth — use when you need a full picture of the file tree (prefer `list` for a single level, `glob` for filename patterns) | `uri` (optional), `level_limit` (default 3), `node_limit` (default 1000), `offset`, `limit`, `include_abstract` (optional — also show each directory's summary; for a skill directory that is its name and description) |
 | `remember` | Store messages into long-term memory (triggers extraction) | `messages` (list of `{role, content}`) |

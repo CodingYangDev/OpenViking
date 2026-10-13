@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from fastapi import FastAPI
-from mcp.types import Tool
+from mcp.types import CallToolResult, TextContent, Tool
 
 from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
@@ -176,9 +176,41 @@ async def test_invoke_failure_is_not_retried_or_rewrapped(monkeypatch):
     )
 
 
+async def test_invoke_returns_upstream_result_without_routing_wrapper(monkeypatch):
+    service = MCPService(SimpleNamespace())
+    server = {"name": "demo", "url": "https://mcp.example.com/api"}
+    monkeypatch.setattr(service, "_registered", AsyncMock(return_value=(server, {})))
+    monkeypatch.setattr(service, "_catalog_names", AsyncMock(return_value={"get-sum"}))
+    upstream = CallToolResult(
+        content=[TextContent(type="text", text="5")],
+        structuredContent={"value": 5},
+    )
+    session = SimpleNamespace(initialize=AsyncMock(), call_tool=AsyncMock(return_value=upstream))
+
+    @asynccontextmanager
+    async def fake_session(_server, _headers, _timeout_seconds):
+        yield session
+
+    monkeypatch.setattr(service, "_session", fake_session)
+
+    result = await service.invoke(
+        "viking://agent/tools/demo/get-sum.json",
+        {"a": 2, "b": 3},
+        _ctx(),
+    )
+
+    assert result == {
+        "content": [{"type": "text", "text": "5"}],
+        "structuredContent": {"value": 5},
+        "isError": False,
+    }
+    assert "uri" not in result
+    assert "result" not in result
+
+
 async def test_invoke_live_context_uses_definition_and_arguments(monkeypatch):
     service = MCPService(SimpleNamespace())
-    invoke = AsyncMock(return_value={"result": {"content": [{"type": "text", "text": "5.858"}]}})
+    invoke = AsyncMock(return_value={"content": [{"type": "text", "text": "5.858"}]})
     monkeypatch.setattr(service, "invoke", invoke)
     content = """---
 type: OpenViking Live Context
@@ -197,7 +229,7 @@ x-openviking:
 
     result = await service.invoke_live_context(content, _ctx())
 
-    assert result == {"result": {"content": [{"type": "text", "text": "5.858"}]}}
+    assert result == {"content": [{"type": "text", "text": "5.858"}]}
     invoke.assert_awaited_once_with(
         "viking://agent/tools/demo/get-sum.json",
         {"a": 3.14, "b": 2.718},
@@ -212,7 +244,8 @@ async def test_invoke_live_context_ignores_regular_content():
     assert await service.invoke_live_context("# Regular document", _ctx()) is None
 
 
-async def test_find_uses_semantic_search_scoped_to_mcp_tools(monkeypatch):
+@pytest.mark.parametrize("include_definition", [False, True])
+async def test_find_uses_semantic_search_scoped_to_mcp_tools(monkeypatch, include_definition):
     search = AsyncMock(
         return_value={
             "resources": [
@@ -225,21 +258,34 @@ async def test_find_uses_semantic_search_scoped_to_mcp_tools(monkeypatch):
         }
     )
     service = MCPService(SimpleNamespace(search=SimpleNamespace(find=search)))
+    definition = {
+        "name": "current",
+        "description": "Get current weather conditions",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+        "annotations": {"readOnlyHint": True},
+        "execution": {"taskSupport": "forbidden"},
+    }
     monkeypatch.setattr(
         service,
         "_tool",
         AsyncMock(
             return_value={
                 "revision": "revision-1",
-                "tool": {
-                    "name": "current",
-                    "description": "Get current weather conditions",
-                },
+                "tool": definition,
             }
         ),
     )
 
-    result = await service.find("Should I carry an umbrella?", 5, _ctx())
+    if include_definition:
+        result = await service.find(
+            "Should I carry an umbrella?", 5, _ctx(), include_definition=True
+        )
+    else:
+        result = await service.find("Should I carry an umbrella?", 5, _ctx())
 
     search.assert_awaited_once_with(
         query="Should I carry an umbrella?",
@@ -257,6 +303,7 @@ async def test_find_uses_semantic_search_scoped_to_mcp_tools(monkeypatch):
                 "description": "Get current weather conditions",
                 "revision": "revision-1",
                 "score": 0.87,
+                **({"tool": definition} if include_definition else {}),
             }
         ],
         "total": 1,

@@ -662,6 +662,8 @@ class MCPService:
         query: str,
         limit: int,
         ctx: RequestContext,
+        *,
+        include_definition: bool = False,
     ) -> dict[str, Any]:
         query = query.strip()
         if not query:
@@ -702,6 +704,8 @@ class MCPService:
                     "score": hit.get("score", 0.0),
                 }
             )
+            if include_definition:
+                results[-1]["tool"] = tool
         return {"tools": results, "total": len(results)}
 
     async def _registered(
@@ -750,8 +754,7 @@ class MCPService:
                     f"MCP tool names are not valid OpenViking filenames: {', '.join(invalid_names)}"
                 )
             existing_tools = {
-                document["tool"]["name"]: document
-                for document in await self._catalog(name, ctx)
+                document["tool"]["name"]: document for document in await self._catalog(name, ctx)
             }
             current_tools = {document["tool"]["name"]: document for document in tools}
             existing_names = set(existing_tools)
@@ -761,8 +764,7 @@ class MCPService:
             changed = sorted(
                 tool_name
                 for tool_name in existing_names & current_names
-                if existing_tools[tool_name]["revision"]
-                != current_tools[tool_name]["revision"]
+                if existing_tools[tool_name]["revision"] != current_tools[tool_name]["revision"]
             )
             unchanged = sorted((existing_names & current_names) - set(changed))
             await self._publish_catalog(
@@ -1063,9 +1065,4 @@ class MCPService:
                     "MCP tool",
                     f"call failed ({type(exc).__name__}); outcome may be unknown and was not retried",
                 ) from exc
-        return {
-            "uri": uri,
-            "server": server_name,
-            "tool": tool_name,
-            "result": result.model_dump(mode="json", by_alias=True, exclude_none=True),
-        }
+        return result.model_dump(mode="json", by_alias=True, exclude_none=True)

@@ -8,6 +8,7 @@ and service dependency, avoiding MCP protocol complexity.
 """
 
 import base64
+import json
 import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -15,7 +16,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from fastapi import FastAPI
-from mcp.types import AudioContent, ImageContent, TextContent
+from mcp.types import AudioContent, CallToolResult, ImageContent, TextContent
 from starlette.routing import Route
 
 import openviking.server.mcp_endpoint as mcp_endpoint
@@ -32,10 +33,12 @@ from openviking.server.mcp_endpoint import (
     add_skill,
     cancel_watch,
     edit,
+    find_mcp_tools,
     forget,
     glob,
     grep,
     health,
+    invoke_mcp_tool,
     list_watches,
     read,
     remember,
@@ -195,6 +198,101 @@ async def test_search_tools_expose_only_context_type_parameter():
         properties = tools[tool_name].inputSchema["properties"]
         assert "context_type" in properties
         assert "filter" not in properties
+
+
+async def test_mcp_catalog_tools_are_registered_with_conservative_annotations():
+    tools = {tool.name: tool for tool in await mcp_endpoint.mcp.list_tools()}
+
+    assert tools["find_mcp_tools"].annotations.readOnlyHint is True
+    assert tools["find_mcp_tools"].annotations.idempotentHint is True
+    assert tools["invoke_mcp_tool"].annotations.destructiveHint is True
+    assert tools["invoke_mcp_tool"].annotations.openWorldHint is True
+
+
+async def test_find_mcp_tools_delegates_to_catalog(monkeypatch):
+    definition = {
+        "name": "current",
+        "title": "Current Weather",
+        "description": "Current weather",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "City name"}},
+            "required": ["city"],
+        },
+        "annotations": {"readOnlyHint": True},
+        "execution": {"taskSupport": "forbidden"},
+    }
+    find_tools = AsyncMock(
+        return_value={
+            "tools": [
+                {
+                    "uri": "viking://agent/tools/weather/current.json",
+                    "server": "weather",
+                    "name": "current",
+                    "description": "Current weather",
+                    "revision": "revision-1",
+                    "score": 0.87,
+                    "tool": definition,
+                }
+            ],
+            "total": 1,
+        }
+    )
+    monkeypatch.setattr(
+        mcp_endpoint,
+        "get_service",
+        lambda: SimpleNamespace(mcps=SimpleNamespace(find=find_tools)),
+    )
+
+    result = await find_mcp_tools("Should I carry an umbrella?", limit=5)
+
+    find_tools.assert_awaited_once_with(
+        "Should I carry an umbrella?", 5, DEFAULT_CTX, include_definition=True
+    )
+    assert isinstance(result, CallToolResult)
+    expected = {
+        "tools": [
+            {
+                "uri": "viking://agent/tools/weather/current.json",
+                "score": 0.87,
+                "tool": definition,
+            }
+        ],
+        "total": 1,
+    }
+    assert result.structuredContent == expected
+    assert isinstance(result.content[0], TextContent)
+    assert json.loads(result.content[0].text) == expected
+
+
+async def test_invoke_mcp_tool_preserves_native_content_and_error(monkeypatch):
+    invocation = {
+        "content": [{"type": "text", "text": "upstream rejected the request"}],
+        "structuredContent": {"code": "invalid_city"},
+        "isError": True,
+    }
+    invoke = AsyncMock(return_value=invocation)
+    monkeypatch.setattr(
+        mcp_endpoint,
+        "get_service",
+        lambda: SimpleNamespace(mcps=SimpleNamespace(invoke=invoke)),
+    )
+
+    result = await invoke_mcp_tool(
+        "viking://agent/tools/weather/current.json",
+        {"city": "Atlantis"},
+    )
+
+    invoke.assert_awaited_once_with(
+        "viking://agent/tools/weather/current.json",
+        {"city": "Atlantis"},
+        DEFAULT_CTX,
+    )
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert isinstance(result.content[0], TextContent)
+    assert result.content[0].text == "upstream rejected the request"
+    assert result.structuredContent == {"code": "invalid_city"}
 
 
 async def test_recall_tool_is_replaced_by_search_context_mode():
@@ -969,6 +1067,62 @@ async def test_read_passes_offset_limit_to_visible_read(monkeypatch):
         offset=2,
         limit=2,
     )
+
+
+async def test_read_invokes_live_context_and_returns_only_upstream_result(monkeypatch):
+    content = """---
+type: OpenViking Live Context
+x-openviking:
+  type: mcp
+  definition: viking://agent/tools/weather/current.json
+  args:
+    city: Beijing
+---
+"""
+    read_visible = AsyncMock(return_value=content)
+    invoke_live_context = AsyncMock(
+        return_value={
+            "content": [{"type": "text", "text": "Sunny, 23 C"}],
+            "structuredContent": {"temperature": 23, "condition": "sunny"},
+            "isError": False,
+        }
+    )
+    monkeypatch.setattr(
+        mcp_endpoint,
+        "get_service",
+        lambda: SimpleNamespace(
+            fs=SimpleNamespace(read_visible=read_visible),
+            mcps=SimpleNamespace(invoke_live_context=invoke_live_context),
+        ),
+    )
+
+    result = await read("viking://resources/demo/weather.md")
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is False
+    assert result.structuredContent == {"temperature": 23, "condition": "sunny"}
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], TextContent)
+    assert result.content[0].text == "Sunny, 23 C"
+    invoke_live_context.assert_awaited_once_with(content, DEFAULT_CTX)
+
+
+async def test_paginated_read_does_not_invoke_live_context(monkeypatch):
+    read_visible = AsyncMock(return_value="type: OpenViking Live Context\n")
+    invoke_live_context = AsyncMock()
+    monkeypatch.setattr(
+        mcp_endpoint,
+        "get_service",
+        lambda: SimpleNamespace(
+            fs=SimpleNamespace(read_visible=read_visible),
+            mcps=SimpleNamespace(invoke_live_context=invoke_live_context),
+        ),
+    )
+
+    result = await read("viking://resources/demo/weather.md", offset=1, limit=5)
+
+    assert result == "type: OpenViking Live Context\n"
+    invoke_live_context.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

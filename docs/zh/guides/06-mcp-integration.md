@@ -121,13 +121,15 @@ claude mcp add --transport http openviking \
 
 ## 可用的 MCP 工具
 
-连接后，OpenViking MCP 端点暴露 16 个工具：
+连接后，OpenViking MCP 端点暴露 18 个工具：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
+| `find_mcp_tools` | 语义检索并按相关性返回 MCP Tool 的路由 URI、revision、score 和完整定义（含 inputSchema、annotations）。Agent 直接选择工具并填写参数，然后交给 `invoke_mcp_tool` 执行，无需额外 `read` | `query`, `limit` |
+| `invoke_mcp_tool` | 通过 OpenViking 的凭证安全代理调用已注册的上游 MCP Tool。调用不会自动重试，上游 Tool 可能产生外部副作用 | `tool_uri`, `arguments` |
 | `find` | 无 session 上下文的快速语义检索。只传 `context_type="skill"` 时改走包级 skill 检索：每个 skill 包只返回一条命中，URI 指向该包的 `SKILL.md`，摘要取自 skill 本身，即使命中的是包内辅助文件也是如此；不传 `target_uri` 时同时检索自己的 skill 和账户共享的 `viking://agent/skills`。`skill` 与其它 context_type 混用时仍走通用检索路径 | `query`, `target_uri`(可选), `limit`, `min_score`, `level`(可选), `context_type`(可选), `read_content`(可选——直接内联每条命中的内容) |
 | `search` | 深度语义检索；`mode="context"` 组装可直接注入的上下文，并替代原 `recall` 工具。`list` 模式下每个 skill 包也只出一条命中，URI 指向 `SKILL.md`、摘要取自包本身，但 `limit` 在合并之前生效，所以一个包在多个文件上命中时会占掉多个名额，返回条数少于 `limit` | `query`, `mode`（`list` 或 `context`）, `target_uri`（仅 list 模式）, `session_id`(可选), `limit`, `min_score`, `level`（list 模式）, `context_type`(可选)，以及 context 模式的 `quotas`, `purpose`, `max_tokens`, `detail` 或 `detail_by_category`, `dedup_turns`, `exclude_uris`, `peer_scope`, 标量 `other_peer_penalty` 或按类别设置的 `other_peer_penalties`, `rewrite`（`off` 或 `auto`） |
-| `read` | 读取一个或多个 `viking://` URI 的内容。PNG、JPEG、GIF、WebP 返回 MCP 原生图片内容；WAV、MP3、FLAC、OGG、M4A 返回原生音频内容。MCP 没有标准视频内容块，因此暂不支持视频 | `uris`（单个字符串或数组） |
+| `read` | 读取一个或多个 `viking://` URI。完整读取 Live Context 节点时只透明返回上游 MCP Tool 的调用结果，不附带存储描述或路由标签；分页读取才返回存储的描述文本。支持的图片和音频会返回 MCP 原生内容块 | `uris`（单个字符串或数组）, `offset`, `limit` |
 | `list` | 列出 `viking://` 目录下的条目 | `uri`, `recursive`(可选) |
 | `tree` | 以缩进形式展示 `viking://` URI 下的递归目录树——当需要全面了解文件树结构时使用（单层列表用 `list`，按文件名查找用 `glob`） | `uri`(可选), `level_limit`(默认 3), `node_limit`(默认 1000), `include_abstract`(可选——同时展示每个目录的摘要；skill 目录的摘要就是它的名字和描述) |
 | `remember` | 存储消息到长期记忆（触发记忆提取） | `messages`（`{role, content}` 列表） |

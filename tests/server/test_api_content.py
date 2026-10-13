@@ -204,10 +204,8 @@ x-openviking:
 ---
 """
     live_result = {
-        "uri": "viking://agent/tools/demo/get-sum.json",
-        "server": "demo",
-        "tool": "get-sum",
-        "result": {"content": [{"type": "text", "text": "5.858"}]},
+        "content": [{"type": "text", "text": "5.858"}],
+        "isError": False,
     }
     fs = SimpleNamespace(
         read=AsyncMock(return_value=content),
