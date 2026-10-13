@@ -37,3 +37,19 @@ export function resolveStudioManagementCapabilities({
     canManageUsers: role === 'root' || role === 'admin',
   }
 }
+
+type ManagementInput = Parameters<typeof resolveStudioManagementCapabilities>[0]
+
+export function canManageStudioGateway(input: ManagementInput): boolean {
+  return (
+    input.serverMode === 'api_key' &&
+    resolveStudioManagementCapabilities(input).canManageUsers
+  )
+}
+
+export function canEditStudioConfiguration(input: ManagementInput): boolean {
+  return (
+    (input.serverMode === 'api_key' || input.serverMode === 'trusted') &&
+    resolveStudioManagementCapabilities(input).canManageAccounts
+  )
+}

@@ -24,6 +24,7 @@ import {
   FieldLabel,
 } from '#/components/ui/field'
 import { Input } from '#/components/ui/input'
+import { canEditStudioConfiguration } from '#/lib/studio-permissions'
 import { resolveConfiguredServiceProvider } from '#/lib/studio-service'
 import { useStudioService } from '#/hooks/use-studio-service'
 import { useAppConnection } from '#/hooks/use-app-connection'
@@ -43,23 +44,51 @@ export const Route = createFileRoute('/settings')({
 
 function ConnectionSettingsRoute() {
   const { t } = useTranslation('settings')
-  const { identityScopeKey } = useAppConnection()
+  const {
+    identityScopeKey,
+    connection,
+    connectionRole,
+    isConnectionRoleLoading,
+    serverMode,
+  } = useAppConnection()
+  const service = useStudioService()
+  const canConfigure =
+    service.ready &&
+    canEditStudioConfiguration({
+      serviceProvider: service.provider,
+      hasControlCredential: Boolean(connection.adminApiKey.trim()),
+      isRoleLoading: isConnectionRoleLoading,
+      role: connectionRole,
+      serverMode,
+    })
+  const [activeTab, setActiveTab] = React.useState('connection')
+  React.useEffect(() => {
+    setActiveTab('connection')
+  }, [identityScopeKey, canConfigure])
   return (
     <div className="flex w-full min-w-0 flex-col gap-5">
       <h1 className="text-2xl font-semibold">{t('pageTitle')}</h1>
-      <Tabs defaultValue="connection" className="min-w-0 gap-5">
+      <Tabs
+        value={canConfigure ? activeTab : 'connection'}
+        onValueChange={setActiveTab}
+        className="min-w-0 gap-5"
+      >
         <TabsList variant="line">
           <TabsTrigger value="connection">{t('tabs.connection')}</TabsTrigger>
-          <TabsTrigger value="configuration">
-            {t('tabs.configuration')}
-          </TabsTrigger>
+          {canConfigure ? (
+            <TabsTrigger value="configuration">
+              {t('tabs.configuration')}
+            </TabsTrigger>
+          ) : null}
         </TabsList>
         <TabsContent value="connection">
           <ConnectionSettingsPanel />
         </TabsContent>
-        <TabsContent value="configuration" keepMounted>
-          <ServerConfigurationEditor key={identityScopeKey} />
-        </TabsContent>
+        {canConfigure ? (
+          <TabsContent value="configuration" keepMounted>
+            <ServerConfigurationEditor key={identityScopeKey} />
+          </TabsContent>
+        ) : null}
       </Tabs>
     </div>
   )

@@ -9,6 +9,7 @@ const state = vi.hoisted(() => ({
   ready: true,
   capability: 'unavailable',
   role: 'admin',
+  mode: 'api_key',
 }))
 vi.mock('@tanstack/react-router', () => ({
   useRouterState: () => state.pathname,
@@ -19,7 +20,7 @@ vi.mock('#/hooks/use-app-connection', () => ({
     connection: { adminApiKey: 'mock-admin' },
     connectionRole: state.role,
     isConnectionRoleLoading: false,
-    serverMode: 'api_key',
+    serverMode: state.mode,
   }),
 }))
 vi.mock('#/hooks/use-studio-service', () => ({
@@ -41,6 +42,7 @@ afterEach(() => {
   cleanup()
   state.provider = 'volcengine'
   state.ready = true
+  state.mode = 'api_key'
 })
 it('does not mount an incompatible extension or its effects through a deep link', () => {
   state.pathname = '/compile'
@@ -83,4 +85,31 @@ it('does not mount personal-directory requests before a custom deployment is ide
   )
   expect(screen.queryByTestId('directory child')).toBeNull()
   expect(screen.getByText('states.unknownProvider.title')).toBeTruthy()
+})
+
+it.each(['/gateway', '/gateway/upstreams/model', '/gateway/keys'])(
+  'blocks hosted Gateway deep link %s before mounting children',
+  (pathname) => {
+    state.pathname = pathname
+    render(
+      <StudioFeatureBoundary>
+        <span data-testid="gateway-child" />
+      </StudioFeatureBoundary>,
+    )
+    expect(screen.queryByTestId('gateway-child')).toBeNull()
+  },
+)
+it('explains the Gateway authentication requirement for trusted connections', () => {
+  Object.assign(state, {
+    pathname: '/gateway',
+    provider: 'opensource',
+    mode: 'trusted',
+  })
+  render(
+    <StudioFeatureBoundary>
+      <span data-testid="gateway-child" />
+    </StudioFeatureBoundary>,
+  )
+  expect(screen.queryByTestId('gateway-child')).toBeNull()
+  expect(screen.getByText('states.gatewayAuthMode.title')).toBeTruthy()
 })

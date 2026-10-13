@@ -49,6 +49,11 @@ const studio = {
   directoryDescription: '浏览自己的上下文，以及获得授权的共享资源。',
   directoryError: '无法打开目录：目录可能不存在，或当前身份没有访问权限。',
   states: {
+    gatewayAuthMode: {
+      title: 'Gateway 需要 API Key 认证模式',
+      description:
+        '请使用已验证的管理凭证连接采用 API Key 模式的开源服务。Gateway 用户绑定暂不支持 trusted 模式。',
+    },
     checking: {
       title: '正在验证可用性',
       description: '正在验证当前连接及读取能力。',

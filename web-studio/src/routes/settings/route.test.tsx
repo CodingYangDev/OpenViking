@@ -12,24 +12,39 @@ import { afterEach, expect, it, vi } from 'vitest'
 
 import { Route } from './route'
 
-const { probe, reconnect, serviceState, config } = vi.hoisted(() => ({
-  probe: vi.fn(),
-  reconnect: vi.fn(),
-  serviceState: { provider: 'opensource' },
-  config: { url: 'http://localhost:1933', selection: 'auto' },
-}))
-vi.mock('#/lib/admin', () => ({ probeStudioConnection: probe }))
-vi.mock('#/hooks/use-app-connection', () => ({
-  useAppConnection: () => ({
-    connection: {
-      baseUrl: config.url,
-      serviceSelection: config.selection,
+const { probe, reconnect, serviceState, config, connectionState } = vi.hoisted(
+  () => ({
+    connectionState: {
+      baseUrl: '',
+      serviceSelection: 'auto',
       accountId: 'account-a',
       userId: 'alice',
       adminApiKey: '',
       apiKey: '',
     },
+    probe: vi.fn(),
+    reconnect: vi.fn(),
+    serviceState: {
+      provider: 'opensource',
+      ready: true,
+      role: 'user',
+      key: '',
+    },
+    config: { url: 'http://localhost:1933', selection: 'auto' },
+  }),
+)
+vi.mock('#/lib/admin', () => ({ probeStudioConnection: probe }))
+vi.mock('#/hooks/use-app-connection', () => ({
+  useAppConnection: () => ({
+    connection: Object.assign(connectionState, {
+      baseUrl: config.url,
+      serviceSelection: config.selection,
+      adminApiKey: serviceState.key,
+    }),
     serverMode: 'trusted',
+    connectionRole: serviceState.role,
+    isConnectionRoleLoading: false,
+    identityScopeKey: 'settings-test',
     saveConnection: vi.fn(),
     reconnect,
   }),
@@ -43,13 +58,14 @@ vi.mock('react-i18next', () => ({
 vi.mock('#/hooks/use-studio-service', () => ({
   useStudioService: () => ({
     provider: serviceState.provider,
+    ready: serviceState.ready,
     version: '',
     isChecking: false,
     health: { refetch: vi.fn() },
   }),
 }))
 vi.mock('./-components/server-configuration', () => ({
-  ServerConfigurationEditor: () => null,
+  ServerConfigurationEditor: () => <span data-testid="configuration-editor" />,
 }))
 afterEach(cleanup)
 
@@ -110,4 +126,35 @@ it('keeps management credentials editable after authentication fails and retries
   serviceState.provider = 'opensource'
   config.url = 'http://localhost:1933'
   config.selection = 'auto'
+})
+
+it('unmounts the configuration editor and resets the active tab when switching to a hosted connection', async () => {
+  Object.assign(serviceState, {
+    provider: 'opensource',
+    ready: true,
+    role: 'root',
+    key: 'root-key',
+  })
+  probe.mockResolvedValue({ admin: { state: 'ok' }, data: { state: 'ok' } })
+  const client = new QueryClient()
+  const Settings = Route.options.component as ComponentType
+  const content = () => (
+    <QueryClientProvider client={client}>
+      <Settings />
+    </QueryClientProvider>
+  )
+  const view = render(content())
+  fireEvent.click(screen.getByRole('tab', { name: 'tabs.configuration' }))
+  expect(await screen.findByTestId('configuration-editor')).toBeTruthy()
+  serviceState.provider = 'volcengine'
+  view.rerender(content())
+  expect(screen.queryByRole('tab', { name: 'tabs.configuration' })).toBeNull()
+  expect(screen.queryByTestId('configuration-editor')).toBeNull()
+  expect(
+    screen
+      .getByRole('tab', { name: 'tabs.connection' })
+      .getAttribute('aria-selected'),
+  ).toBe('true')
+  client.clear()
+  Object.assign(serviceState, { provider: 'opensource', role: 'user', key: '' })
 })

@@ -49,6 +49,9 @@ vi.mock('react-i18next', () => ({
   }),
 }))
 vi.mock('sonner', () => ({ toast }))
+vi.mock('#/hooks/use-studio-service', () => ({
+  useStudioService: () => ({ provider: 'opensource', ready: true }),
+}))
 vi.mock('#/hooks/use-app-connection', () => ({
   useAppConnection: () => ({
     connection: {

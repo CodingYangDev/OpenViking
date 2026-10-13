@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { resolveStudioManagementCapabilities } from './studio-permissions'
+import {
+  canEditStudioConfiguration,
+  canManageStudioGateway,
+  resolveStudioManagementCapabilities,
+} from './studio-permissions'
 
 describe('resolveStudioManagementCapabilities', () => {
   it('allows a validated root control credential to manage accounts and users', () => {
@@ -72,4 +76,33 @@ describe('resolveStudioManagementCapabilities', () => {
       canManageUsers: false,
     })
   })
+})
+
+describe('new management feature permissions', () => {
+  const input = {
+    serviceProvider: 'opensource' as const,
+    hasControlCredential: true,
+    isRoleLoading: false,
+    role: 'root' as const,
+    serverMode: 'api_key' as const,
+  }
+  it('keeps Gateway API-key-only while configuration supports authenticated trusted ROOT', () => {
+    expect(canManageStudioGateway(input)).toBe(true)
+    expect(canManageStudioGateway({ ...input, serverMode: 'trusted' })).toBe(
+      false,
+    )
+    expect(
+      canEditStudioConfiguration({ ...input, serverMode: 'trusted' }),
+    ).toBe(true)
+    expect(canEditStudioConfiguration({ ...input, role: 'admin' })).toBe(false)
+  })
+  it.each(['volcengine', 'unknown'] as const)(
+    'never grants %s connections native management',
+    (serviceProvider) => {
+      expect(canManageStudioGateway({ ...input, serviceProvider })).toBe(false)
+      expect(canEditStudioConfiguration({ ...input, serviceProvider })).toBe(
+        false,
+      )
+    },
+  )
 })

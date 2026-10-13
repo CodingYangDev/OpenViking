@@ -39,6 +39,9 @@ vi.mock('react-i18next', () => ({
     i18n: { resolvedLanguage: 'en' },
   }),
 }))
+vi.mock('#/hooks/use-studio-service', () => ({
+  useStudioService: () => ({ provider: 'opensource', ready: true }),
+}))
 vi.mock('#/hooks/use-app-connection', () => ({
   useAppConnection: () => ({
     connection: {

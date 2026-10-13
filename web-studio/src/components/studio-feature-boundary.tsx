@@ -6,7 +6,10 @@ import { useAppConnection } from '#/hooks/use-app-connection'
 import { useStudioService } from '#/hooks/use-studio-service'
 import { featureForPath } from '#/lib/studio-service'
 import { useStudioCapabilities } from '#/hooks/use-studio-capabilities'
-import { resolveStudioManagementCapabilities } from '#/lib/studio-permissions'
+import {
+  canManageStudioGateway,
+  resolveStudioManagementCapabilities,
+} from '#/lib/studio-permissions'
 
 export function StudioFeatureBoundary({ children }: { children: ReactNode }) {
   const { t } = useTranslation('studio')
@@ -33,7 +36,24 @@ export function StudioFeatureBoundary({ children }: { children: ReactNode }) {
       role: connectionRole,
       serverMode,
     })
-    if (!permissions.canManageUsers) reason = 'managementRequired'
+    if (
+      feature.id === 'gateway' &&
+      service.provider === 'opensource' &&
+      serverMode !== 'api_key'
+    )
+      reason = 'gatewayAuthMode'
+    else if (
+      feature.id === 'gateway'
+        ? !canManageStudioGateway({
+            serviceProvider: service.provider,
+            hasControlCredential: Boolean(connection.adminApiKey.trim()),
+            isRoleLoading: isConnectionRoleLoading,
+            role: connectionRole,
+            serverMode,
+          })
+        : !permissions.canManageUsers
+    )
+      reason = 'managementRequired'
   } else if (pathname.startsWith('/oauth') && service.provider !== 'opensource')
     reason = 'unavailable'
   else if (

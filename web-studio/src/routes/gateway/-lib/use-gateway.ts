@@ -3,8 +3,9 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { UseQueryOptions } from '@tanstack/react-query'
 
 import { useAppConnection } from '#/hooks/use-app-connection'
+import { useStudioService } from '#/hooks/use-studio-service'
 import type { AdminConnection } from '#/lib/admin'
-import { resolveStudioManagementCapabilities } from '#/lib/studio-permissions'
+import { canManageStudioGateway } from '#/lib/studio-permissions'
 
 import {
   getConnectionInfo,
@@ -79,12 +80,16 @@ export function useGateway() {
   const { connection, connectionRole, isConnectionRoleLoading, serverMode } =
     useAppConnection()
   const { baseUrl, accountId, userId, adminApiKey } = connection
-  const { canManageUsers } = resolveStudioManagementCapabilities({
-    hasControlCredential: Boolean(adminApiKey.trim()),
-    isRoleLoading: isConnectionRoleLoading,
-    role: connectionRole,
-    serverMode,
-  })
+  const service = useStudioService()
+  const allowed =
+    service.ready &&
+    canManageStudioGateway({
+      serviceProvider: service.provider,
+      hasControlCredential: Boolean(adminApiKey.trim()),
+      isRoleLoading: isConnectionRoleLoading,
+      role: connectionRole,
+      serverMode,
+    })
   const admin = useMemo<AdminConnection>(
     () => ({ baseUrl, accountId, userId, apiKey: adminApiKey }),
     [baseUrl, accountId, userId, adminApiKey],
@@ -106,7 +111,7 @@ export function useGateway() {
     [queryClient, scope],
   )
   return {
-    allowed: canManageUsers,
+    allowed,
     /** OpenViking runs in development mode, where Studio can't manage the gateway. */
     devMode: serverMode === 'dev',
     isRoleLoading: isConnectionRoleLoading,
@@ -134,7 +139,11 @@ function useGatewayQuery<T>(
   return useQuery<T, GatewayError>({
     ...options,
     queryKey: gatewayQueryKey(scope, resource, ...params),
-    queryFn: () => load(connection),
+    queryFn: () => {
+      if (!allowed)
+        throw new Error('Gateway management is unavailable for this connection')
+      return load(connection)
+    },
     enabled: allowed && options.enabled !== false,
   })
 }

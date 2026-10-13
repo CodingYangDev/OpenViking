@@ -14,7 +14,12 @@ import {
   useUpstreams,
 } from './use-gateway'
 
-const state = vi.hoisted(() => ({ role: 'admin' }))
+const state = vi.hoisted(() => ({
+  role: 'admin',
+  provider: 'opensource',
+  ready: true,
+  mode: 'api_key',
+}))
 const api = vi.hoisted(() => ({
   listUpstreams: vi.fn(),
   listLogs: vi.fn(),
@@ -32,8 +37,11 @@ vi.mock('#/hooks/use-app-connection', () => ({
     },
     connectionRole: state.role,
     isConnectionRoleLoading: false,
-    serverMode: 'api_key',
+    serverMode: state.mode,
   }),
+}))
+vi.mock('#/hooks/use-studio-service', () => ({
+  useStudioService: () => ({ provider: state.provider, ready: state.ready }),
 }))
 vi.mock('./api', async (importOriginal) => ({
   ...(await importOriginal<typeof Api>()),
@@ -50,6 +58,9 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
 beforeEach(() => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   state.role = 'admin'
+  state.provider = 'opensource'
+  state.ready = true
+  state.mode = 'api_key'
   api.listUpstreams.mockReset()
   api.listLogs.mockReset()
   api.listTools.mockReset()
@@ -139,3 +150,24 @@ it('loads resources with the admin connection and invalidates by resource', asyn
   await result.current.gateway.invalidate()
   expect(api.listLogs).toHaveBeenCalledTimes(2)
 })
+
+it.each([
+  ['volcengine', 'api_key', true],
+  ['unknown', 'api_key', true],
+  ['opensource', 'trusted', true],
+  ['opensource', 'dev', true],
+  ['opensource', 'api_key', false],
+])(
+  'blocks Gateway requests for %s/%s (ready: %s), including manual retries',
+  async (provider, mode, ready) => {
+    Object.assign(state, { provider, mode, ready, role: 'root' })
+    const { result } = renderHook(
+      () => ({ gateway: useGateway(), tools: useTools() }),
+      { wrapper },
+    )
+    expect(result.current.gateway.allowed).toBe(false)
+    expect(result.current.tools.fetchStatus).toBe('idle')
+    await result.current.tools.refetch()
+    expect(api.listTools).not.toHaveBeenCalled()
+  },
+)

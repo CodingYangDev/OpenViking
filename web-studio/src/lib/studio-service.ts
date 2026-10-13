@@ -69,6 +69,7 @@ export const STUDIO_FEATURES = [
     to: '/monitoring',
     probe: '/api/v1/observer/system',
   },
+  { id: 'gateway', domain: 'management', to: '/gateway' },
   { id: 'users', domain: 'management', to: '/users' },
   { id: 'permissions', domain: 'management', to: '/permissions' },
 ] as const satisfies ReadonlyArray<{

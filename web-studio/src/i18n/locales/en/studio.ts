@@ -60,6 +60,11 @@ const studio = {
   directoryError:
     'Unable to open this directory. It may be missing or inaccessible to your identity.',
   states: {
+    gatewayAuthMode: {
+      title: 'Gateway requires API key authentication',
+      description:
+        'Connect to an open-source service in API key mode using a verified management key. Trusted mode is not supported by Gateway user binding.',
+    },
     checking: {
       title: 'Checking availability',
       description: 'Verifying this connection and its read capabilities.',

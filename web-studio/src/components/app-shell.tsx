@@ -68,7 +68,10 @@ import { featureForPath, isStudioFeatureVisible } from '#/lib/studio-service'
 import { resolveDomainDestination } from '#/lib/studio-navigation'
 import type { StudioDomain } from '#/lib/studio-service'
 import { StudioFeatureBoundary } from './studio-feature-boundary'
-import { resolveStudioManagementCapabilities } from '#/lib/studio-permissions'
+import {
+  canManageStudioGateway,
+  resolveStudioManagementCapabilities,
+} from '#/lib/studio-permissions'
 
 type NavItem = {
   icon: React.ComponentType
@@ -319,7 +322,8 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   const settingsActive = pathname === '/settings'
   const gatewayActive =
     pathname === '/gateway' || pathname.startsWith('/gateway/')
-  const { provider } = useStudioService()
+  const service = useStudioService()
+  const { provider } = service
   const sdkApiHref =
     provider === 'volcengine'
       ? 'https://docs.volcengine.com/docs/84313/2381937'
@@ -331,9 +335,17 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     role: connectionRole,
     serverMode,
   })
+  const canManageGateway =
+    service.ready &&
+    canManageStudioGateway({
+      serviceProvider: provider,
+      hasControlCredential: Boolean(connection.adminApiKey.trim()),
+      isRoleLoading: isConnectionRoleLoading,
+      role: connectionRole,
+      serverMode,
+    })
   const crossDeviceVerifyActive =
     pathname === '/oauth/verify' || pathname.startsWith('/oauth/verify/')
-  const service = useStudioService()
   const activeDomain = featureForPath(pathname)?.domain ?? 'workspace'
   const capabilities = useStudioCapabilities()
   const availableNavItems = NAV_ITEMS.filter((item) => {
@@ -478,7 +490,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                     <span>{t('footer.connection', { ns: 'appShell' })}</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
-                {provider === 'opensource' && canManageUsers ? (
+                {canManageGateway ? (
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       render={<Link to="/gateway" />}

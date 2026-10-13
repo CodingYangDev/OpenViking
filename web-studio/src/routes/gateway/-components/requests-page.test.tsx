@@ -43,6 +43,9 @@ const api = vi.hoisted(() => ({
 }))
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }))
 
+vi.mock('#/hooks/use-studio-service', () => ({
+  useStudioService: () => ({ provider: 'opensource', ready: true }),
+}))
 vi.mock('#/hooks/use-app-connection', () => ({
   useAppConnection: () => ({
     connection: {
