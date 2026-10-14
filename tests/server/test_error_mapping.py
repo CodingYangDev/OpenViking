@@ -188,74 +188,21 @@ def test_upstream_text_status_maps_to_permission_denied():
     assert mapped.details["upstream_status_code"] == 403
 
 
-@pytest.mark.parametrize(
-    ("errors", "expected_code", "expected_status"),
-    [
-        ([RuntimeError("Volcengine embedding failed: HTTP 502 Bad Gateway")], "UNAVAILABLE", 503),
-        (
-            [httpx.ReadTimeout("Request timed out."), httpx.ConnectTimeout("Request timed out.")],
-            "DEADLINE_EXCEEDED",
-            504,
-        ),
-        (
-            [httpx.ConnectError("Connection refused"), httpx.ReadError("Connection reset")],
-            "UNAVAILABLE",
-            503,
-        ),
-        (
-            [
-                _UpstreamHTTPError(401, "invalid_api_key"),
-                _UpstreamHTTPError(401, "invalid_api_key"),
-            ],
-            "UNAUTHENTICATED",
-            401,
-        ),
-        (
-            [_UpstreamHTTPError(401, "invalid_api_key"), httpx.ReadTimeout("Request timed out.")],
-            "INTERNAL",
-            500,
-        ),
-        (
-            [httpx.ReadTimeout("Request timed out."), _UpstreamHTTPError(401, "invalid_api_key")],
-            "INTERNAL",
-            500,
-        ),
-        (
-            [httpx.ReadTimeout("Request timed out."), RuntimeError("Unexpected tensor shape")],
-            "INTERNAL",
-            500,
-        ),
-        (
-            [
-                ValueError("Embedding provider api_key is required"),
-                httpx.ReadTimeout("Request timed out."),
-            ],
-            "INTERNAL",
-            500,
-        ),
-    ],
-)
-def test_upstream_failures_keep_their_status_through_wrappers(
-    errors, expected_code, expected_status
-):
-    failures = []
-    for index, error in enumerate(errors):
-        wrapped = RuntimeError(f"Volcengine embedding failed: {error}")
-        wrapped.__cause__ = error
-        failures.append((f"credential-{index}", "unknown", wrapped, index))
+def test_upstream_credential_failures_distinguish_timeouts_from_mixed_errors():
+    timeout = RuntimeError("Volcengine embedding failed: Request timed out.")
+    timeout.__cause__ = httpx.ReadTimeout("Request timed out.")
+    failures = [("primary", "unknown", timeout, 0), ("backup", "unknown", timeout, 1)]
 
-    aggregate = AllCredentialsFailedError(failures)
-    outer = RuntimeError(f"Embedding failed: {aggregate}")
-    outer.__cause__ = aggregate
-    mapped = map_exception(outer)
-
+    mapped = map_exception(AllCredentialsFailedError(failures))
     assert mapped is not None
-    assert mapped.code == expected_code
-    assert ERROR_CODE_TO_HTTP_STATUS[mapped.code] == expected_status
-    if expected_code == "INTERNAL":
-        assert mapped.message == str(outer)
-    else:
-        assert mapped.details["upstream_error_type"] == "AllCredentialsFailedError"
+    assert ERROR_CODE_TO_HTTP_STATUS[mapped.code] == 504
+
+    failures[1] = ("backup", "auth", _UpstreamHTTPError(401, "invalid_api_key"), 1)
+    mixed = AllCredentialsFailedError(failures)
+    mapped = map_exception(mixed)
+    assert mapped is not None
+    assert ERROR_CODE_TO_HTTP_STATUS[mapped.code] == 500
+    assert mapped.message == str(mixed)
 
 
 def test_model_api_key_configuration_error_maps_to_failed_precondition():

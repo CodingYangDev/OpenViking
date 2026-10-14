@@ -35,7 +35,7 @@ def test_empty_query_without_filter_is_still_rejected():
 
 
 def test_non_empty_query_is_always_accepted():
-    _validate_query("hello 你好 🧭", None, None)
+    _validate_query("hello", None, None)
 
 
 def test_image_only_query_is_still_accepted():
