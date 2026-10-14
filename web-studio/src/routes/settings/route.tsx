@@ -316,13 +316,40 @@ function ConnectionSettingsPanel() {
   const { connection, reconnect, saveConnection, serverMode, serverHealth } =
     useAppConnection()
   const [draft, setDraft] = React.useState<ConnectionDraft>(connection)
+  const previousConnectionRef = React.useRef({ ...connection })
   const [saveError, setSaveError] = React.useState(false)
   const canEditControlCredential =
     resolveConfiguredServiceProvider(draft.baseUrl, draft.serviceSelection) ===
     'opensource'
   React.useEffect(() => {
-    setDraft(connection)
-    setSaveError(false)
+    const previous = previousConnectionRef.current
+    previousConnectionRef.current = { ...connection }
+    if (
+      previous.baseUrl !== connection.baseUrl ||
+      previous.serviceSelection !== connection.serviceSelection ||
+      previous.apiKey !== connection.apiKey ||
+      previous.adminApiKey !== connection.adminApiKey
+    ) {
+      setDraft(connection)
+      setSaveError(false)
+    } else if (
+      previous.accountId !== connection.accountId ||
+      previous.userId !== connection.userId
+    ) {
+      // Health may fill in identity while the user edits a recovery address/key.
+      // Update untouched identity fields without replacing the in-progress form.
+      setDraft((current) => ({
+        ...current,
+        accountId:
+          current.accountId === previous.accountId
+            ? connection.accountId
+            : current.accountId,
+        userId:
+          current.userId === previous.userId
+            ? connection.userId
+            : current.userId,
+      }))
+    }
   }, [connection])
 
   function updateDraft(next: Partial<ConnectionDraft>): void {

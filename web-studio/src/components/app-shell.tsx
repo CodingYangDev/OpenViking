@@ -336,13 +336,14 @@ export function IdentityScopedAppShell({
 }: {
   children: React.ReactNode
 }) {
-  const { identityScopeKey, serverMode } = useAppConnection()
+  const { identityScopeKey, activeProfileId, serverMode } = useAppConnection()
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
   })
-  // Settings must stay reachable while a saved service is being checked.
-  if (serverMode === 'checking' && pathname === '/settings') return children
-  if (serverMode === 'checking')
+  const isSettings = pathname === '/settings'
+  // Keep the settings tree stable across health transitions, but reset it when
+  // an actual profile changes. Business routes retain identity isolation.
+  if (serverMode === 'checking' && !isSettings)
     return (
       <div
         role="status"
@@ -359,10 +360,16 @@ export function IdentityScopedAppShell({
       </div>
     )
   return (
-    <AppShellInner key={identityScopeKey}>
-      <ConnectionScopedRouteContent serverMode={serverMode}>
-        <StudioFeatureBoundary>{children}</StudioFeatureBoundary>
-      </ConnectionScopedRouteContent>
+    <AppShellInner
+      key={isSettings ? `settings:${activeProfileId}` : identityScopeKey}
+    >
+      {isSettings ? (
+        children
+      ) : (
+        <ConnectionScopedRouteContent serverMode={serverMode}>
+          <StudioFeatureBoundary>{children}</StudioFeatureBoundary>
+        </ConnectionScopedRouteContent>
+      )}
     </AppShellInner>
   )
 }

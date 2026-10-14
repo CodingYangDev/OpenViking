@@ -44,11 +44,13 @@ const {
 vi.mock('#/lib/admin', () => ({ probeStudioConnection: probe }))
 vi.mock('#/hooks/use-app-connection', () => ({
   useAppConnection: () => ({
-    connection: Object.assign(connectionState, {
-      baseUrl: config.url,
-      serviceSelection: config.selection,
-      adminApiKey: serviceState.key,
-    }),
+    connection: {
+      ...Object.assign(connectionState, {
+        baseUrl: config.url,
+        serviceSelection: config.selection,
+        adminApiKey: serviceState.key,
+      }),
+    },
     serverMode: 'trusted',
     serverHealth: healthState.value,
     connectionRole: serviceState.role,
@@ -237,4 +239,43 @@ it('unmounts the configuration editor and resets the active tab when switching t
   ).toBe('true')
   client.clear()
   Object.assign(serviceState, { provider: 'opensource', role: 'user', key: '' })
+})
+
+it('preserves an edited URL and user key while health fills in identity', async () => {
+  const originalIdentity = {
+    accountId: connectionState.accountId,
+    userId: connectionState.userId,
+  }
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const Settings = Route.options.component as ComponentType
+  const content = () => (
+    <QueryClientProvider client={client}>
+      <Settings />
+    </QueryClientProvider>
+  )
+  const view = render(content())
+  const url = screen.getByLabelText<HTMLInputElement>('fields.baseUrl')
+  const key = document.getElementById(
+    'settings-user-api-key',
+  ) as HTMLInputElement
+  fireEvent.change(url, { target: { value: 'http://recovery.test' } })
+  fireEvent.change(key, { target: { value: 'synthetic-draft' } })
+  connectionState.accountId = 'resolved-account'
+  connectionState.userId = 'resolved-user'
+  view.rerender(content())
+  expect(url.value).toBe('http://recovery.test')
+  expect(key.value).toBe('synthetic-draft')
+  fireEvent.click(screen.getByRole('button', { name: 'studio:profiles.save' }))
+  expect(saveConnection).toHaveBeenCalledWith(
+    expect.objectContaining({
+      baseUrl: 'http://recovery.test',
+      apiKey: 'synthetic-draft',
+      accountId: 'resolved-account',
+      userId: 'resolved-user',
+    }),
+  )
+  Object.assign(connectionState, originalIdentity)
+  client.clear()
 })
