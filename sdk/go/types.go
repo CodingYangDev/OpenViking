@@ -158,6 +158,7 @@ type MountMCPToolOptions struct {
 	Description    *string
 	TimeoutSeconds int
 	Arguments      map[string]any
+	Tags           []string
 }
 
 // WaitProcessedOptions controls WaitProcessed.

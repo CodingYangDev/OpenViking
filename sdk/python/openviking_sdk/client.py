@@ -10,7 +10,7 @@ import os
 import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Type, Union
 from urllib.parse import quote
 
 import httpx
@@ -1028,18 +1028,22 @@ class AsyncHTTPClient:
         description: Optional[str] = None,
         timeout_seconds: int = 60,
         arguments: Optional[Mapping[str, Any]] = None,
+        tags: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "tool_uri": VikingURI.normalize(tool_uri),
+            "node_uri": VikingURI.normalize(node_uri),
+            "title": title,
+            "description": description,
+            "timeout_seconds": timeout_seconds,
+            "arguments": dict(arguments or {}),
+        }
+        if tags is not None:
+            payload["tags"] = list(tags)
         response = await self._request(
             "POST",
             "/api/v1/mcps/mount",
-            json={
-                "tool_uri": VikingURI.normalize(tool_uri),
-                "node_uri": VikingURI.normalize(node_uri),
-                "title": title,
-                "description": description,
-                "timeout_seconds": timeout_seconds,
-                "arguments": dict(arguments or {}),
-            },
+            json=payload,
         )
         return self._handle_response(response)
 
@@ -2654,6 +2658,7 @@ class SyncHTTPClient:
         description: Optional[str] = None,
         timeout_seconds: int = 60,
         arguments: Optional[Mapping[str, Any]] = None,
+        tags: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         return run_async(
             self._async_client.mount_mcp_tool(
@@ -2663,6 +2668,7 @@ class SyncHTTPClient:
                 description=description,
                 timeout_seconds=timeout_seconds,
                 arguments=arguments,
+                tags=tags,
             )
         )
 

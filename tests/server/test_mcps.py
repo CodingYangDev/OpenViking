@@ -402,6 +402,7 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
         60,
         {"city": "Beijing"},
         _ctx(),
+        tags=["project=demo", "kind=live-context"],
     )
 
     assert mounted["mounted"] is True
@@ -422,6 +423,7 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
         ctx=_ctx(),
         mode="replace",
         wait=True,
+        tags=["project=demo", "kind=live-context"],
     )
 
     database = stored["/local/account-1/_system/live_context_nodes.dat"]
@@ -769,6 +771,7 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
                 "description": "Current weather in Beijing",
                 "timeout_seconds": 120,
                 "arguments": {"city": "Beijing"},
+                "tags": ["project=demo"],
             },
         ),
         (
@@ -784,3 +787,13 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
             assert response.status_code == 200, response.text
 
     assert all(mock.await_count == 1 for mock in methods.values())
+    methods["mount"].assert_awaited_once_with(
+        "viking://agent/tools/demo/current.json",
+        "viking://resources/demo/current.md",
+        "Current Weather",
+        "Current weather in Beijing",
+        120,
+        {"city": "Beijing"},
+        _ctx(),
+        tags=["project=demo"],
+    )

@@ -104,6 +104,7 @@ func (c *Client) InvokeMCPTool(ctx context.Context, toolURI string, arguments ma
 func (c *Client) MountMCPTool(ctx context.Context, toolURI string, nodeURI string, title string, opts *MountMCPToolOptions) (map[string]any, error) {
 	timeoutSeconds := 60
 	arguments := map[string]any{}
+	var tags []string
 	var description *string
 	if opts != nil {
 		description = opts.Description
@@ -113,6 +114,7 @@ func (c *Client) MountMCPTool(ctx context.Context, toolURI string, nodeURI strin
 		if opts.Arguments != nil {
 			arguments = opts.Arguments
 		}
+		tags = opts.Tags
 	}
 	payload := map[string]any{
 		"tool_uri":        NormalizeURI(toolURI),
@@ -121,6 +123,9 @@ func (c *Client) MountMCPTool(ctx context.Context, toolURI string, nodeURI strin
 		"description":     description,
 		"timeout_seconds": timeoutSeconds,
 		"arguments":       arguments,
+	}
+	if tags != nil {
+		payload["tags"] = tags
 	}
 	var result map[string]any
 	err := c.doJSON(ctx, http.MethodPost, "/api/v1/mcps/mount", nil, payload, &result)

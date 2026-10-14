@@ -1,5 +1,5 @@
 use crate::client::HttpClient;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::output::OutputFormat;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -146,12 +146,18 @@ fn create_download_target(path: &Path, local_path: &str) -> Result<std::fs::File
 }
 
 fn output_content_result(result: Value, output_format: OutputFormat, compact: bool) -> Result<()> {
+    if let Some(is_error) = crate::output::output_tool_result(&result, output_format, compact) {
+        return if is_error {
+            Err(Error::AlreadyReported)
+        } else {
+            Ok(())
+        };
+    }
+
     match output_format {
         OutputFormat::Json => crate::output::output_success(result, output_format, compact),
         OutputFormat::Table => {
-            if let Some(rendered) = render_live_context_text(&result) {
-                println!("{rendered}");
-            } else if let Some(rendered) = crate::output::render_profiled_scalar_result(&result) {
+            if let Some(rendered) = crate::output::render_profiled_scalar_result(&result) {
                 println!("{}", rendered);
             } else if let Some(content) = result.as_str() {
                 println!("{}", content);
@@ -161,26 +167,6 @@ fn output_content_result(result: Value, output_format: OutputFormat, compact: bo
         }
     }
     Ok(())
-}
-
-fn render_live_context_text(result: &Value) -> Option<String> {
-    let call_result = result.get("result")?.as_object()?;
-    if call_result.get("structuredContent").is_some() {
-        return None;
-    }
-    let content = call_result.get("content")?.as_array()?;
-    if content.is_empty() {
-        return None;
-    }
-    let mut texts = Vec::with_capacity(content.len());
-    for item in content {
-        let item = item.as_object()?;
-        if item.get("type").and_then(Value::as_str) != Some("text") {
-            return None;
-        }
-        texts.push(item.get("text")?.as_str()?);
-    }
-    Some(texts.join("\n"))
 }
 
 fn output_set_tags_result(result: Value, output_format: OutputFormat, compact: bool) {
@@ -252,7 +238,6 @@ fn render_set_tags_result_for_table(result: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::render_live_context_text;
     use crate::error::Error;
     use serde_json::json;
 
@@ -273,38 +258,6 @@ mod tests {
             output.push(ch);
         }
         output
-    }
-
-    #[test]
-    fn live_context_read_renders_text_tool_results_as_content() {
-        let result = json!({
-            "uri": "viking://agent/tools/demo/get-sum.json",
-            "server": "demo",
-            "tool": "get-sum",
-            "result": {
-                "content": [
-                    {"type": "text", "text": "5.858"},
-                    {"type": "text", "text": "calculated live"}
-                ]
-            }
-        });
-
-        assert_eq!(
-            render_live_context_text(&result).as_deref(),
-            Some("5.858\ncalculated live")
-        );
-    }
-
-    #[test]
-    fn live_context_read_keeps_structured_results_for_generic_rendering() {
-        let result = json!({
-            "result": {
-                "content": [{"type": "text", "text": "5.858"}],
-                "structuredContent": {"sum": 5.858}
-            }
-        });
-
-        assert!(render_live_context_text(&result).is_none());
     }
 
     #[test]

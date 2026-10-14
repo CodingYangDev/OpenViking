@@ -972,6 +972,7 @@ describe("OpenVikingClient", () => {
         description: "Current weather in Beijing",
         timeoutSeconds: 120,
         arguments: { city: "Beijing" },
+        tags: ["project=demo", "kind=live-context"],
       },
     );
     await client.unmountMCPTool("resources/demo/weather.md");
@@ -1022,6 +1023,7 @@ describe("OpenVikingClient", () => {
       description: "Current weather in Beijing",
       timeout_seconds: 120,
       arguments: { city: "Beijing" },
+      tags: ["project=demo", "kind=live-context"],
     });
     expect(
       new URL(String(fetcher.mock.calls[7]![0])).searchParams.get("name"),

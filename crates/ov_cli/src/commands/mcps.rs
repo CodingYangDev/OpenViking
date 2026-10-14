@@ -590,8 +590,14 @@ pub async fn invoke(
             &json!({"uri": uri, "arguments": arguments}),
         )
         .await?;
-    print_response(&response, output_format, compact);
-    Ok(())
+    match crate::output::output_tool_result(&response, output_format, compact) {
+        Some(true) => Err(Error::AlreadyReported),
+        Some(false) => Ok(()),
+        None => {
+            print_response(&response, output_format, compact);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

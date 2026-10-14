@@ -82,6 +82,7 @@ export interface MountMCPToolOptions {
   description?: string;
   timeoutSeconds?: number;
   arguments?: JsonObject;
+  tags?: string[];
 }
 /** One live context mount affected by an MCP catalog sync. */
 export interface MCPAffectedMount {

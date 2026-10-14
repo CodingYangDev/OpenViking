@@ -428,6 +428,7 @@ async def set_acl(uri: str, acl: AclSpec) -> dict[str, Any]:
     )
 
 
+# -- find_mcp_tools / invoke_mcp_tool ---------------------------------------------------------
 
 @_mcp_error_results(structured_output=False)
 @mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS, structured_output=False)

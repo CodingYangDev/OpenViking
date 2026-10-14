@@ -375,6 +375,7 @@ export class OpenVikingClient {
         description: options.description,
         timeout_seconds: options.timeoutSeconds ?? 60,
         arguments: options.arguments ?? {},
+        tags: options.tags,
       }),
     });
   }

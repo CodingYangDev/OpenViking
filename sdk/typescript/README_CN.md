@@ -77,6 +77,7 @@ const mounted = await client.mountMCPTool(
     description: "北京区域的实时天气。",
     timeoutSeconds: 60,
     arguments: { city: "Beijing" },
+    tags: ["project=weather", "kind=live-context"],
   },
 );
 const syncResult = await client.syncMCP("weather");

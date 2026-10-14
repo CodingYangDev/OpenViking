@@ -830,6 +830,8 @@ class MCPService:
         timeout_seconds: int,
         arguments: dict[str, Any],
         ctx: RequestContext,
+        *,
+        tags: list[str] | None = None,
     ) -> dict[str, Any]:
         if not title.strip():
             raise InvalidArgumentError("Live context node title must not be empty")
@@ -866,6 +868,7 @@ class MCPService:
                     ctx=ctx,
                     mode="replace",
                     wait=True,
+                    tags=tags,
                 )
                 connection.execute(
                     """

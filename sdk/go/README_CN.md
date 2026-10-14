@@ -153,6 +153,7 @@ mounted, err := client.MountMCPTool(
         Description:    openviking.String("北京区域的实时天气。"),
         TimeoutSeconds: 60,
         Arguments:      map[string]any{"city": "Beijing"},
+        Tags:           []string{"project=weather", "kind=live-context"},
     },
 )
 syncResult, err := client.SyncMCP(ctx, "weather")

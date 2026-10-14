@@ -48,7 +48,7 @@ class FakeClient:
         self.calls.append(("mount", tool_uri, node_uri, title, kwargs))
         self.entries[node_uri] = {
             "isDir": False,
-            "tags": [],
+            "tags": list(kwargs.get("tags") or []),
             "tool_uri": tool_uri,
             "arguments": dict(kwargs["arguments"]),
         }
@@ -90,17 +90,6 @@ class FakeClient:
         self.entries.pop(uri, None)
 
 
-class FailingTagClient(FakeClient):
-    async def set_tags(
-        self,
-        uri: str,
-        tags: list[str],
-        *,
-        mode: str,
-    ) -> dict[str, Any]:
-        raise RuntimeError("tag write failed")
-
-
 def declare_alerts(project: Any, *, service: str = "api") -> None:
     project.live_context(
         "alerts.md",
@@ -136,7 +125,7 @@ async def test_async_project_converges_live_context() -> None:
 
     result = await project.apply()
     assert len(result.applied) == 1
-    assert [call[0] for call in client.calls] == ["mount", "set_tags"]
+    assert [call[0] for call in client.calls] == ["mount"]
     assert project.owner_tag in client.entries[
         "viking://resources/ops/alerts.md"
     ]["tags"]
@@ -265,16 +254,17 @@ async def test_plan_detects_live_mount_drift() -> None:
 
 
 @pytest.mark.asyncio
-async def test_new_live_context_rolls_back_when_ownership_tagging_fails() -> None:
-    client = FailingTagClient()
+async def test_new_live_context_mounts_with_ownership_tags() -> None:
+    client = FakeClient()
     project = AsyncContextArranger(client, "demo", "resources/demo")
     declare_alerts(project)
 
-    with pytest.raises(RuntimeError, match="tag write failed"):
-        await project.apply()
+    await project.apply()
 
-    assert "viking://resources/demo/alerts.md" not in client.entries
-    assert client.calls[-1] == ("unmount", "viking://resources/demo/alerts.md")
+    mount_call = client.calls[-1]
+    assert mount_call[0] == "mount"
+    assert project.owner_tag in mount_call[4]["tags"]
+    assert "ov-cac-kind=live_context" in mount_call[4]["tags"]
 
 
 def test_sync_project_uses_the_same_declaration_and_plan_model() -> None:

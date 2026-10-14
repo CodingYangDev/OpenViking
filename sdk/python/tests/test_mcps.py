@@ -38,6 +38,7 @@ async def test_async_http_client_exposes_all_mcp_operations():
         description="Current weather in Beijing",
         timeout_seconds=120,
         arguments={"city": "Beijing"},
+        tags=["project=demo", "kind=live-context"],
     )
     await client.unmount_mcp_tool("resources/demo/weather.md")
     await client.list_mcp_mounts("demo", tool="current")
@@ -89,6 +90,7 @@ async def test_async_http_client_exposes_all_mcp_operations():
                 "description": "Current weather in Beijing",
                 "timeout_seconds": 120,
                 "arguments": {"city": "Beijing"},
+                "tags": ["project=demo", "kind=live-context"],
             },
         ),
         call(
@@ -171,6 +173,7 @@ def test_sync_http_client_exposes_and_forwards_mcp_operations():
         description="Current weather",
         timeout_seconds=90,
         arguments={"city": "Beijing"},
+        tags=["project=demo"],
     )
 
     assert result == {"mounted": True}
@@ -181,4 +184,5 @@ def test_sync_http_client_exposes_and_forwards_mcp_operations():
         description="Current weather",
         timeout_seconds=90,
         arguments={"city": "Beijing"},
+        tags=["project=demo"],
     )

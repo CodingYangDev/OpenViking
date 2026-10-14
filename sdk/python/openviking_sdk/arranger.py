@@ -407,16 +407,8 @@ class _ContextArrangerBase:
                 description=resource.description,
                 timeout_seconds=resource.timeout_seconds,
                 arguments=resource.arguments,
+                tags=tags,
             )
-            try:
-                await self._client.set_tags(resource.uri, tags, mode="replace")
-            except BaseException:
-                if change.action == ContextChangeAction.CREATE:
-                    try:
-                        await self._client.unmount_mcp_tool(resource.uri)
-                    except BaseException:
-                        pass
-                raise
             applied.append(change)
 
         for change in plan.changes:

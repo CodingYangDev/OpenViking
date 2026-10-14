@@ -301,6 +301,7 @@ mounted = client.mount_mcp_tool(
     description="北京区域的实时天气。",
     timeout_seconds=60,
     arguments={"city": "Beijing"},
+    tags=["project=weather", "kind=live-context"],
 )
 sync_result = client.sync_mcp("weather")
 print(sync_result["changes"])

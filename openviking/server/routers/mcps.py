@@ -46,6 +46,7 @@ class MountMCPToolRequest(BaseModel):
     description: str | None = None
     timeout_seconds: int = Field(default=60, gt=0)
     arguments: dict[str, Any] = Field(default_factory=dict)
+    tags: list[str] | None = None
 
 
 @router.post("")
@@ -70,6 +71,7 @@ async def mount_mcp_tool(
         body.timeout_seconds,
         body.arguments,
         ctx,
+        tags=body.tags,
     )
     return Response(status="ok", result=result)
 

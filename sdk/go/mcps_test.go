@@ -68,6 +68,7 @@ func TestMCPOperationsMatchServerContract(t *testing.T) {
 				"description":     "Current weather in Beijing",
 				"timeout_seconds": float64(120),
 				"arguments":       map[string]any{"city": "Beijing"},
+				"tags":            []any{"project=demo", "kind=live-context"},
 			},
 		},
 		{
@@ -147,6 +148,7 @@ func TestMCPOperationsMatchServerContract(t *testing.T) {
 			Description:    &description,
 			TimeoutSeconds: 120,
 			Arguments:      map[string]any{"city": "Beijing"},
+			Tags:           []string{"project=demo", "kind=live-context"},
 		},
 	); err != nil {
 		t.Fatal(err)
