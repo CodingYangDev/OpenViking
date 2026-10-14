@@ -37,6 +37,16 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
+it('does not load upload tasks when the workbench only supports reads', async () => {
+  render(
+    <ResourceUploadProvider enabled={false}>
+      <span data-testid="read-only" />
+    </ResourceUploadProvider>,
+  )
+  await screen.findByTestId('read-only')
+  expect(apiMocks.getTasks).not.toHaveBeenCalled()
+})
+
 function UploadHarness({
   onAccepted,
   onCompleted,

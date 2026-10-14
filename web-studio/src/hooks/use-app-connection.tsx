@@ -8,6 +8,17 @@ import { identifyServiceProvider } from '#/lib/studio-service'
 import type { ServiceSelection } from '#/lib/studio-service'
 import { fetchAdminAccounts } from '#/lib/admin'
 import { isOvClientError, ovClient } from '#/lib/ov-client'
+import {
+  readConnectionProfiles,
+  persistConnectionProfiles,
+  updateActiveProfile,
+  normalizeProfileConnection,
+  isValidConnectionUrl,
+} from '#/lib/connection-profiles'
+import type {
+  ConnectionProfile,
+  ConnectionProfiles,
+} from '#/lib/connection-profiles'
 
 import {
   resolveServerAuthMode,
@@ -42,6 +53,11 @@ export type GeneratedCredential = {
 }
 
 type AppConnectionContextValue = {
+  profiles: Array<ConnectionProfile>
+  activeProfileId: string
+  saveProfile: (profile: ConnectionProfile) => void
+  activateProfile: (id: string) => void
+  deleteProfile: (id: string) => void
   clearGeneratedCredential: () => void
   connection: ConnectionDraft
   connectionRole: ConnectionRole
@@ -524,19 +540,33 @@ export function AppConnectionProvider({
 }) {
   const queryClient = useQueryClient()
   const authPromptSuppressedUntilRef = React.useRef(0)
+  const connectionRevisionRef = React.useRef(0)
   const navigate = useNavigate()
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
   })
   const initialConnectionRef = React.useRef<ConnectionDraft | null>(null)
+  const profilesRef = React.useRef<ConnectionProfiles | null>(null)
   const synchronizedRoleProbeRef = React.useRef<{
     key: string
     role: ConnectionRole
   } | null>(null)
   if (initialConnectionRef.current === null) {
-    initialConnectionRef.current = readInitialConnection()
+    profilesRef.current = readConnectionProfiles(readInitialConnection())
+    initialConnectionRef.current = normalizeConnectionDraft(
+      profilesRef.current.profiles.find(
+        (p) => p.id === profilesRef.current!.activeId,
+      )!.connection,
+    )
     applyConnection(initialConnectionRef.current, 'checking')
   }
+
+  const [profileState, setProfileState] = React.useState(profilesRef.current!)
+  const storeProfiles = React.useCallback((next: ConnectionProfiles) => {
+    profilesRef.current = next
+    persistConnectionProfiles(next)
+    setProfileState(next)
+  }, [])
 
   const [connection, setConnection] = React.useState<ConnectionDraft>(
     initialConnectionRef.current,
@@ -558,6 +588,7 @@ export function AppConnectionProvider({
   } | null>(null)
   const [connectionAttempt, setConnectionAttempt] = React.useState(0)
   const reconnect = React.useCallback(() => {
+    connectionRevisionRef.current += 1
     authPromptSuppressedUntilRef.current =
       Date.now() + AUTH_PROMPT_SUPPRESSION_MS
     synchronizedRoleProbeRef.current = null
@@ -582,6 +613,10 @@ export function AppConnectionProvider({
     applyConnection(connection, serverMode)
     persistConnection(connection)
   }, [connection, serverMode])
+
+  React.useEffect(() => {
+    storeProfiles(updateActiveProfile(profilesRef.current!, connection))
+  }, [connection, storeProfiles])
 
   React.useEffect(() => {
     let cancelled = false
@@ -747,6 +782,7 @@ export function AppConnectionProvider({
 
   const value = React.useMemo<AppConnectionContextValue>(() => {
     const commitConnection = (next: ConnectionDraft) => {
+      connectionRevisionRef.current += 1
       authPromptSuppressedUntilRef.current =
         Date.now() + AUTH_PROMPT_SUPPRESSION_MS
       const normalized = synchronizeConnectionRuntime(next, serverMode)
@@ -754,12 +790,63 @@ export function AppConnectionProvider({
       setConnection(normalized)
     }
 
+    const activateConnection = (next: ConnectionDraft) => {
+      // Apply the new credentials before any new route effects can issue requests.
+      const normalized = synchronizeConnectionRuntime(next, 'checking')
+      reconnect()
+      setGeneratedCredential(null)
+      setConnection(normalized)
+    }
+
     return {
+      profiles: profileState.profiles,
+      activeProfileId: profileState.activeId,
+      saveProfile: (profile) => {
+        if (!isValidConnectionUrl(profile.connection.baseUrl))
+          throw new Error(i18n.t('studio:profiles.invalidUrl'))
+        const normalized = {
+          ...profile,
+          name: profile.name.trim(),
+          connection: normalizeConnectionDraft(
+            normalizeProfileConnection(profile.connection),
+          ),
+        }
+        const current = profilesRef.current!
+        const exists = current.profiles.some((p) => p.id === profile.id)
+        storeProfiles({
+          ...current,
+          profiles: exists
+            ? current.profiles.map((p) =>
+                p.id === profile.id ? normalized : p,
+              )
+            : [...current.profiles, normalized],
+        })
+        if (profile.id === current.activeId)
+          activateConnection(normalized.connection)
+      },
+      activateProfile: (id) => {
+        const current = profilesRef.current!
+        const profile = current.profiles.find((p) => p.id === id)
+        if (!profile || id === current.activeId) return
+        storeProfiles({ ...current, activeId: id })
+        activateConnection(profile.connection)
+      },
+      deleteProfile: (id) => {
+        const current = profilesRef.current!
+        if (id === current.activeId) return
+        storeProfiles({
+          ...current,
+          profiles: current.profiles.filter((p) => p.id !== id),
+        })
+      },
       clearGeneratedCredential: () => setGeneratedCredential(null),
       connection,
       connectionRole,
       generatedCredential,
-      identityScopeKey: createIdentityScopeKey(connection, serverMode),
+      identityScopeKey:
+        profileState.activeId +
+        '\u0000' +
+        createIdentityScopeKey(connection, serverMode),
       isConnectionRoleLoading,
       openConnectionSettings,
       reconnect,
@@ -768,7 +855,11 @@ export function AppConnectionProvider({
         createConnectionRoleProbeKey(connection, 'checking')
           ? serverHealth.data
           : null,
-      saveConnection: commitConnection,
+      saveConnection: (next) => {
+        if (!isValidConnectionUrl(next.baseUrl))
+          throw new Error(i18n.t('studio:profiles.invalidUrl'))
+        commitConnection(normalizeProfileConnection(next))
+      },
       setGeneratedCredential,
       serverMode,
       switchIdentity: async ({
@@ -781,6 +872,12 @@ export function AppConnectionProvider({
           throw createConnectionError('identitySwitchUnsupported')
         }
 
+        const revision = ++connectionRevisionRef.current
+        const assertCurrentConnection = () => {
+          if (revision !== connectionRevisionRef.current)
+            throw new Error(i18n.t('studio:profiles.connectionChanged'))
+        }
+
         const requested = normalizeConnectionDraft({
           ...connection,
           accountId,
@@ -788,6 +885,7 @@ export function AppConnectionProvider({
           userId,
         })
         const identity = await detectConnectionIdentity(requested, 'data')
+        assertCurrentConnection()
         const resolvedIdentity = resolveSwitchedIdentity(
           requested,
           identity,
@@ -807,6 +905,7 @@ export function AppConnectionProvider({
             to: '/filesystem',
           })
         }
+        assertCurrentConnection()
         commitConnection({
           ...requested,
           ...resolvedIdentity,
@@ -823,6 +922,8 @@ export function AppConnectionProvider({
     }
   }, [
     connection,
+    profileState,
+    storeProfiles,
     connectionRole,
     generatedCredential,
     isConnectionRoleLoading,

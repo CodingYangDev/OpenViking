@@ -26,6 +26,7 @@ import {
 import { Input } from '#/components/ui/input'
 import { canEditStudioConfiguration } from '#/lib/studio-permissions'
 import { resolveConfiguredServiceProvider } from '#/lib/studio-service'
+import { isValidConnectionUrl } from '#/lib/connection-profiles'
 import { useStudioService } from '#/hooks/use-studio-service'
 import { useAppConnection } from '#/hooks/use-app-connection'
 import { probeStudioConnection } from '#/lib/admin'
@@ -36,6 +37,7 @@ import { cn } from '#/lib/utils'
 import { localizeCapabilityDetail } from './-lib/localize-capability-probe'
 import type { ConnectionDraft } from '#/hooks/use-app-connection'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '#/components/ui/tabs'
+import { ConnectionProfilesList } from './-components/connection-profiles'
 import { ServerConfigurationEditor } from './-components/server-configuration'
 
 export const Route = createFileRoute('/settings')({
@@ -46,6 +48,7 @@ function ConnectionSettingsRoute() {
   const { t } = useTranslation('settings')
   const {
     identityScopeKey,
+    activeProfileId,
     connection,
     connectionRole,
     isConnectionRoleLoading,
@@ -82,7 +85,10 @@ function ConnectionSettingsRoute() {
           ) : null}
         </TabsList>
         <TabsContent value="connection">
-          <ConnectionSettingsPanel />
+          <div className="grid gap-5">
+            <ConnectionProfilesList />
+            <ConnectionSettingsPanel key={activeProfileId} />
+          </div>
         </TabsContent>
         {canConfigure ? (
           <TabsContent value="configuration" keepMounted>
@@ -149,22 +155,18 @@ function CapabilityStatus({
 }
 
 function UserApiKeyInput({
-  accountId,
+  identity,
   id,
   onChange,
   placeholder,
-  userId,
   value,
 }: {
-  accountId: string
+  identity: string
   id: string
   onChange: (value: string) => void
   placeholder: string
-  userId: string
   value: string
 }) {
-  const identity = `${accountId || DEFAULT_ACCOUNT_ID}/${userId || DEFAULT_USER_ID}`
-
   return (
     <div className="flex h-9 w-full min-w-0 items-center gap-2 rounded-md border border-input bg-transparent bg-clip-padding px-2.5 shadow-xs transition-[color,box-shadow] focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input/30">
       <span className="shrink-0 rounded-sm bg-muted px-2 py-1 font-mono text-xs text-muted-foreground">
@@ -186,53 +188,34 @@ function UserApiKeyInput({
 function ConnectionSettingsPanel() {
   const { i18n, t } = useTranslation(['settings', 'studio'])
   const service = useStudioService()
-  const { connection, reconnect, saveConnection, serverMode } =
+  const { connection, reconnect, saveConnection, serverMode, serverHealth } =
     useAppConnection()
   const [draft, setDraft] = React.useState<ConnectionDraft>(connection)
+  const [saveError, setSaveError] = React.useState(false)
   const canEditControlCredential =
     resolveConfiguredServiceProvider(draft.baseUrl, draft.serviceSelection) ===
     'opensource'
-  const pendingDraftRef = React.useRef<ConnectionDraft | null>(null)
-  const saveTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
-  const saveConnectionRef = React.useRef(saveConnection)
-
   React.useEffect(() => {
-    saveConnectionRef.current = saveConnection
-  }, [saveConnection])
-
-  React.useEffect(() => {
-    if (!pendingDraftRef.current) {
-      setDraft(connection)
-    }
+    setDraft(connection)
+    setSaveError(false)
   }, [connection])
 
-  React.useEffect(() => {
-    return () => {
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current)
-      }
-      if (pendingDraftRef.current) {
-        saveConnectionRef.current(pendingDraftRef.current)
-      }
-    }
-  }, [])
-
   function updateDraft(next: Partial<ConnectionDraft>): void {
-    const updated = { ...draft, ...next }
-    setDraft(updated)
-    pendingDraftRef.current = updated
-    if (saveTimerRef.current) {
-      clearTimeout(saveTimerRef.current)
-    }
-    saveTimerRef.current = setTimeout(() => {
-      saveTimerRef.current = null
-      const pending = pendingDraftRef.current
-      pendingDraftRef.current = null
-      if (pending) {
-        saveConnectionRef.current(pending)
-      }
-    }, 350)
+    setSaveError(false)
+    setDraft((current) => ({ ...current, ...next }))
   }
+
+  const resolvedIdentity =
+    draft.baseUrl === connection.baseUrl &&
+    draft.apiKey === connection.apiKey &&
+    draft.serviceSelection === connection.serviceSelection &&
+    (draft.apiKey || draft.adminApiKey === connection.adminApiKey) &&
+    typeof serverHealth?.account_id === 'string' &&
+    serverHealth.account_id &&
+    typeof serverHealth.user_id === 'string' &&
+    serverHealth.user_id
+      ? `${serverHealth.account_id}/${serverHealth.user_id}`
+      : t('studio:profiles.identityPending')
 
   const probeQuery = useQuery({
     enabled: Boolean(connection.baseUrl) && serverMode !== 'checking',
@@ -350,7 +333,6 @@ function ConnectionSettingsPanel() {
                   })
                 }
               >
-                <option value="auto">{t('studio:auto')}</option>
                 <option value="opensource">
                   {t('studio:providers.opensource')}
                 </option>
@@ -358,7 +340,9 @@ function ConnectionSettingsPanel() {
                   {t('studio:providers.volcengine')}
                 </option>
               </select>
-              <FieldDescription>{t('studio:serviceHint')}</FieldDescription>
+              <FieldDescription>
+                {t('studio:profiles.typeHint')}
+              </FieldDescription>
               <Button
                 type="button"
                 variant="outline"
@@ -464,9 +448,8 @@ function ConnectionSettingsPanel() {
                   </FieldLabel>
                   <FieldContent>
                     <UserApiKeyInput
-                      accountId={draft.accountId}
+                      identity={resolvedIdentity}
                       id="settings-user-api-key"
-                      userId={draft.userId}
                       value={draft.apiKey}
                       onChange={(apiKey) => updateDraft({ apiKey })}
                       placeholder={t('placeholders.userApiKey')}
@@ -534,6 +517,26 @@ function ConnectionSettingsPanel() {
               ) : null}
             </>
           )}
+          {saveError && (
+            <p role="alert" className="text-sm text-destructive">
+              {t('studio:profiles.invalidUrl')}
+            </p>
+          )}
+          <div className="flex justify-end">
+            <Button
+              onClick={() => {
+                if (!isValidConnectionUrl(draft.baseUrl)) {
+                  setSaveError(true)
+                  return
+                }
+                saveConnection(draft)
+                reconnect()
+              }}
+              disabled={JSON.stringify(draft) === JSON.stringify(connection)}
+            >
+              {t('studio:profiles.save')}
+            </Button>
+          </div>
         </CardContent>
       </Card>
     </div>

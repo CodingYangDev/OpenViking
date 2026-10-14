@@ -12,27 +12,35 @@ import { afterEach, expect, it, vi } from 'vitest'
 
 import { Route } from './route'
 
-const { probe, reconnect, serviceState, config, connectionState } = vi.hoisted(
-  () => ({
-    connectionState: {
-      baseUrl: '',
-      serviceSelection: 'auto',
-      accountId: 'account-a',
-      userId: 'alice',
-      adminApiKey: '',
-      apiKey: '',
-    },
-    probe: vi.fn(),
-    reconnect: vi.fn(),
-    serviceState: {
-      provider: 'opensource',
-      ready: true,
-      role: 'user',
-      key: '',
-    },
-    config: { url: 'http://localhost:1933', selection: 'auto' },
-  }),
-)
+const {
+  probe,
+  reconnect,
+  saveConnection,
+  serviceState,
+  config,
+  connectionState,
+  healthState,
+} = vi.hoisted(() => ({
+  connectionState: {
+    baseUrl: '',
+    serviceSelection: 'auto',
+    accountId: 'account-a',
+    userId: 'alice',
+    adminApiKey: '',
+    apiKey: '',
+  },
+  probe: vi.fn(),
+  reconnect: vi.fn(),
+  saveConnection: vi.fn(),
+  serviceState: {
+    provider: 'opensource',
+    ready: true,
+    role: 'user',
+    key: '',
+  },
+  config: { url: 'http://localhost:1933', selection: 'auto' },
+  healthState: { value: null as null | Record<string, unknown> },
+}))
 vi.mock('#/lib/admin', () => ({ probeStudioConnection: probe }))
 vi.mock('#/hooks/use-app-connection', () => ({
   useAppConnection: () => ({
@@ -42,10 +50,11 @@ vi.mock('#/hooks/use-app-connection', () => ({
       adminApiKey: serviceState.key,
     }),
     serverMode: 'trusted',
+    serverHealth: healthState.value,
     connectionRole: serviceState.role,
     isConnectionRoleLoading: false,
     identityScopeKey: 'settings-test',
-    saveConnection: vi.fn(),
+    saveConnection,
     reconnect,
   }),
 }))
@@ -67,7 +76,78 @@ vi.mock('#/hooks/use-studio-service', () => ({
 vi.mock('./-components/server-configuration', () => ({
   ServerConfigurationEditor: () => <span data-testid="configuration-editor" />,
 }))
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  healthState.value = null
+  saveConnection.mockClear()
+  reconnect.mockClear()
+})
+
+it('preserves the active connection when an invalid address is saved from the details panel', async () => {
+  probe.mockResolvedValue({
+    admin: { state: 'skipped' },
+    data: { state: 'ok' },
+  })
+  const client = new QueryClient()
+  const Settings = Route.options.component as ComponentType & {
+    preload?: () => Promise<unknown>
+  }
+  await Settings.preload?.()
+  render(
+    <QueryClientProvider client={client}>
+      <Settings />
+    </QueryClientProvider>,
+  )
+  fireEvent.change(document.getElementById('settings-base-url')!, {
+    target: { value: 'not-a-url' },
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'studio:profiles.save' }))
+  expect(screen.getByRole('alert').textContent).toBe(
+    'studio:profiles.invalidUrl',
+  )
+  expect(saveConnection).not.toHaveBeenCalled()
+  expect(reconnect).not.toHaveBeenCalled()
+  fireEvent.change(document.getElementById('settings-base-url')!, {
+    target: { value: 'https://proxy.example/openviking' },
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'studio:profiles.save' }))
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(saveConnection).toHaveBeenCalledWith(
+    expect.objectContaining({ baseUrl: 'https://proxy.example/openviking' }),
+  )
+  expect(reconnect).toHaveBeenCalledTimes(1)
+  client.clear()
+})
+
+it('shows only the server-resolved identity next to the data key', async () => {
+  probe.mockResolvedValue({
+    admin: { state: 'skipped' },
+    data: { state: 'ok' },
+  })
+  const client = new QueryClient()
+  const Settings = Route.options.component as ComponentType & {
+    preload?: () => Promise<unknown>
+  }
+  await Settings.preload?.()
+  const content = () => (
+    <QueryClientProvider client={client}>
+      <Settings />
+    </QueryClientProvider>
+  )
+  const view = render(content())
+  expect(
+    await screen.findByText('[studio:profiles.identityPending]'),
+  ).toBeTruthy()
+  expect(screen.queryByText('[account-a/alice]')).toBeNull()
+  healthState.value = { account_id: 'server-account', user_id: 'server-user' }
+  view.rerender(content())
+  expect(await screen.findByText('[server-account/server-user]')).toBeTruthy()
+  fireEvent.change(document.getElementById('settings-user-api-key')!, {
+    target: { value: 'unverified-key' },
+  })
+  expect(screen.getByText('[studio:profiles.identityPending]')).toBeTruthy()
+  client.clear()
+})
 
 it.each([false, undefined, true])(
   'requires the Root key in trusted mode regardless of legacy metadata: %s',

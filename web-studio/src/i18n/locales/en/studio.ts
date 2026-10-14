@@ -1,4 +1,34 @@
 const studio = {
+  profiles: {
+    connectionChanged:
+      'The connection changed. Select the identity again on the active connection.',
+    identityPending: 'Identity unconfirmed',
+    typeHint:
+      'Select the service type for this profile. Save to apply changes to the active connection.',
+    title: 'Connection profiles',
+    hint: 'Enable one profile to use its service and credentials. To delete the active profile, enable another first.',
+    add: 'Add profile',
+    edit: 'Edit profile',
+    delete: 'Delete',
+    activate: 'Enable',
+    active: 'Active',
+    name: 'Profile name',
+    save: 'Save',
+    cancel: 'Cancel',
+    saveHint:
+      'Saving a new profile does not enable it. Changes to the active profile reconnect immediately.',
+    invalidUrl:
+      'Enter a valid HTTP or HTTPS service address without embedded credentials.',
+    deleteConfirm: 'Delete “{{name}}”? Its saved credentials will be removed.',
+    fields: {
+      baseUrl: 'Service address',
+      apiKey: 'User API Key',
+      adminApiKey: 'Management API Key (optional)',
+      accountId: 'Account ID',
+      userId: 'User ID',
+    },
+  },
+
   selectSessionRecord:
     'Select a session from the list to view its current context.',
   noSessionRecords: 'No session records are accessible to this identity.',

@@ -176,8 +176,10 @@ export function useResourceUpload(): ResourceUploadContextValue {
 
 export function ResourceUploadProvider({
   children,
+  enabled = true,
 }: {
   children: React.ReactNode
+  enabled?: boolean
 }) {
   const { t } = useTranslation('resources', { i18n })
   const [tasks, setTasks] = React.useState<ResourceUploadTask[]>([])
@@ -547,8 +549,8 @@ export function ResourceUploadProvider({
   }, [])
 
   React.useEffect(() => {
-    void refreshTasks({ notifyOnError: false, silent: true })
-  }, [refreshTasks, t])
+    if (enabled) void refreshTasks({ notifyOnError: false, silent: true })
+  }, [enabled, refreshTasks, t])
 
   const hasActiveServerTasks = React.useMemo(
     () =>

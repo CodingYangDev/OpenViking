@@ -19,7 +19,10 @@ vi.mock('@tanstack/react-router', () => ({
   useRouterState: () => '/home',
 }))
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  localStorage.removeItem('ov_console_connection_profiles')
+})
 
 function Identity() {
   const { connectionRole, isConnectionRoleLoading, serverMode } =

@@ -1,4 +1,31 @@
 const studio = {
+  profiles: {
+    connectionChanged: '连接已切换，请在当前连接上重新选择身份。',
+    identityPending: '身份待确认',
+    typeHint: '为这份配置选择服务类型。保存后应用到当前连接。',
+    title: '连接配置',
+    hint: '启用一份配置，使用对应服务和凭证。删除当前配置前，请先启用另一份配置。',
+    add: '添加配置',
+    edit: '编辑配置',
+    delete: '删除',
+    activate: '启用',
+    active: '已启用',
+    name: '配置名称',
+    save: '保存',
+    cancel: '取消',
+    saveHint: '新增配置保存后需手动启用。编辑已启用配置后，保存会重新连接。',
+    invalidUrl:
+      '请输入有效的 HTTP 或 HTTPS 服务地址，地址中不能包含账号或密码。',
+    deleteConfirm: '删除“{{name}}”？已保存的凭证也会被移除。',
+    fields: {
+      baseUrl: '服务地址',
+      apiKey: '用户 API Key',
+      adminApiKey: '管理 API Key（选填）',
+      accountId: '账号 ID',
+      userId: '用户 ID',
+    },
+  },
+
   selectSessionRecord: '从左侧选择一个会话，查看其当前上下文。',
   noSessionRecords: '当前身份没有可查看的会话记录。',
   sessionRecords: '会话记录',
