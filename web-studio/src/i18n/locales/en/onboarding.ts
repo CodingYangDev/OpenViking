@@ -1,4 +1,10 @@
 export default {
+  connectionTitle: 'Connect your workspace.',
+  preferencesHint: 'Choose your language and appearance.',
+  connectionHint: 'Connect and verify an OpenViking service.',
+
+  verifiedManagement:
+    'Management access verified. Open Users to create a User API Key.',
   brand: 'OpenViking Studio',
   invalidService:
     'This address did not return valid OpenViking service information.',
@@ -7,7 +13,7 @@ export default {
   steps: 'First-time setup',
   preferences: 'Preferences',
   connection: 'Connect a service',
-  welcome: 'Welcome to OpenViking Studio',
+  welcome: 'Welcome to\nOpenViking Studio',
   welcomeDescription:
     'Choose your language and appearance. You can change these in the workspace anytime.',
   connectionDescription:

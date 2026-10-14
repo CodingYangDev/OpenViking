@@ -32,6 +32,9 @@ describe('fetchServerHealth', () => {
       { auth_mode: 'api_key', role: 'user' },
       { auth_mode: 'api_key', role: 'user' },
     ])
+    expect(getHealthMock).toHaveBeenCalledWith(
+      expect.objectContaining({ timeout: 10000 }),
+    )
     expect(getHealthMock).toHaveBeenCalledTimes(1)
   })
 

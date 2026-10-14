@@ -1,4 +1,9 @@
 export default {
+  connectionTitle: '连接你的工作区。',
+  preferencesHint: '选择你熟悉的语言与外观。',
+  connectionHint: '连接并验证你的 OpenViking 服务。',
+
+  verifiedManagement: '管理权限验证成功。进入用户管理后可创建用户 API 密钥。',
   brand: 'OpenViking Studio',
   invalidService: '这个地址未返回有效的 OpenViking 服务信息。',
   keyRequired: '此服务需要 API Key，请填写后重试。',
@@ -6,7 +11,7 @@ export default {
   steps: '首次使用引导',
   preferences: '基础偏好',
   connection: '连接服务',
-  welcome: '欢迎使用 OpenViking Studio',
+  welcome: '欢迎使用\nOpenViking Studio',
   welcomeDescription: '选择语言和外观，随时可以在工作区调整。',
   connectionDescription: '配置服务连接。验证成功后，将显示对应的工作区和功能。',
   language: '语言',

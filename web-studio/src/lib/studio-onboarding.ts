@@ -113,7 +113,7 @@ export async function verifyStudioSetup(
   if (
     mode !== 'dev' &&
     !connection.apiKey &&
-    !(mode === 'trusted' && connection.adminApiKey)
+    !(connection.serviceSelection === 'opensource' && connection.adminApiKey)
   )
     throw new StudioSetupError('keyRequired')
   if (connection.serviceSelection === 'volcengine') {
@@ -130,22 +130,50 @@ export async function verifyStudioSetup(
     timeout: 10000,
     throwOnError: true,
   })
-  await getOvResult(
-    dataClient.get({
-      url: '/api/v1/fs/ls',
-      query: {
-        uri:
-          connection.serviceSelection === 'volcengine'
-            ? 'viking://~/'
-            : 'viking://',
-        node_limit: 1,
-        output: 'agent',
-      },
-      signal,
-    }),
-  )
+  const managementOnly =
+    mode === 'api_key' &&
+    connection.serviceSelection === 'opensource' &&
+    !connection.apiKey &&
+    Boolean(connection.adminApiKey)
+  if (managementOnly) {
+    // ROOT cannot call tenant data APIs. Verify control access before letting
+    // a new administrator open Users and mint a separate user credential.
+    if (health.role !== 'root' && health.role !== 'admin')
+      throw new StudioSetupError('keyRequired')
+    await getOvResult(
+      dataClient.get({
+        url:
+          health.role === 'root'
+            ? '/api/v1/admin/accounts'
+            : '/api/v1/admin/accounts/{account_id}/users',
+        path: { account_id: connection.accountId },
+        signal,
+      }),
+    )
+  } else
+    await getOvResult(
+      dataClient.get({
+        url: '/api/v1/fs/ls',
+        query: {
+          uri:
+            connection.serviceSelection === 'volcengine'
+              ? 'viking://~/'
+              : 'viking://',
+          node_limit: 1,
+          output: 'agent',
+        },
+        signal,
+      }),
+    )
   signal.throwIfAborted()
   return connection
+}
+
+export function studioSetupDestination(
+  connection: ConnectionDraft,
+): '/filesystem' | '/users' | '/home' {
+  if (connection.serviceSelection === 'volcengine') return '/filesystem'
+  return !connection.apiKey && connection.adminApiKey ? '/users' : '/home'
 }
 
 export function completeStudioSetup(connection: ConnectionDraft, name: string) {

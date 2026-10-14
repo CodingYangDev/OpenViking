@@ -66,6 +66,7 @@ export async function fetchServerHealth(
       Accept: 'application/json',
       ...headers,
     },
+    timeout: 10000,
     throwOnError: true,
   }).then((response) => {
     const data = response.data

@@ -5,6 +5,7 @@ import {
   needsStudioSetup,
   SETUP_STORAGE_KEY,
   verifyStudioSetup,
+  studioSetupDestination,
 } from './studio-onboarding'
 import { PROFILES_STORAGE_KEY } from './connection-profiles'
 import { createClient } from '#/gen/ov-client/client'
@@ -149,5 +150,78 @@ describe('verification', () => {
     await expect(
       verifyStudioSetup({ ...draft, apiKey: '' }, new AbortController().signal),
     ).rejects.toThrow('keyRequired')
+  })
+})
+
+describe('management bootstrap', () => {
+  it.each(['root', 'admin'])(
+    'verifies %s control access without calling tenant data APIs',
+    async (role) => {
+      get
+        .mockResolvedValueOnce({
+          data: {
+            version: 'test',
+            auth_mode: 'api_key',
+            role,
+            account_id: 'tenant',
+            user_id: 'admin',
+          },
+        })
+        .mockResolvedValueOnce({
+          status: 200,
+          headers: {},
+          data: { status: 'ok', result: [] },
+        })
+      const connection = await verifyStudioSetup(
+        { ...draft, apiKey: '', adminApiKey: 'synthetic-control' },
+        new AbortController().signal,
+      )
+      expect(get.mock.calls[1][0].url).toBe(
+        role === 'root'
+          ? '/api/v1/admin/accounts'
+          : '/api/v1/admin/accounts/{account_id}/users',
+      )
+      expect(studioSetupDestination(connection)).toBe('/users')
+      expect(
+        get.mock.calls.some(([options]) => options.url === '/api/v1/fs/ls'),
+      ).toBe(false)
+    },
+  )
+  it('rejects denied management access and does not save it', async () => {
+    get
+      .mockResolvedValueOnce({
+        data: { version: 'test', auth_mode: 'api_key', role: 'root' },
+      })
+      .mockRejectedValueOnce(new Error('Forbidden'))
+    await expect(
+      verifyStudioSetup(
+        { ...draft, apiKey: '', adminApiKey: 'synthetic-control' },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow('Forbidden')
+    expect(localStorage.getItem(PROFILES_STORAGE_KEY)).toBeNull()
+  })
+  it('does not use a hosted control credential as a user credential', async () => {
+    get.mockResolvedValueOnce({
+      data: { version: 'test', auth_mode: 'api_key', role: 'root' },
+    })
+    await expect(
+      verifyStudioSetup(
+        {
+          ...draft,
+          serviceSelection: 'volcengine',
+          apiKey: '',
+          adminApiKey: 'synthetic-control',
+        },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow('keyRequired')
+    expect(get).toHaveBeenCalledTimes(1)
+  })
+  it('keeps data connections on their normal landing page', () => {
+    expect(studioSetupDestination(draft)).toBe('/home')
+    expect(
+      studioSetupDestination({ ...draft, serviceSelection: 'volcengine' }),
+    ).toBe('/filesystem')
   })
 })

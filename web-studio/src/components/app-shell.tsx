@@ -1,6 +1,10 @@
+import { Button } from '#/components/ui/button'
 import studioI18n from '#/i18n'
 import { StudioSetup } from './studio-setup'
-import { needsStudioSetup } from '#/lib/studio-onboarding'
+import {
+  needsStudioSetup,
+  studioSetupDestination,
+} from '#/lib/studio-onboarding'
 import * as React from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import {
@@ -315,10 +319,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         onComplete={(connection) => {
           setNeedsSetup(false)
           void navigate({
-            to:
-              connection.serviceSelection === 'volcengine'
-                ? '/filesystem'
-                : '/home',
+            to: studioSetupDestination(connection),
           })
         }}
       />
@@ -330,15 +331,31 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   )
 }
 
-function IdentityScopedAppShell({ children }: { children: React.ReactNode }) {
+export function IdentityScopedAppShell({
+  children,
+}: {
+  children: React.ReactNode
+}) {
   const { identityScopeKey, serverMode } = useAppConnection()
+  const pathname = useRouterState({
+    select: (state) => state.location.pathname,
+  })
+  // Settings must stay reachable while a saved service is being checked.
+  if (serverMode === 'checking' && pathname === '/settings') return children
   if (serverMode === 'checking')
     return (
       <div
         role="status"
-        className="flex min-h-svh items-center justify-center bg-background text-sm text-muted-foreground"
+        className="flex min-h-svh flex-col items-center justify-center gap-4 bg-background text-sm text-muted-foreground"
       >
         {studioI18n.t('studio:loading')}
+        <Button
+          nativeButton={false}
+          variant="outline"
+          render={<Link to="/settings" />}
+        >
+          {studioI18n.t('studio:connectionSettings')}
+        </Button>
       </div>
     )
   return (
