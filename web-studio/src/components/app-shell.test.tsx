@@ -3,7 +3,21 @@
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { AppShell, ConnectionScopedRouteContent } from './app-shell'
+import {
+  AppShell,
+  ConnectionScopedRouteContent,
+  shouldShowGatewayNavigation,
+} from './app-shell'
+
+const bootstrap = vi.hoisted(() => ({ health: vi.fn() }))
+vi.mock('#/hooks/use-server-mode', async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  fetchServerHealth: bootstrap.health,
+}))
+vi.mock('#/hooks/use-app-connection', async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  AppConnectionProvider: () => <span data-testid="connected-provider" />,
+}))
 
 vi.mock('@tanstack/react-router', async (original) => ({
   ...(await original<Record<string, unknown>>()),
@@ -50,4 +64,55 @@ it('shows first-use setup before mounting business routes or the connection prov
     'Welcome',
   )
   expect(localStorage.getItem('ov_console_connection_profiles')).toBeNull()
+})
+
+describe('gateway navigation', () => {
+  it.each([
+    ['dev', true, true],
+    ['api_key', true, true],
+    ['trusted', true, true],
+    ['api_key', false, false],
+    ['offline', true, false],
+    ['checking', true, false],
+  ] as const)('%s allowed %s: %s', (serverMode, allowed, visible) => {
+    expect(
+      shouldShowGatewayNavigation({
+        isGatewayHost: false,
+        serverMode,
+        allowed,
+      }),
+    ).toBe(visible)
+  })
+
+  it('always shows the entry on a standalone gateway', () => {
+    expect(
+      shouldShowGatewayNavigation({
+        isGatewayHost: true,
+        serverMode: 'offline',
+        allowed: false,
+      }),
+    ).toBe(true)
+  })
+})
+
+it('opens a fresh standalone Gateway Studio without the data-connection wizard', async () => {
+  localStorage.clear()
+  sessionStorage.clear()
+  window.history.replaceState(null, '', '/studio/')
+  bootstrap.health.mockResolvedValueOnce({
+    service: 'openviking-gateway',
+    auth_mode: 'api_key',
+  })
+  try {
+    render(
+      <AppShell>
+        <span data-testid="business-route" />
+      </AppShell>,
+    )
+    expect(await screen.findByTestId('connected-provider')).toBeTruthy()
+    expect(bootstrap.health).toHaveBeenCalledWith(window.location.origin)
+    expect(screen.queryByRole('heading')).toBeNull()
+  } finally {
+    window.history.replaceState(null, '', '/')
+  }
 })

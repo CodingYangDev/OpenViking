@@ -751,6 +751,20 @@ const workspace = {
     },
   },
   settings: {
+    gatewayConnection: {
+      title: '登录 OpenViking 网关',
+      openvikingUrl: '这台网关连接的 OpenViking：{{url}}',
+      apiKey: 'OpenViking API 密钥',
+      keyHint: '用户、账号管理员或 Root 的 API 密钥都可以。',
+      wrongKey:
+        '网关密钥（ovgw_）和网关管理密钥（ovgm_）不能用来登录，请输入 OpenViking API 密钥。',
+      invalidKey: 'OpenViking 拒绝了这个 API 密钥。请确认密钥正确后重试。',
+      unreachable:
+        '网关连不上 OpenViking（{{url}}）。确认 OpenViking 正在运行、网关的 openviking_url（gateway.conf 或 OPENVIKING_GATEWAY_OPENVIKING_URL）指向它，然后重试。',
+      gatewayUnreachable: '连不上这台网关。确认网关正在运行后重试。',
+      connect: '登录',
+      connecting: '正在登录…',
+    },
     pageTitle: '设置',
     tabs: { connection: '连接设置', configuration: '服务端配置' },
     models: {

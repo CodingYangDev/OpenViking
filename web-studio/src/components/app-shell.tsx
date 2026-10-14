@@ -64,6 +64,8 @@ import {
 } from '#/hooks/use-app-connection'
 import type { ServerMode } from '#/hooks/use-server-mode'
 import { cn } from '#/lib/utils'
+import { useGateway } from '#/routes/gateway/-lib/use-gateway'
+import { fetchServerHealth } from '#/hooks/use-server-mode'
 import { useStudioService } from '#/hooks/use-studio-service'
 import { useStudioCapabilities } from '#/hooks/use-studio-capabilities'
 import { featureForPath, isStudioFeatureVisible } from '#/lib/studio-service'
@@ -279,6 +281,34 @@ function NavGroupItem({ item, pathname, title, t }: NavGroupItemProps) {
 export function AppShell({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate()
   const [needsSetup, setNeedsSetup] = React.useState(needsStudioSetup)
+  const [checkingHost, setCheckingHost] = React.useState(
+    () => needsSetup && window.location.pathname.startsWith('/studio'),
+  )
+  React.useEffect(() => {
+    if (!checkingHost) return
+    let cancelled = false
+    void fetchServerHealth(window.location.origin)
+      .then((health) => {
+        if (!cancelled && health.service === 'openviking-gateway')
+          setNeedsSetup(false)
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setCheckingHost(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [checkingHost])
+  if (checkingHost)
+    return (
+      <div
+        role="status"
+        className="flex min-h-svh items-center justify-center bg-background text-sm text-muted-foreground"
+      >
+        {studioI18n.t('studio:loading')}
+      </div>
+    )
   if (needsSetup)
     return (
       <StudioSetup
@@ -330,6 +360,26 @@ export function ConnectionScopedRouteContent({
   return serverMode === 'checking' ? null : children
 }
 
+/**
+ * Every signed-in user of an OpenViking server sees the gateway entry, even
+ * while the gateway is off: the page explains how to turn it on.
+ */
+export function shouldShowGatewayNavigation({
+  isGatewayHost,
+  serverMode,
+  allowed,
+}: {
+  isGatewayHost: boolean
+  serverMode: ServerMode
+  /** `useGateway().allowed`: the gateway can be asked for /access. */
+  allowed: boolean
+}): boolean {
+  return (
+    isGatewayHost ||
+    (serverMode !== 'checking' && serverMode !== 'offline' && allowed)
+  )
+}
+
 function AppShellInner({ children }: { children: React.ReactNode }) {
   const { i18n, t } = useTranslation(['appShell', 'common'])
   const navigate = useNavigate()
@@ -348,8 +398,13 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   }/api/01-overview`
   const [crossDeviceVerifyOpen, setCrossDeviceVerifyOpen] =
     React.useState(false)
-  const { connection, connectionRole, isConnectionRoleLoading, serverMode } =
-    useAppConnection()
+  const {
+    connection,
+    connectionRole,
+    isConnectionRoleLoading,
+    isGatewayHost,
+    serverMode,
+  } = useAppConnection()
   const service = useStudioService()
   const { provider } = service
   const sdkApiHref =
@@ -367,15 +422,24 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     role: connectionRole,
     serverMode,
   }
+  const gateway = useGateway()
   const canManageGateway =
     service.ready && canManageStudioGateway(permissionInput)
-  const { canManageUsers } = resolveStudioManagementCapabilities({
-    serviceProvider: provider,
-    hasControlCredential: Boolean(connection.adminApiKey.trim()),
-    isRoleLoading: isConnectionRoleLoading,
-    role: connectionRole,
+  const showGateway = shouldShowGatewayNavigation({
+    isGatewayHost,
     serverMode,
+    allowed: canManageGateway && gateway.allowed,
   })
+  const navSections = isGatewayHost ? [] : NAV_SECTIONS
+  const { canManageUsers: canManageServiceUsers } =
+    resolveStudioManagementCapabilities({
+      serviceProvider: provider,
+      hasControlCredential: Boolean(connection.adminApiKey.trim()),
+      isRoleLoading: isConnectionRoleLoading,
+      role: connectionRole,
+      serverMode,
+    })
+  const canManageUsers = !isGatewayHost && canManageServiceUsers
   const crossDeviceVerifyActive =
     pathname === '/oauth/verify' || pathname.startsWith('/oauth/verify/')
   const capabilities = useStudioCapabilities()
@@ -426,59 +490,61 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         </SidebarHeader>
 
         <SidebarContent className="gap-0 py-1">
-          {NAV_SECTIONS.filter((section) =>
-            visibleNavItems.some((item) => item.section === section.id),
-          ).map((section) => (
-            <SidebarGroup key={section.id} className="pb-1">
-              <SidebarGroupLabel className="h-7 px-2 pt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-sidebar-foreground/45">
-                {t(section.titleKey, { ns: 'appShell' })}
-              </SidebarGroupLabel>
-              <SidebarGroupContent>
-                <SidebarMenu>
-                  {visibleNavItems
-                    .filter((item) => item.section === section.id)
-                    .map((item) => {
-                      const isActive =
-                        pathname === item.to ||
-                        pathname.startsWith(`${item.to}/`)
-                      const title = t(item.titleKey, { ns: 'appShell' })
+          {navSections
+            .filter((section) =>
+              visibleNavItems.some((item) => item.section === section.id),
+            )
+            .map((section) => (
+              <SidebarGroup key={section.id} className="pb-1">
+                <SidebarGroupLabel className="h-7 px-2 pt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-sidebar-foreground/45">
+                  {t(section.titleKey, { ns: 'appShell' })}
+                </SidebarGroupLabel>
+                <SidebarGroupContent>
+                  <SidebarMenu>
+                    {visibleNavItems
+                      .filter((item) => item.section === section.id)
+                      .map((item) => {
+                        const isActive =
+                          pathname === item.to ||
+                          pathname.startsWith(`${item.to}/`)
+                        const title = t(item.titleKey, { ns: 'appShell' })
 
-                      if (item.children) {
-                        return (
-                          <NavGroupItem
-                            key={item.id}
-                            item={
-                              item as NavItem & {
-                                children: readonly NavSubItem[]
+                        if (item.children) {
+                          return (
+                            <NavGroupItem
+                              key={item.id}
+                              item={
+                                item as NavItem & {
+                                  children: readonly NavSubItem[]
+                                }
                               }
-                            }
-                            pathname={pathname}
-                            title={title}
-                            t={t}
-                          />
+                              pathname={pathname}
+                              title={title}
+                              t={t}
+                            />
+                          )
+                        }
+
+                        const Icon = item.icon
+
+                        return (
+                          <SidebarMenuItem key={item.id}>
+                            <SidebarMenuButton
+                              render={<Link to={item.to} />}
+                              isActive={isActive}
+                              tooltip={title}
+                              className="h-9"
+                            >
+                              <Icon />
+                              <span>{title}</span>
+                            </SidebarMenuButton>
+                          </SidebarMenuItem>
                         )
-                      }
-
-                      const Icon = item.icon
-
-                      return (
-                        <SidebarMenuItem key={item.id}>
-                          <SidebarMenuButton
-                            render={<Link to={item.to} />}
-                            isActive={isActive}
-                            tooltip={title}
-                            className="h-9"
-                          >
-                            <Icon />
-                            <span>{title}</span>
-                          </SidebarMenuButton>
-                        </SidebarMenuItem>
-                      )
-                    })}
-                </SidebarMenu>
-              </SidebarGroupContent>
-            </SidebarGroup>
-          ))}
+                      })}
+                  </SidebarMenu>
+                </SidebarGroupContent>
+              </SidebarGroup>
+            ))}
 
           <SidebarGroup className="pb-1">
             <SidebarGroupLabel className="h-7 px-2 pt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-sidebar-foreground/45">
@@ -497,7 +563,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                     <span>{t('footer.connection', { ns: 'appShell' })}</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
-                {canManageGateway ? (
+                {showGateway ? (
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       render={<Link to="/gateway" />}
@@ -529,7 +595,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                 ) : null}
-                {provider === 'opensource' ? (
+                {provider === 'opensource' && !isGatewayHost ? (
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       onClick={openCrossDeviceVerify}
@@ -552,7 +618,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             </SidebarGroupContent>
           </SidebarGroup>
 
-          <SidebarGroup className="pb-1">
+          <SidebarGroup className="pb-1" hidden={isGatewayHost}>
             <SidebarGroupLabel className="h-7 px-2 pt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-sidebar-foreground/45">
               {t('sidebar.groups.resources', { ns: 'appShell' })}
             </SidebarGroupLabel>
@@ -590,7 +656,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                     <span>{t('footer.sdkApi', { ns: 'appShell' })}</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
-                {provider === 'opensource' ? (
+                {provider === 'opensource' && !isGatewayHost ? (
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       render={
@@ -681,7 +747,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
 
             <div className="h-6 w-px bg-border/80" aria-hidden="true" />
 
-            <CurrentUserMenu />
+            {isGatewayHost ? null : <CurrentUserMenu />}
           </div>
         </header>
 
@@ -692,7 +758,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         </ScrollArea>
       </SidebarInset>
 
-      {provider === 'opensource' ? (
+      {provider === 'opensource' && !isGatewayHost ? (
         <CrossDeviceVerifyDialog
           open={crossDeviceVerifyOpen}
           onOpenChange={setCrossDeviceVerifyOpen}

@@ -1,3 +1,4 @@
+import { useAppConnection } from '#/hooks/use-app-connection'
 import * as React from 'react'
 import { Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
 import {
@@ -133,6 +134,8 @@ function SectionTabs({ activeTab }: { activeTab: GatewayTab }) {
  */
 export function GatewayLayout() {
   const { t } = useTranslation('gateway')
+  const navigate = useNavigate()
+  const { isGatewayHost } = useAppConnection()
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
   })
@@ -146,6 +149,10 @@ export function GatewayLayout() {
   } = useGateway()
   const probe = useConnectionInfo({ enabled: Boolean(access) })
 
+  React.useEffect(() => {
+    if (isGatewayHost && !allowed && !isRoleLoading)
+      void navigate({ to: '/settings' })
+  }, [isGatewayHost, allowed, isRoleLoading, navigate])
   if (isRoleLoading) return <LoadingState />
   if (!allowed) return <GatewayConnect />
   if (accessQuery.isError)

@@ -44,6 +44,7 @@ export function canManageStudioGateway(input: ManagementInput): boolean {
   return (
     (input.serviceProvider ?? 'opensource') === 'opensource' &&
     (input.serverMode === 'dev' ||
+      input.serverMode === 'trusted' ||
       (input.serverMode === 'api_key' &&
         !input.isRoleLoading &&
         input.role !== 'unknown'))

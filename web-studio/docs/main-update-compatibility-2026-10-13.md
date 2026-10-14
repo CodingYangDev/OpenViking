@@ -1,6 +1,6 @@
 # Web Studio 双版本兼容与 UI 范围
 
-历史核对日期：2026-10-13，主干基准：`d41cd6db1`。2026-10-14 Gateway 契约与实现更新基于最新 `origin/main`（`b15426b28`），未合并其他服务端改动。功能改动位于 `web-studio/`，并复用主干 Gateway URL 校验测试数据。已使用真实火山配置进行 Chrome 读取联调。
+历史核对日期：2026-10-13，主干基准：`d41cd6db1`。2026-10-14 已合并 `origin/main`（`b8ec9d821`），包含 Gateway 独立宿主与嵌入式管理入口。功能改动位于 `web-studio/`，并复用主干 Gateway URL 校验测试数据。已使用真实火山配置进行 Chrome 读取联调。
 
 ## 界面原则
 
@@ -29,10 +29,10 @@
 | 任务 | 原表格和统计；重试 URL 参数修正为 path | 已适配数组列表；不假定 include_events、游标和缺省字段一致 |
 | Watches、日志、监控 | 保留原功能 | 按读取响应能力启用；Watches 写操作隐藏 |
 | 用户管理、OAuth | 原有管理凭证与角色判断 | 原生管理与 OAuth 隐藏；数据 Key 不授予管理能力 |
-| Gateway | api_key 普通用户或 dev 模式可进入；具体权限使用 /gateway/admin/access | 隐藏导航、拦截深链接与请求 |
+| Gateway | 开源服务可查询 /gateway/admin/access；trusted 仅展示服务端不兼容说明，实际权限由响应决定 | 隐藏导航、拦截深链接与请求 |
 | 启动配置与重启 | ROOT 专属；文件可写及重启能力由响应决定 | 隐藏配置 Tab，不挂载编辑器，不调用开源配置接口 |
 
-Gateway 暂不对 trusted 开放：主干 trusted 仅接受 Root Key并停止签发个人 Key；现有 Gateway 绑定依赖用户 Key且不发送 trusted 身份头。最新主干 Gateway 使用 /gateway/admin/access 判断权限与状态，独立管理密钥仅发送到 Gateway 管理接口。
+Gateway 运行时仍拒绝 trusted 身份模式。Studio 与主干一致，允许开源 trusted 连接进入网关页查询 /gateway/admin/access，并展示服务端的不兼容说明，不授予数据或写入权限。独立 Gateway 的 /studio 入口先无凭证识别宿主，不转发其他配置中保存的 Key；仅显示网关与连接设置。独立管理密钥仅发送到 Gateway 管理接口。
 
 开源启动配置读、预览、保存和重启共享同一授权限制；连接或授权变化时返回连接 Tab并卸载编辑器。云库模型配置属于 AK/SK 管理面，不能复用 User Key或 ov.conf 文件编辑器。
 

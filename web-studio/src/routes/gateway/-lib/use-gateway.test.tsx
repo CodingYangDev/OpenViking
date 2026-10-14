@@ -175,7 +175,7 @@ it('uses the ordinary OV key without an administrator key', () => {
   expect(result.current.allowed).toBe(true)
   expect(result.current.connection.apiKey).toBe('data-key')
 })
-it.each(['dev'])(
+it.each(['dev', 'trusted'])(
   'asks /access in %s mode without either credential',
   (serverMode) => {
     state.serverMode = serverMode
@@ -232,14 +232,4 @@ it('reloads gateway data in its own scope when the key is unlocked or locked', a
   act(() => lockManagementKey(baseUrl))
   await waitFor(() => expect(result.current.gateway.readOnly).toBe(true))
   expect(result.current.upstreams.data?.[0].header_names).toBeUndefined()
-})
-
-it('does not request Gateway in trusted mode', () => {
-  state.serverMode = 'trusted'
-  state.apiKey = ''
-  state.adminApiKey = ''
-  api.getAccess.mockClear()
-  const { result } = renderHook(() => useGateway(), { wrapper })
-  expect(result.current.allowed).toBe(false)
-  expect(api.getAccess).not.toHaveBeenCalled()
 })

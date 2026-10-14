@@ -14,8 +14,13 @@ import {
 export function StudioFeatureBoundary({ children }: { children: ReactNode }) {
   const { t } = useTranslation('studio')
   const pathname = useRouterState({ select: (s) => s.location.pathname })
-  const { connection, connectionRole, isConnectionRoleLoading, serverMode } =
-    useAppConnection()
+  const {
+    connection,
+    connectionRole,
+    isConnectionRoleLoading,
+    isGatewayHost,
+    serverMode,
+  } = useAppConnection()
   const service = useStudioService()
   const feature = featureForPath(pathname)
   const probe = feature && 'probe' in feature ? feature.probe : undefined
@@ -23,7 +28,12 @@ export function StudioFeatureBoundary({ children }: { children: ReactNode }) {
     service.ready && service.provider === 'volcengine' && Boolean(probe)
   const capabilities = useStudioCapabilities()
   const capability = feature ? capabilities[feature.id] : undefined
-  if (pathname === '/settings' || pathname === '/') return children
+  if (
+    pathname === '/settings' ||
+    pathname === '/' ||
+    (isGatewayHost && feature?.id === 'gateway')
+  )
+    return children
   let reason: string | undefined
   if (!service.ready)
     reason = service.isChecking ? 'checking' : 'connectionFailed'
@@ -40,7 +50,8 @@ export function StudioFeatureBoundary({ children }: { children: ReactNode }) {
       feature.id === 'gateway' &&
       service.provider === 'opensource' &&
       serverMode !== 'api_key' &&
-      serverMode !== 'dev'
+      serverMode !== 'dev' &&
+      serverMode !== 'trusted'
     )
       reason = 'gatewayAuthMode'
     else if (

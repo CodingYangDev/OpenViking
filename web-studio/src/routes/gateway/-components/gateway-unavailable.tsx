@@ -42,10 +42,12 @@ export function GatewayUnavailable({
   retrying?: boolean
 }) {
   const { t } = useTranslation('gateway')
-  const { connectionRole, serverMode } = useAppConnection()
+  const { connectionRole, serverMode, openvikingUrl, isGatewayHost } =
+    useAppConnection()
   const isRoot = serverMode === 'dev' || connectionRole === 'root'
-  // Only root can change the embedded server configuration.
-  const canConfigure = isRoot
+  // On an OpenViking server only root can change ov.conf; a standalone
+  // gateway host keeps showing the instructions to its admins as well.
+  const canConfigure = isRoot || (isGatewayHost && connectionRole === 'admin')
   const retry = (
     <Button variant="outline" size="sm" disabled={retrying} onClick={onRetry}>
       <RefreshCwIcon className={retrying ? 'animate-spin' : undefined} />
@@ -77,7 +79,7 @@ export function GatewayUnavailable({
       </SetupCard>
     )
     // Studio edits ov.conf through the admin API, which needs a root key.
-    if (serverMode !== 'api_key') return instructions
+    if (isGatewayHost || serverMode !== 'api_key') return instructions
     return (
       <EnableGatewayCard
         retry={retry}
@@ -99,6 +101,17 @@ export function GatewayUnavailable({
           code={'{"server":{"auth_mode":"api_key"}}'}
         />
       </SetupCard>
+    )
+  // Only a standalone gateway has an OpenViking URL and gateway.conf to fix.
+  if (error.reason === 'openviking_unreachable' && isGatewayHost)
+    return (
+      <SetupCard
+        title={t('unavailable.openvikingUnreachable.title', {
+          url: openvikingUrl,
+        })}
+        description={t('unavailable.openvikingUnreachable.description')}
+        actions={retry}
+      />
     )
   return (
     <SetupCard

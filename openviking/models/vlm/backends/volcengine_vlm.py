@@ -15,7 +15,6 @@ from openviking.models.network import (
 )
 from openviking.telemetry import tracer
 from openviking.utils.message_format import format_messages, sanitize_openai_messages
-from openviking.utils.model_retry import retry_async
 from openviking.utils.multimodal import redact_image_data_urls
 from openviking_cli.utils import get_logger
 
@@ -26,6 +25,7 @@ logger = get_logger(__name__)
 
 VOLCENGINE_CLIENT_REQUEST_ID_HEADER = "X-Client-Request-Id"
 VOLCENGINE_CLIENT_REQUEST_ID = "ToB-direct,OpenViking_Service,openviking-service_cn-beijing"
+DEFAULT_VOLCENGINE_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 
 
 def _build_volcengine_headers(extra_headers: Optional[Dict[str, str]]) -> Dict[str, str]:
@@ -63,7 +63,7 @@ class VolcEngineVLM(OpenAIVLM):
         self.extra_headers = _build_volcengine_headers(self.extra_headers)
 
         if not self.api_base:
-            self.api_base = "https://ark.cn-beijing.volces.com/api/v3"
+            self.api_base = DEFAULT_VOLCENGINE_API_BASE
         if not self.model:
             self.model = "doubao-seed-2-0-lite-260428"
 
@@ -293,12 +293,7 @@ class VolcEngineVLM(OpenAIVLM):
                 tracer.info(f"message.content={content}")
             return content
 
-        return await retry_async(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="VolcEngine VLM async completion",
-        )
+        return await _call()
 
     def _detect_image_format(self, data: bytes) -> str:
         """Detect image format from magic bytes.

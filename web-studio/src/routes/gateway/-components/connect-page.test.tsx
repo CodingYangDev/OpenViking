@@ -225,6 +225,27 @@ describe('ConnectPage', () => {
     expect(screen.getAllByText('gateway.public_url')).toHaveLength(1)
   })
 
+  it('points a standalone gateway at gateway.conf instead of ov.conf', async () => {
+    host.isGatewayHost = true
+    api.getConnectionInfo.mockResolvedValue({
+      base_url: 'http://gateway:1935/gateway',
+      public_url_configured: false,
+    })
+    try {
+      renderPage()
+      expect(
+        await screen.findByText(
+          'Clients may not be able to reach this address',
+        ),
+      ).toBeTruthy()
+      expect(screen.getByText('gateway.conf')).toBeTruthy()
+      expect(screen.getByText('OPENVIKING_GATEWAY_PUBLIC_URL')).toBeTruthy()
+      expect(screen.queryByText('ov.conf')).toBeNull()
+    } finally {
+      host.isGatewayHost = false
+    }
+  })
+
   it('starts with Claude Code and warns when no enabled upstream speaks its protocol', async () => {
     renderPage()
     expect(

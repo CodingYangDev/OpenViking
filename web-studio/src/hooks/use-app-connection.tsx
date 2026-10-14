@@ -64,6 +64,8 @@ type AppConnectionContextValue = {
   generatedCredential: GeneratedCredential | null
   identityScopeKey: string
   isConnectionRoleLoading: boolean
+  isGatewayHost: boolean
+  openvikingUrl: string
   openConnectionSettings: () => void
   reconnect: () => void
   serverHealth: Record<string, unknown> | null
@@ -461,7 +463,11 @@ export function resolveSwitchedIdentity(
 export function createManagementAccountConnection(
   connection: ConnectionDraft,
   accountId: string,
+  isGatewayHost = false,
 ): ConnectionDraft {
+  if (isGatewayHost) {
+    return { ...connection, accountId: accountId.trim() }
+  }
   return {
     ...connection,
     accountId: accountId.trim(),
@@ -541,6 +547,10 @@ export function AppConnectionProvider({
   const queryClient = useQueryClient()
   const authPromptSuppressedUntilRef = React.useRef(0)
   const connectionRevisionRef = React.useRef(0)
+  const hostDiscoveryRef = React.useRef<Promise<Record<
+    string,
+    unknown
+  > | null> | null>(null)
   const navigate = useNavigate()
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
@@ -600,6 +610,8 @@ export function AppConnectionProvider({
     queryClient.clear()
     setConnectionAttempt((attempt) => attempt + 1)
   }, [queryClient])
+  const [isGatewayHost, setIsGatewayHost] = React.useState(false)
+  const [openvikingUrl, setOpenvikingUrl] = React.useState('')
   const [generatedCredential, setGeneratedCredential] =
     React.useState<GeneratedCredential | null>(null)
 
@@ -621,43 +633,83 @@ export function AppConnectionProvider({
   React.useEffect(() => {
     let cancelled = false
 
+    const isCancelled = () => cancelled
     setServerMode('checking')
     setServerHealth(null)
-    void fetchServerHealth(
-      connection.baseUrl,
-      createConnectionHealthHeaders(connection, 'data'),
-    )
-      .then((health) => {
-        if (!cancelled) {
-          const mode = resolveServerAuthMode(health)
-          const resolved = synchronizeResolvedDataIdentity(connection, {
-            accountId:
-              typeof health.account_id === 'string' ? health.account_id : '',
-            userId: typeof health.user_id === 'string' ? health.user_id : '',
-            role: isConnectionRole(health.role) ? health.role : 'unknown',
-          })
-          // Resolve the data identity before exposing a ready workspace. A slow
-          // or expired management credential must not delay personal navigation.
-          const next = resolved
-            ? synchronizeConnectionRuntime(resolved, mode)
-            : connection
-          if (resolved) {
-            queryClient.clear()
-            setConnection(next)
-          }
-          setServerHealth({
-            key: createConnectionRoleProbeKey(next, 'checking'),
-            data: health,
-          })
-          setServerMode(mode)
+    void (async () => {
+      // A standalone Studio is bound to the gateway serving /studio. Discover
+      // that host without forwarding credentials saved for another server.
+      if (
+        isBrowser() &&
+        window.location.pathname.startsWith('/studio') &&
+        normalizeBaseUrl(connection.baseUrl) !== window.location.origin
+      ) {
+        hostDiscoveryRef.current ??= fetchServerHealth(
+          window.location.origin,
+        ).catch(() => null)
+        const host = await hostDiscoveryRef.current
+        if (isCancelled()) return
+        if (host?.service === 'openviking-gateway') {
+          setIsGatewayHost(true)
+          setOpenvikingUrl(
+            typeof host.openviking_url === 'string' ? host.openviking_url : '',
+          )
+          const next = synchronizeConnectionRuntime(
+            {
+              ...connection,
+              serviceSelection: 'opensource',
+              baseUrl: window.location.origin,
+              apiKey: '',
+              adminApiKey: '',
+              accountId: 'default',
+              userId: 'default',
+            },
+            'checking',
+          )
+          queryClient.clear()
+          setConnection(next)
+          return
         }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setServerHealth(null)
-          setServerMode('offline')
+      }
+      let health: Record<string, unknown>
+      try {
+        // The gateway answers an invalid OV key with health minus identity.
+        health = await fetchServerHealth(
+          connection.baseUrl,
+          createConnectionHealthHeaders(connection, 'data'),
+        )
+      } catch {
+        if (!isCancelled()) setServerMode('offline')
+        return
+      }
+      if (!isCancelled()) {
+        setIsGatewayHost(health.service === 'openviking-gateway')
+        setOpenvikingUrl(
+          typeof health.openviking_url === 'string'
+            ? health.openviking_url
+            : '',
+        )
+        const mode = resolveServerAuthMode(health)
+        const resolved = synchronizeResolvedDataIdentity(connection, {
+          accountId:
+            typeof health.account_id === 'string' ? health.account_id : '',
+          userId: typeof health.user_id === 'string' ? health.user_id : '',
+          role: isConnectionRole(health.role) ? health.role : 'unknown',
+        })
+        const next = resolved
+          ? synchronizeConnectionRuntime(resolved, mode)
+          : connection
+        if (resolved) {
+          queryClient.clear()
+          setConnection(next)
         }
-      })
+        setServerHealth({
+          key: createConnectionRoleProbeKey(next, 'checking'),
+          data: health,
+        })
+        setServerMode(mode)
+      }
+    })()
 
     return () => {
       cancelled = true
@@ -848,6 +900,8 @@ export function AppConnectionProvider({
         '\u0000' +
         createIdentityScopeKey(connection, serverMode),
       isConnectionRoleLoading,
+      isGatewayHost,
+      openvikingUrl,
       openConnectionSettings,
       reconnect,
       serverHealth:
@@ -916,7 +970,11 @@ export function AppConnectionProvider({
           throw createConnectionError('rootRequired')
         }
         commitConnection(
-          createManagementAccountConnection(connection, accountId),
+          createManagementAccountConnection(
+            connection,
+            accountId,
+            isGatewayHost,
+          ),
         )
       },
     }
@@ -927,6 +985,8 @@ export function AppConnectionProvider({
     connectionRole,
     generatedCredential,
     isConnectionRoleLoading,
+    isGatewayHost,
+    openvikingUrl,
     navigate,
     openConnectionSettings,
     pathname,

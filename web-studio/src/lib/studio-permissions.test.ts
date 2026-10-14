@@ -86,10 +86,10 @@ describe('new management feature permissions', () => {
     role: 'root' as const,
     serverMode: 'api_key' as const,
   }
-  it('keeps trusted Gateway blocked while configuration supports authenticated trusted ROOT', () => {
+  it('allows trusted Gateway access while configuration requires authenticated trusted ROOT', () => {
     expect(canManageStudioGateway(input)).toBe(true)
     expect(canManageStudioGateway({ ...input, serverMode: 'trusted' })).toBe(
-      false,
+      true,
     )
     expect(
       canEditStudioConfiguration({ ...input, serverMode: 'trusted' }),

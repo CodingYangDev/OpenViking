@@ -99,7 +99,7 @@ it.each(['/gateway', '/gateway/upstreams/model', '/gateway/keys'])(
     expect(screen.queryByTestId('gateway-child')).toBeNull()
   },
 )
-it('explains the Gateway authentication requirement for trusted connections', () => {
+it('allows trusted connections to reach Gateway access verification', () => {
   Object.assign(state, {
     pathname: '/gateway',
     provider: 'opensource',
@@ -110,6 +110,5 @@ it('explains the Gateway authentication requirement for trusted connections', ()
       <span data-testid="gateway-child" />
     </StudioFeatureBoundary>,
   )
-  expect(screen.queryByTestId('gateway-child')).toBeNull()
-  expect(screen.getByText('states.gatewayAuthMode.title')).toBeTruthy()
+  expect(screen.getByTestId('gateway-child')).toBeTruthy()
 })

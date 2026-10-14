@@ -119,7 +119,9 @@ function useGatewayConnection() {
     allowed:
       service.ready &&
       service.provider === 'opensource' &&
-      (serverMode === 'dev' || Boolean(apiKey.trim())),
+      (serverMode === 'dev' ||
+        serverMode === 'trusted' ||
+        Boolean(apiKey.trim())),
     /** Local development authenticates as default/default without a credential. */
     devMode: serverMode === 'dev',
     isRoleLoading: isConnectionRoleLoading,

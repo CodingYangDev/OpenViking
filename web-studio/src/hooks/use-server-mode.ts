@@ -26,7 +26,7 @@ export function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.trim().replace(/\/+$/, '')
 }
 
-function isServerAuthMode(value: unknown): value is ServerAuthMode {
+export function isServerAuthMode(value: unknown): value is ServerAuthMode {
   return (
     typeof value === 'string' && SERVER_AUTH_MODES.has(value as ServerAuthMode)
   )
