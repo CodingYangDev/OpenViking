@@ -17,6 +17,7 @@ import remarkBreaks from 'remark-breaks'
 import remarkGfm from 'remark-gfm'
 import { X, Pencil, Save, XCircle, Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 
 import { Button } from '#/components/ui/button'
 import { ScrollArea } from '#/components/ui/scroll-area'
@@ -126,6 +127,7 @@ async function ensureLanguage(lang: string): Promise<void> {
 
 interface FilePreviewProps {
   readOnly?: boolean
+  defaultReadLimit?: number
   file: VikingFsEntry | null
   hideDirectoryHeader?: boolean
   onClose: () => void
@@ -1350,6 +1352,7 @@ function JsonlPreview({ content }: { content: string }) {
 
 export function FilePreview({
   readOnly = false,
+  defaultReadLimit,
   file,
   hideDirectoryHeader = false,
   onClose,
@@ -1378,7 +1381,7 @@ export function FilePreview({
     resolvedFile,
     {
       maxAutoReadBytes: LARGE_FILE_PREVIEW_BYTES,
-      defaultReadLimit: readOnly ? 10000 : -1,
+      defaultReadLimit: defaultReadLimit ?? (readOnly ? 10000 : -1),
       requireKnownSize: isJsonFile,
     },
     {
@@ -1419,6 +1422,10 @@ export function FilePreview({
   >(new Set(['abstract', 'overview']))
   const [editing, setEditing] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [loadingEditor, setLoadingEditor] = useState(false)
+  const [editorContent, setEditorContent] = useState('')
+  const fileUriRef = useRef(file?.uri)
+  fileUriRef.current = file?.uri
   const editorRef = useRef<CodeEditorHandle>(null)
   const { invalidatePreview } = useInvalidateVikingFs()
 
@@ -1435,6 +1442,8 @@ export function FilePreview({
     setMarkdownMode('preview')
     setJsonMode('preview')
     setEditing(false)
+    setLoadingEditor(false)
+    setEditorContent('')
     setActiveDirectoryLevels(new Set(['abstract', 'overview']))
   }, [file?.uri])
 
@@ -1549,6 +1558,38 @@ export function FilePreview({
     }
   }, [file, preview?.fileType])
 
+  const handleEdit = async () => {
+    if (!file || loadingEditor || !canEdit) return
+    const uri = file.uri
+    setLoadingEditor(true)
+    try {
+      // A limited preview must never become a replace write. Download the
+      // complete original content through the authenticated API first.
+      const response = preview.truncated
+        ? await getContentDownload({
+            query: { uri },
+            responseType: 'text',
+            throwOnError: true,
+          })
+        : null
+      if (fileUriRef.current !== uri) return
+      const content = response ? response.data : preview.content
+      if (
+        typeof content !== 'string' ||
+        new Blob([content]).size > LARGE_FILE_PREVIEW_BYTES
+      ) {
+        throw new Error(t('filePreview.largeFileSkipped'))
+      }
+      setEditorContent(content)
+      setEditing(true)
+    } catch (err) {
+      if (fileUriRef.current === uri)
+        toast.error(t('filePreview.editFailed'), { description: String(err) })
+    } finally {
+      if (fileUriRef.current === uri) setLoadingEditor(false)
+    }
+  }
+
   const handleSave = async () => {
     if (!file || !editorRef.current) return
     setSaving(true)
@@ -1557,7 +1598,7 @@ export function FilePreview({
       invalidatePreview(file.uri)
       setEditing(false)
     } catch (err) {
-      console.error('Save failed:', err)
+      toast.error(t('filePreview.saveFailed'), { description: String(err) })
     } finally {
       setSaving(false)
     }
@@ -1635,7 +1676,8 @@ export function FilePreview({
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={() => setEditing(true)}
+                  disabled={loadingEditor}
+                  onClick={() => void handleEdit()}
                 >
                   <Pencil className="mr-1 size-3.5" />
                   {t('filePreview.edit')}
@@ -1668,7 +1710,7 @@ export function FilePreview({
           >
             <LazyCodeEditor
               ref={editorRef}
-              initialContent={preview.content}
+              initialContent={editorContent}
               filename={file.name}
               isDark={isDark}
             />

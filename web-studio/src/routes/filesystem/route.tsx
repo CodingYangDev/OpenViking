@@ -660,7 +660,7 @@ function FilesystemWorkbench() {
           </div>
           <div className="min-h-0 flex-1">
             <LazyFilePreview
-              readOnly={!canUseLocalTools}
+              defaultReadLimit={canUseLocalTools ? -1 : 10000}
               file={selectedFile}
               hideDirectoryHeader
               onClose={() => setSelectedFile(null)}

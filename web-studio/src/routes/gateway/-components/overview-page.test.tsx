@@ -37,6 +37,7 @@ import { PROFILE_DEFAULTS } from '../-lib/profile-schema'
 import { OverviewPage } from './overview-page'
 
 const api = vi.hoisted(() => ({
+  getAccess: vi.fn(),
   getOverview: vi.fn(),
   listLogs: vi.fn(),
   listUpstreams: vi.fn(),
@@ -46,8 +47,9 @@ const api = vi.hoisted(() => ({
 }))
 
 vi.mock('#/hooks/use-studio-service', () => ({
-  useStudioService: () => ({ provider: 'opensource', ready: true }),
+  useStudioService: () => ({ ready: true, provider: 'opensource' }),
 }))
+
 vi.mock('#/hooks/use-app-connection', () => ({
   useAppConnection: () => ({
     connection: {
@@ -207,6 +209,16 @@ afterAll(async () => {
 beforeEach(() => {
   vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
   for (const mock of Object.values(api)) mock.mockReset()
+  api.getAccess.mockResolvedValue({
+    managed: false,
+    can_write_objects: true,
+    can_import_vlm: true,
+    can_issue_for_others: true,
+    role: 'admin',
+    account_id: 'acme',
+    user_id: 'admin',
+    warnings: [],
+  })
   api.listLogs.mockResolvedValue([])
   api.listUpstreams.mockResolvedValue([])
   api.listProfiles.mockResolvedValue([])
@@ -275,7 +287,7 @@ describe('OverviewPage', () => {
     )
     await waitFor(() =>
       expect(toast.error).toHaveBeenCalledWith(
-        'The gateway rejected these settings. Check the values and limits.',
+        'The gateway rejected these settings. Check the values and try again.',
       ),
     )
     expect(

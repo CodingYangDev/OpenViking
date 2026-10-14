@@ -42,8 +42,11 @@ type ManagementInput = Parameters<typeof resolveStudioManagementCapabilities>[0]
 
 export function canManageStudioGateway(input: ManagementInput): boolean {
   return (
-    input.serverMode === 'api_key' &&
-    resolveStudioManagementCapabilities(input).canManageUsers
+    (input.serviceProvider ?? 'opensource') === 'opensource' &&
+    (input.serverMode === 'dev' ||
+      (input.serverMode === 'api_key' &&
+        !input.isRoleLoading &&
+        input.role !== 'unknown'))
   )
 }
 

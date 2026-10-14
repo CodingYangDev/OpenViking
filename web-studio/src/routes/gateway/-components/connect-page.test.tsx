@@ -44,11 +44,15 @@ const api = vi.hoisted(() => ({
   listUpstreams: vi.fn(),
 }))
 
+const host = vi.hoisted(() => ({ isGatewayHost: false }))
+
 vi.mock('#/hooks/use-studio-service', () => ({
-  useStudioService: () => ({ provider: 'opensource', ready: true }),
+  useStudioService: () => ({ ready: true, provider: 'opensource' }),
 }))
+
 vi.mock('#/hooks/use-app-connection', () => ({
   useAppConnection: () => ({
+    isGatewayHost: host.isGatewayHost,
     connection: {
       baseUrl: 'http://localhost:1933',
       accountId: 'acme',
@@ -68,7 +72,7 @@ vi.mock('../-lib/api', async (importOriginal) => ({
 }))
 
 const PUBLIC: ConnectionInfo = {
-  base_url: 'https://gw.example.com',
+  base_url: 'https://gw.example.com/gateway',
   public_url_configured: true,
 }
 
@@ -191,8 +195,10 @@ describe('ConnectPage', () => {
 
   it('shows the address for both client families and links keys and docs', async () => {
     renderPage()
-    expect(await screen.findByText('https://gw.example.com')).toBeTruthy()
-    expect(screen.getByText('https://gw.example.com/v1')).toBeTruthy()
+    expect(
+      await screen.findByText('https://gw.example.com/gateway'),
+    ).toBeTruthy()
+    expect(screen.getByText('https://gw.example.com/gateway/v1')).toBeTruthy()
     expect(screen.queryByText(/public_url/)).toBeNull()
     expect(linkTo('Manage keys')).toBe('/gateway/keys')
     expect(linkTo('Full guide')).toBe(gatewayDocsUrl('guide', 'en'))
@@ -201,12 +207,15 @@ describe('ConnectPage', () => {
   it.each([
     [
       'a loopback address',
-      { base_url: 'http://127.0.0.1:1935', public_url_configured: false },
+      {
+        base_url: 'http://127.0.0.1:1933/gateway',
+        public_url_configured: false,
+      },
       "Only the gateway's own machine can use this address",
     ],
     [
       'an address that is not the public one',
-      { base_url: 'http://gateway:1935', public_url_configured: false },
+      { base_url: 'http://gateway:1933/gateway', public_url_configured: false },
       'Clients may not be able to reach this address',
     ],
   ])('warns about %s', async (_, info, title) => {
@@ -223,7 +232,7 @@ describe('ConnectPage', () => {
     ).toBeTruthy()
     expect(snippetTexts()).toContain(
       [
-        'export ANTHROPIC_BASE_URL=https://gw.example.com',
+        'export ANTHROPIC_BASE_URL=https://gw.example.com/gateway',
         "export ANTHROPIC_AUTH_TOKEN='<gateway-key>'",
         'export CLAUDE_CODE_GATEWAY_HINT_HEADERS=1',
       ].join('\n'),
@@ -249,7 +258,7 @@ describe('ConnectPage', () => {
     ).toBeTruthy()
     expect(
       snippetTexts().some((code) =>
-        code.includes('base_url = "https://gw.example.com/v1"'),
+        code.includes('base_url = "https://gw.example.com/gateway/v1"'),
       ),
     ).toBe(true)
     expect(

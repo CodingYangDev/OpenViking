@@ -39,7 +39,8 @@ export function StudioFeatureBoundary({ children }: { children: ReactNode }) {
     if (
       feature.id === 'gateway' &&
       service.provider === 'opensource' &&
-      serverMode !== 'api_key'
+      serverMode !== 'api_key' &&
+      serverMode !== 'dev'
     )
       reason = 'gatewayAuthMode'
     else if (

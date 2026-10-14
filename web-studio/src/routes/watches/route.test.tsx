@@ -84,7 +84,8 @@ vi.mock('./-components/edit-watch-dialog', () => ({
 }))
 
 vi.mock('./-components/watch-history-sheet', () => ({
-  WatchHistorySheet: () => null,
+  WatchHistorySheet: ({ watch }: { watch: WatchTask | null }) =>
+    watch ? <div data-testid="watch-history">{watch.toUri}</div> : null,
 }))
 
 vi.mock('./-lib/api', () => apiMocks)
@@ -147,7 +148,9 @@ describe('WatchManagementPage', () => {
       expect(screen.queryByRole('button', { name })).toBeNull()
     }
     expect(screen.queryByRole('switch')).toBeNull()
-    expect(screen.queryByText('columns.actions')).toBeNull()
+    expect(screen.getByText('columns.actions')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'actions.history' }))
+    expect(screen.getByTestId('watch-history').textContent).toBe(watch.toUri)
     expect(apiMocks.triggerWatch).not.toHaveBeenCalled()
   })
   it('shows edit as a direct row action', async () => {

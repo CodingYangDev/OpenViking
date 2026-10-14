@@ -82,7 +82,8 @@ vi.mock('#/routes/resources/-hooks/use-resource-upload', () => ({
 vi.mock('#/routes/resources/-components/lazy-file-preview', () => ({
   LazyFilePreview: (props: {
     file: { uri: string } | null
-    readOnly: boolean
+    readOnly?: boolean
+    defaultReadLimit?: number
   }) => {
     mocks.preview(props)
     return <div data-testid="preview">{props.file?.uri}</div>
@@ -136,7 +137,8 @@ describe('filesystem context tree refresh', () => {
     mocks.provider = 'volcengine'
     render(<FilesystemRoute />)
     expect(screen.getByTestId('preview').textContent).toBe(firstFile)
-    expect(mocks.preview.mock.lastCall?.[0].readOnly).toBe(true)
+    expect(mocks.preview.mock.lastCall?.[0].readOnly).not.toBe(true)
+    expect(mocks.preview.mock.lastCall?.[0].defaultReadLimit).toBe(10000)
     expect(mocks.uploadProvider.mock.lastCall?.[0]).toBe(false)
     expect(mocks.agent).not.toHaveBeenCalled()
     expect(mocks.terminal).not.toHaveBeenCalled()

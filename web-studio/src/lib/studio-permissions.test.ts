@@ -86,7 +86,7 @@ describe('new management feature permissions', () => {
     role: 'root' as const,
     serverMode: 'api_key' as const,
   }
-  it('keeps Gateway API-key-only while configuration supports authenticated trusted ROOT', () => {
+  it('keeps trusted Gateway blocked while configuration supports authenticated trusted ROOT', () => {
     expect(canManageStudioGateway(input)).toBe(true)
     expect(canManageStudioGateway({ ...input, serverMode: 'trusted' })).toBe(
       false,
@@ -95,6 +95,26 @@ describe('new management feature permissions', () => {
       canEditStudioConfiguration({ ...input, serverMode: 'trusted' }),
     ).toBe(true)
     expect(canEditStudioConfiguration({ ...input, role: 'admin' })).toBe(false)
+  })
+  it('allows ordinary API-key users and development mode to query Gateway access', () => {
+    expect(
+      canManageStudioGateway({
+        ...input,
+        role: 'user',
+        hasControlCredential: false,
+      }),
+    ).toBe(true)
+    expect(
+      canManageStudioGateway({
+        ...input,
+        serverMode: 'dev',
+        role: 'unknown',
+        hasControlCredential: false,
+      }),
+    ).toBe(true)
+    expect(canManageStudioGateway({ ...input, isRoleLoading: true })).toBe(
+      false,
+    )
   })
   it.each(['volcengine', 'unknown'] as const)(
     'never grants %s connections native management',

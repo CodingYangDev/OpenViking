@@ -131,7 +131,7 @@ function AddressCard({ info }: { info: ConnectionInfo }) {
         {warning ? (
           <Notice tone="warning" title={t(`connect.address.${warning}.title`)}>
             <p>
-              <CodeText text={t(`connect.address.${warning}.description`)} />
+              <CodeText text={t(`connect.address.${warning}.embedded`)} />
             </p>
           </Notice>
         ) : null}

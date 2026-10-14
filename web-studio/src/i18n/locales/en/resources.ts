@@ -420,6 +420,8 @@ const resources = {
       },
     },
     filePreview: {
+      editFailed: 'Unable to load the complete file for editing.',
+      saveFailed: 'Unable to save the file.',
       directoryLevels: {
         abstractLabel: 'Abstract',
         overviewLabel: 'Overview',

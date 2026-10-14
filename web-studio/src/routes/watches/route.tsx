@@ -432,11 +432,9 @@ export function WatchManagementPage() {
                 <TableHead className="min-w-40">
                   {t('columns.nextRun')}
                 </TableHead>
-                {!readOnly ? (
-                  <TableHead className="min-w-40 text-right">
-                    {t('columns.actions')}
-                  </TableHead>
-                ) : null}
+                <TableHead className="min-w-40 text-right">
+                  {t('columns.actions')}
+                </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -567,7 +565,16 @@ export function WatchManagementPage() {
                           </DropdownMenu>
                         </div>
                       </TableCell>
-                    ) : null}
+                    ) : (
+                      <TableCell className="text-right">
+                        <ActionButton
+                          label={t('actions.history')}
+                          onClick={() => setHistoryWatch(watch)}
+                        >
+                          <HistoryIcon />
+                        </ActionButton>
+                      </TableCell>
+                    )}
                   </TableRow>
                 )
               })}
