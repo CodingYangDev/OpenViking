@@ -1,5 +1,5 @@
-import type { ConnectionDraft } from '#/hooks/use-app-connection'
-import { resolveConfiguredServiceProvider } from './studio-service'
+import type { ConnectionDraft } from '#/lib/connection/types'
+import { resolveConfiguredServiceProvider } from '../studio-service'
 
 export const PROFILES_STORAGE_KEY = 'ov_console_connection_profiles'
 

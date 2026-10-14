@@ -1,7 +1,7 @@
-import { resolveApiKeyAuth } from './studio-auth'
-import type { ApiKeyAuth } from './studio-auth'
+import { resolveApiKeyAuth, createApiKeyHeaders } from '#/lib/connection/auth'
+import type { ApiKeyAuth } from '#/lib/connection/auth'
 import axios from 'axios'
-import type { ServerMode } from '#/hooks/use-server-mode'
+import type { ServerMode } from '#/lib/connection/health'
 
 import { createClient } from '#/gen/ov-client/client'
 import {
@@ -174,11 +174,7 @@ function setApiKeyHeader(
   apiKey: string,
   auth: ApiKeyAuth = 'header',
 ): void {
-  setOptionalHeader(
-    headers,
-    auth === 'bearer' ? 'Authorization' : 'X-API-Key',
-    auth === 'bearer' && apiKey ? `Bearer ${apiKey}` : apiKey,
-  )
+  Object.assign(headers, createApiKeyHeaders(apiKey, auth))
 }
 
 function probeError(error: unknown): CapabilityProbeResult {

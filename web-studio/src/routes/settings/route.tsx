@@ -1,7 +1,5 @@
-import { fetchServerHealth } from '#/hooks/use-server-mode'
-import { resolveApiKeyAuth } from '#/lib/studio-auth'
+import { fetchServerHealth } from '#/lib/connection/health'
 import * as React from 'react'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import {
   CircleAlertIcon,
@@ -27,12 +25,11 @@ import {
 import { Input } from '#/components/ui/input'
 import { canEditStudioConfiguration } from '#/lib/studio-permissions'
 import { resolveConfiguredServiceProvider } from '#/lib/studio-service'
-import { isValidConnectionUrl } from '#/lib/connection-profiles'
+import { isValidConnectionUrl } from '#/lib/connection/profiles'
 import { useStudioService } from '#/hooks/use-studio-service'
 import { useAppConnection } from '#/hooks/use-app-connection'
-import { probeStudioConnection } from '#/lib/admin'
+import { useConnectionProbe } from '#/hooks/use-connection-probe'
 import type { CapabilityProbeResult } from '#/lib/admin'
-import { DEFAULT_ACCOUNT_ID, DEFAULT_USER_ID } from '#/lib/admin-options'
 import { PLAIN_INPUT_PROPS } from '#/lib/form-input'
 import { cn } from '#/lib/utils'
 import { localizeCapabilityDetail } from './-lib/localize-capability-probe'
@@ -369,42 +366,7 @@ function ConnectionSettingsPanel() {
       ? `${serverHealth.account_id}/${serverHealth.user_id}`
       : t('studio:profiles.identityPending')
 
-  const probeQuery = useQuery({
-    enabled: Boolean(connection.baseUrl) && serverMode !== 'checking',
-    placeholderData: keepPreviousData,
-    queryFn: () =>
-      probeStudioConnection({
-        apiKeyAuth: resolveApiKeyAuth(
-          connection.baseUrl,
-          connection.serviceSelection,
-        ),
-        accountId: connection.accountId || DEFAULT_ACCOUNT_ID,
-        skipAdmin: service.provider !== 'opensource',
-        dataRootUri:
-          service.provider === 'volcengine'
-            ? 'viking://~/'
-            : connection.userId
-              ? `viking://user/${connection.userId}/`
-              : undefined,
-        adminApiKey: connection.adminApiKey,
-        apiKey: connection.apiKey,
-        baseUrl: connection.baseUrl,
-        serverMode,
-        userId: connection.userId || DEFAULT_USER_ID,
-      }),
-    queryKey: [
-      'studio-connection-probe',
-      service.provider,
-      connection.baseUrl,
-      connection.adminApiKey,
-      connection.apiKey,
-      connection.accountId,
-      connection.userId,
-      serverMode,
-    ],
-    retry: false,
-    staleTime: 15_000,
-  })
+  const probeQuery = useConnectionProbe()
   const isDevMode = serverMode === 'dev'
   const isUnsupportedAuthMode = serverMode === 'oidc' || serverMode === 'ldap'
   const rootApiKey = connection.adminApiKey.trim()

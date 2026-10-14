@@ -1,7 +1,7 @@
 import type { AxiosInstance, AxiosResponse } from 'axios'
 
 import type { Client } from '#/gen/ov-client/client'
-import type { ApiKeyAuth } from '#/lib/studio-auth'
+import type { ApiKeyAuth } from '#/lib/connection/auth'
 
 export const DEFAULT_API_KEY_STORAGE_KEY = 'ov_console_api_key'
 

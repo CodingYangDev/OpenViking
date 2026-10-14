@@ -10,7 +10,7 @@ import {
 } from './app-shell'
 
 const bootstrap = vi.hoisted(() => ({ health: vi.fn() }))
-vi.mock('#/hooks/use-server-mode', async (original) => ({
+vi.mock('#/lib/connection/health', async (original) => ({
   ...(await original<Record<string, unknown>>()),
   fetchServerHealth: bootstrap.health,
 }))

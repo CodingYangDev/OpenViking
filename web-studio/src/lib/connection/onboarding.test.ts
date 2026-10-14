@@ -6,8 +6,8 @@ import {
   SETUP_STORAGE_KEY,
   verifyStudioSetup,
   studioSetupDestination,
-} from './studio-onboarding'
-import { PROFILES_STORAGE_KEY } from './connection-profiles'
+} from '#/lib/connection/onboarding'
+import { PROFILES_STORAGE_KEY } from '#/lib/connection/profiles'
 import { createClient } from '#/gen/ov-client/client'
 import type * as ClientModule from '#/gen/ov-client/client'
 

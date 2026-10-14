@@ -7,7 +7,7 @@ import {
   isStudioFeatureVisible,
   resolveConfiguredServiceProvider,
 } from './studio-service'
-import { resolveApiKeyAuth } from './studio-auth'
+import { resolveApiKeyAuth } from '#/lib/connection/auth'
 import { resolveStudioManagementCapabilities } from './studio-permissions'
 
 describe('service and permission boundaries', () => {

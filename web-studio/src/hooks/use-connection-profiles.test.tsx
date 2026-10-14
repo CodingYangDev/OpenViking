@@ -11,15 +11,15 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, expect, it, vi } from 'vitest'
 import { AppConnectionProvider, useAppConnection } from './use-app-connection'
 import { ovClient } from '#/lib/ov-client'
-import { PROFILES_STORAGE_KEY } from '#/lib/connection-profiles'
-import type * as ServerModeModule from './use-server-mode'
+import { PROFILES_STORAGE_KEY } from '#/lib/connection/profiles'
+import type * as ServerModeModule from '#/lib/connection/health'
 
 const { health } = vi.hoisted(() => ({ health: vi.fn() }))
 vi.mock('@tanstack/react-router', () => ({
   useNavigate: () => vi.fn(),
   useRouterState: () => '/settings',
 }))
-vi.mock('./use-server-mode', async (original) => ({
+vi.mock('#/lib/connection/health', async (original) => ({
   ...(await original<typeof ServerModeModule>()),
   fetchServerHealth: health,
 }))

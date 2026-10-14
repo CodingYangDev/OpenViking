@@ -1,13 +1,19 @@
-import type { ConnectionDraft } from '#/hooks/use-app-connection'
-import { createConnectionHealthHeaders } from '#/hooks/use-app-connection'
+import { resolveConnectionDataRoot } from './probe'
+import type { ConnectionDraft } from '#/lib/connection/types'
+import { createConnectionHealthHeaders } from './auth'
 import { createClient } from '#/gen/ov-client/client'
 import { getOvResult } from '#/lib/ov-client'
-import { resolveServerAuthMode } from '#/hooks/use-server-mode'
+import {
+  resolveServerAuthMode,
+  fetchConnectionHealth,
+  isUsableServerHealth,
+  readServerIdentity,
+} from './health'
 import {
   isValidConnectionUrl,
   normalizeProfileConnection,
   PROFILES_STORAGE_KEY,
-} from './connection-profiles'
+} from '#/lib/connection/profiles'
 
 export const SETUP_STORAGE_KEY = 'ov_studio_setup'
 export class StudioSetupError extends Error {
@@ -93,21 +99,8 @@ export async function verifyStudioSetup(
   if (!isValidConnectionUrl(connection.baseUrl))
     throw new Error('Invalid server URL')
   if (connection.serviceSelection === 'volcengine') connection.adminApiKey = ''
-  const client = createClient({
-    baseURL: connection.baseUrl,
-    headers: createConnectionHealthHeaders(connection, 'data'),
-    timeout: 10000,
-    throwOnError: true,
-  })
-  const response = await client.get({ url: '/health', signal })
-  const health = response.data as Record<string, unknown> | null
-  if (
-    !health ||
-    typeof health !== 'object' ||
-    health.status === 'error' ||
-    health.error ||
-    (typeof health.version !== 'string' && typeof health.auth_mode !== 'string')
-  )
+  const health = await fetchConnectionHealth(connection, signal)
+  if (!isUsableServerHealth(health))
     throw new StudioSetupError('invalidService')
   const mode = resolveServerAuthMode(health)
   if (
@@ -120,10 +113,9 @@ export async function verifyStudioSetup(
     connection.accountId = ''
     connection.userId = ''
   }
-  if (typeof health.account_id === 'string' && health.account_id)
-    connection.accountId = health.account_id
-  if (typeof health.user_id === 'string' && health.user_id)
-    connection.userId = health.user_id
+  const identity = readServerIdentity(health)
+  if (identity.accountId) connection.accountId = identity.accountId
+  if (identity.userId) connection.userId = identity.userId
   const dataClient = createClient({
     baseURL: connection.baseUrl,
     headers: createConnectionHealthHeaders(connection, 'data'),
@@ -155,10 +147,7 @@ export async function verifyStudioSetup(
       dataClient.get({
         url: '/api/v1/fs/ls',
         query: {
-          uri:
-            connection.serviceSelection === 'volcengine'
-              ? 'viking://~/'
-              : 'viking://',
+          uri: resolveConnectionDataRoot(connection, 'root'),
           node_limit: 1,
           output: 'agent',
         },

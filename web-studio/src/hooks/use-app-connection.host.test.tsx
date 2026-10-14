@@ -5,7 +5,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { AppConnectionProvider, useAppConnection } from './use-app-connection'
 
 const { health } = vi.hoisted(() => ({ health: vi.fn() }))
-vi.mock('./use-server-mode', async (importOriginal) => ({
+vi.mock('#/lib/connection/health', async (importOriginal) => ({
   ...(await importOriginal<object>()),
   fetchServerHealth: health,
 }))

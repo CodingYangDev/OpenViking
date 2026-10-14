@@ -56,7 +56,7 @@ function SessionThread({ sessionId, draft = false, onPersisted }: ThreadProps) {
     data: historyMessages,
     isPending: historyLoading,
     error: historyError,
-  } = useSessionMessages(historyId, service.provider === 'opensource')
+  } = useSessionMessages(historyId)
 
   const chat = useChat({
     identityScopeKey,
@@ -158,12 +158,6 @@ function SessionThread({ sessionId, draft = false, onPersisted }: ThreadProps) {
           <MemoryImpact session={session} />
         ) : null}
       </div>
-
-      {service.provider === 'volcengine' ? (
-        <p className="relative z-10 shrink-0 border-b px-6 py-2 text-xs text-muted-foreground">
-          {t('studio:hostedSessionHistory')}
-        </p>
-      ) : null}
 
       <div
         ref={scrollRef}

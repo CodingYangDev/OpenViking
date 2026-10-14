@@ -1,6 +1,6 @@
 import type { ServiceProvider } from './studio-service'
-import type { ConnectionRole } from '#/hooks/use-app-connection'
-import type { ServerMode } from '#/hooks/use-server-mode'
+import type { ConnectionRole } from '#/lib/connection/types'
+import type { ServerMode } from '#/lib/connection/health'
 
 export type StudioManagementCapabilities = {
   canManageAccounts: boolean

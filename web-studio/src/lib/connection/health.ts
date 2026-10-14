@@ -1,3 +1,5 @@
+import type { ConnectionDraft } from './types'
+import { createConnectionHealthHeaders } from './auth'
 import { getHealth } from '#/lib/ov-client'
 import { createClient } from '#/gen/ov-client/client'
 
@@ -97,4 +99,40 @@ export function resolveServerAuthMode(
   data: Record<string, unknown>,
 ): ServerAuthMode {
   return isServerAuthMode(data.auth_mode) ? data.auth_mode : 'api_key'
+}
+
+export function isUsableServerHealth(
+  data: unknown,
+): data is Record<string, unknown> {
+  return Boolean(
+    data &&
+    typeof data === 'object' &&
+    !Array.isArray(data) &&
+    (data as Record<string, unknown>).status !== 'error' &&
+    !(data as Record<string, unknown>).error &&
+    (typeof (data as Record<string, unknown>).version === 'string' ||
+      typeof (data as Record<string, unknown>).auth_mode === 'string'),
+  )
+}
+
+export function readServerIdentity(health: Record<string, unknown>) {
+  return {
+    accountId: typeof health.account_id === 'string' ? health.account_id : '',
+    userId: typeof health.user_id === 'string' ? health.user_id : '',
+  }
+}
+
+/** Setup uses an isolated, cancellable request rather than the runtime reuse cache. */
+export async function fetchConnectionHealth(
+  connection: ConnectionDraft,
+  signal: AbortSignal,
+) {
+  const client = createClient({
+    baseURL: normalizeBaseUrl(connection.baseUrl),
+    headers: createConnectionHealthHeaders(connection, 'data'),
+    timeout: 10000,
+    throwOnError: true,
+  })
+  const response = await client.get({ url: '/health', signal })
+  return response.data
 }

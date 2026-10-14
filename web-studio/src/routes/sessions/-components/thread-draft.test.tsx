@@ -52,7 +52,7 @@ it('does not request draft history and persists only once on first send', async 
   m.create.mockResolvedValue({ session_id: 'draft' })
   render(<Thread sessionId="draft" draft />)
   expect(m.create).not.toHaveBeenCalled()
-  expect(m.history).toHaveBeenLastCalledWith(undefined, true)
+  expect(m.history).toHaveBeenLastCalledWith(undefined)
   await act(async () => {
     expect(await m.onSend!('first')).toBe(true)
   })
@@ -61,7 +61,7 @@ it('does not request draft history and persists only once on first send', async 
   })
   expect(m.create).toHaveBeenCalledExactlyOnceWith('draft')
   expect(m.send).toHaveBeenCalledWith('first')
-  expect(m.history).toHaveBeenLastCalledWith(undefined, true)
+  expect(m.history).toHaveBeenLastCalledWith(undefined)
 })
 
 it('rejects failed creation so the composer can retain input', async () => {
@@ -96,9 +96,9 @@ it('does not send after leaving a draft during creation', async () => {
 
 it('loads the correct history when switching existing sessions', () => {
   const view = render(<Thread sessionId="first" />)
-  expect(m.history).toHaveBeenLastCalledWith('first', true)
+  expect(m.history).toHaveBeenLastCalledWith('first')
   view.rerender(<Thread sessionId="second" />)
-  expect(m.history).toHaveBeenLastCalledWith('second', true)
+  expect(m.history).toHaveBeenLastCalledWith('second')
   expect(m.create).not.toHaveBeenCalled()
 })
 
@@ -125,7 +125,7 @@ it('loads persisted history and continues after switching tabs', async () => {
   })
   act(() => showThread(false))
   act(() => showThread(true))
-  expect(m.history).toHaveBeenLastCalledWith('draft', true)
+  expect(m.history).toHaveBeenLastCalledWith('draft')
   await act(async () => {
     expect(await m.onSend!('second')).toBe(true)
   })
@@ -137,7 +137,7 @@ it('preserves hosted session history without exposing a Bot composer or draft se
   m.provider = 'volcengine'
   m.history.mockReturnValue({ isPending: false, data: [] })
   render(<Thread sessionId="hosted-session" />)
-  expect(m.history).toHaveBeenLastCalledWith('hosted-session', false)
+  expect(m.history).toHaveBeenLastCalledWith('hosted-session')
   expect(m.onSend).toBeUndefined()
   expect(m.send).not.toHaveBeenCalled()
   expect(m.create).not.toHaveBeenCalled()

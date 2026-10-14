@@ -4,7 +4,7 @@ import { StudioSetup } from './studio-setup'
 import {
   needsStudioSetup,
   studioSetupDestination,
-} from '#/lib/studio-onboarding'
+} from '#/lib/connection/onboarding'
 import * as React from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import {
@@ -66,10 +66,10 @@ import {
   AppConnectionProvider,
   useAppConnection,
 } from '#/hooks/use-app-connection'
-import type { ServerMode } from '#/hooks/use-server-mode'
+import type { ServerMode } from '#/lib/connection/health'
 import { cn } from '#/lib/utils'
 import { useGateway } from '#/routes/gateway/-lib/use-gateway'
-import { fetchServerHealth } from '#/hooks/use-server-mode'
+import { fetchServerHealth } from '#/lib/connection/health'
 import { useStudioService } from '#/hooks/use-studio-service'
 import { useStudioCapabilities } from '#/hooks/use-studio-capabilities'
 import { featureForPath, isStudioFeatureVisible } from '#/lib/studio-service'

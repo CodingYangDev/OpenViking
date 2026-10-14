@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { fetchServerHealth } from './use-server-mode'
+import { fetchServerHealth } from '#/lib/connection/health'
 
 const { getHealthMock } = vi.hoisted(() => ({
   getHealthMock: vi.fn(),

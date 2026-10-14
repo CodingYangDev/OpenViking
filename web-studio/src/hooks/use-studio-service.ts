@@ -1,3 +1,4 @@
+import { isUsableServerHealth } from '#/lib/connection/health'
 import { useAppConnection } from './use-app-connection'
 import { resolveConfiguredServiceProvider } from '#/lib/studio-service'
 
@@ -7,13 +8,7 @@ export function useStudioService() {
   const ready =
     serverMode !== 'checking' &&
     serverMode !== 'offline' &&
-    Boolean(
-      serverHealth &&
-      serverHealth.status !== 'error' &&
-      !serverHealth.error &&
-      (typeof serverHealth.version === 'string' ||
-        typeof serverHealth.auth_mode === 'string'),
-    )
+    isUsableServerHealth(serverHealth)
   return {
     provider: ready
       ? resolveConfiguredServiceProvider(

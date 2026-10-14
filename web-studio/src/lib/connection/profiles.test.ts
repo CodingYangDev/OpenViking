@@ -6,8 +6,8 @@ import {
   updateActiveProfile,
   normalizeProfileConnection,
   isValidConnectionUrl,
-} from './connection-profiles'
-import type { ConnectionDraft } from '#/hooks/use-app-connection'
+} from '#/lib/connection/profiles'
+import type { ConnectionDraft } from '#/lib/connection/types'
 
 const fallback: ConnectionDraft = {
   baseUrl: 'http://10.37.244.186:8020',

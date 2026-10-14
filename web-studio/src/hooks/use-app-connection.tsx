@@ -1,11 +1,13 @@
-import { resolveApiKeyAuth } from '#/lib/studio-auth'
+import {
+  resolveApiKeyAuth,
+  createConnectionHealthHeaders,
+} from '#/lib/connection/auth'
 import * as React from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useRouterState } from '@tanstack/react-router'
 
 import i18n from '#/i18n'
 import { identifyServiceProvider } from '#/lib/studio-service'
-import type { ServiceSelection } from '#/lib/studio-service'
 import { fetchAdminAccounts } from '#/lib/admin'
 import { isOvClientError, ovClient } from '#/lib/ov-client'
 import {
@@ -14,30 +16,25 @@ import {
   updateActiveProfile,
   normalizeProfileConnection,
   isValidConnectionUrl,
-} from '#/lib/connection-profiles'
+} from '#/lib/connection/profiles'
 import type {
   ConnectionProfile,
   ConnectionProfiles,
-} from '#/lib/connection-profiles'
+} from '#/lib/connection/profiles'
 
 import {
   resolveServerAuthMode,
   resetServerHealthCache,
   fetchServerHealth,
   normalizeBaseUrl,
-} from './use-server-mode'
-import type { ServerMode } from './use-server-mode'
+  readServerIdentity,
+} from '#/lib/connection/health'
+import type { ServerMode } from '#/lib/connection/health'
 
-export type ConnectionRole = 'admin' | 'root' | 'unknown' | 'user'
+import type { ConnectionDraft, ConnectionRole } from '#/lib/connection/types'
 
-export type ConnectionDraft = {
-  serviceSelection?: ServiceSelection
-  accountId: string
-  adminApiKey: string
-  apiKey: string
-  baseUrl: string
-  userId: string
-}
+export type { ConnectionDraft, ConnectionRole } from '#/lib/connection/types'
+export { createConnectionHealthHeaders } from '#/lib/connection/auth'
 
 export type ConnectionIdentitySummary = {
   labelKey: string
@@ -337,34 +334,6 @@ type ConnectionIdentity = {
   userId: string
 }
 
-export function createConnectionHealthHeaders(
-  connection: ConnectionDraft,
-  credential: 'control' | 'data' = 'control',
-): Record<string, string> {
-  const headers: Record<string, string> = {}
-  const auth = resolveApiKeyAuth(
-    connection.baseUrl,
-    connection.serviceSelection,
-  )
-  const apiKey =
-    auth === 'bearer'
-      ? connection.apiKey
-      : credential === 'data'
-        ? connection.apiKey || connection.adminApiKey
-        : connection.adminApiKey || connection.apiKey
-  if (!apiKey) return headers
-  headers[auth === 'bearer' ? 'Authorization' : 'X-API-Key'] =
-    auth === 'bearer' ? `Bearer ${apiKey}` : apiKey
-  const isHosted = auth === 'bearer'
-  if (!isHosted && connection.accountId) {
-    headers['X-OpenViking-Account'] = connection.accountId
-  }
-  if (!isHosted && connection.userId) {
-    headers['X-OpenViking-User'] = connection.userId
-  }
-  return headers
-}
-
 async function canListAccounts(connection: ConnectionDraft): Promise<boolean> {
   if (
     !connection.adminApiKey ||
@@ -412,9 +381,8 @@ async function detectConnectionIdentity(
       : healthRole
 
   return {
-    accountId: typeof data.account_id === 'string' ? data.account_id : '',
+    ...readServerIdentity(data),
     role,
-    userId: typeof data.user_id === 'string' ? data.user_id : '',
   }
 }
 

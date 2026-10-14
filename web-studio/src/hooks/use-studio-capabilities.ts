@@ -1,13 +1,8 @@
-import { resolveApiKeyAuth } from '#/lib/studio-auth'
 import { useQueries } from '@tanstack/react-query'
 import { useAppConnection } from './use-app-connection'
 import { useStudioService } from './use-studio-service'
-import {
-  STUDIO_FEATURES,
-  classifyCapabilityError,
-  classifyCapabilityResponse,
-} from '#/lib/studio-service'
-import { normalizeOvClientError, createOvClient } from '#/lib/ov-client'
+import { STUDIO_FEATURES } from '#/lib/studio-service'
+import { fetchStudioCapability } from '#/lib/connection/capabilities'
 
 // Only inexpensive, object-free GETs. Do not probe writes, imports, or search.
 export function useStudioCapabilities() {
@@ -19,35 +14,7 @@ export function useStudioCapabilities() {
       queryKey: ['studio-feature', identityScopeKey, feature.id],
       enabled: service.ready && service.provider === 'volcengine',
       queryFn: async ({ signal }: { signal: AbortSignal }) => {
-        try {
-          // Capture credentials with the query's scope. A mutable global client
-          // can otherwise attach a new key to an old connection's request.
-          const client = createOvClient({
-            apiKeyStorageKey: '',
-            apiKeyAuth: resolveApiKeyAuth(
-              connection.baseUrl,
-              connection.serviceSelection,
-            ),
-            baseUrl: connection.baseUrl,
-            connection: {
-              apiKey:
-                resolveApiKeyAuth(
-                  connection.baseUrl,
-                  connection.serviceSelection,
-                ) === 'bearer'
-                  ? connection.apiKey
-                  : connection.apiKey || connection.adminApiKey,
-            },
-          })
-          const response = await client.instance.get(feature.probe, {
-            baseURL: connection.baseUrl.replace(/\/+$/, ''),
-            signal,
-            timeout: 8_000,
-          })
-          return classifyCapabilityResponse(feature.id, response.data)
-        } catch (error) {
-          return classifyCapabilityError(normalizeOvClientError(error))
-        }
+        return fetchStudioCapability(connection, feature, signal)
       },
       retry: false,
       staleTime: 60_000,

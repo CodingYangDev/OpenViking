@@ -30,12 +30,10 @@ const studio = {
   },
 
   selectSessionRecord:
-    'Select a session from the list to view its current context.',
+    'Select a session from the list to view its conversation history.',
   noSessionRecords: 'No session records are accessible to this identity.',
   sessionRecords: 'Session records',
   processingTasks: 'Processing tasks',
-  hostedSessionHistory:
-    'Only current context messages are shown; archived history is not loaded. Committed sessions may have no current messages.',
   backToFiles: 'Back to files',
   showOverview: 'Show statistics and queues',
   hideOverview: 'Hide statistics and queues',

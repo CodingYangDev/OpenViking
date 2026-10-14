@@ -14,11 +14,11 @@ import { Input } from '#/components/ui/input'
 import { Field, FieldLabel } from '#/components/ui/field'
 import { useAppConnection } from '#/hooks/use-app-connection'
 import { PLAIN_INPUT_PROPS } from '#/lib/form-input'
-import type { ConnectionProfile } from '#/lib/connection-profiles'
+import type { ConnectionProfile } from '#/lib/connection/profiles'
 import {
   isValidConnectionUrl,
   normalizeProfileConnection,
-} from '#/lib/connection-profiles'
+} from '#/lib/connection/profiles'
 
 const PROFILE_FIELDS = [
   'baseUrl',

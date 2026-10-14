@@ -1,5 +1,5 @@
 import axios, { AxiosHeaders } from 'axios'
-import { resolveApiKeyAuth } from '#/lib/studio-auth'
+import { resolveApiKeyAuth } from '#/lib/connection/auth'
 import type { InternalAxiosRequestConfig } from 'axios'
 
 import { createClient } from '#/gen/ov-client/client'

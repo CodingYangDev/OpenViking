@@ -26,12 +26,10 @@ const studio = {
     },
   },
 
-  selectSessionRecord: '从左侧选择一个会话，查看其当前上下文。',
+  selectSessionRecord: '从左侧选择一个会话，查看其历史消息。',
   noSessionRecords: '当前身份没有可查看的会话记录。',
   sessionRecords: '会话记录',
   processingTasks: '处理任务',
-  hostedSessionHistory:
-    '仅展示当前上下文消息，历史归档未加载。提交过的会话可能没有当前消息。',
   backToFiles: '返回文件列表',
   showOverview: '展开统计与队列',
   hideOverview: '收起统计与队列',
