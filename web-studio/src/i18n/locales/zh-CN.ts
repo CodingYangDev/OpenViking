@@ -1,3 +1,4 @@
+import onboarding from './zh-CN/onboarding'
 import studio from './zh-CN/studio'
 import vikingbot from './zh-CN/vikingbot'
 import gateway from './zh-CN/gateway'
@@ -10,6 +11,7 @@ import memoryTemplates from './zh-CN/memory-templates'
 
 const zhCN = {
   studio,
+  onboarding,
   gateway,
   compile,
   vikingbot,

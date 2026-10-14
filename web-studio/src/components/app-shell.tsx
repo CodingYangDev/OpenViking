@@ -1,3 +1,6 @@
+import studioI18n from '#/i18n'
+import { StudioSetup } from './studio-setup'
+import { needsStudioSetup } from '#/lib/studio-onboarding'
 import * as React from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import {
@@ -274,6 +277,22 @@ function NavGroupItem({ item, pathname, title, t }: NavGroupItemProps) {
 }
 
 export function AppShell({ children }: { children: React.ReactNode }) {
+  const navigate = useNavigate()
+  const [needsSetup, setNeedsSetup] = React.useState(needsStudioSetup)
+  if (needsSetup)
+    return (
+      <StudioSetup
+        onComplete={(connection) => {
+          setNeedsSetup(false)
+          void navigate({
+            to:
+              connection.serviceSelection === 'volcengine'
+                ? '/filesystem'
+                : '/home',
+          })
+        }}
+      />
+    )
   return (
     <AppConnectionProvider>
       <IdentityScopedAppShell>{children}</IdentityScopedAppShell>
@@ -283,6 +302,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
 function IdentityScopedAppShell({ children }: { children: React.ReactNode }) {
   const { identityScopeKey, serverMode } = useAppConnection()
+  if (serverMode === 'checking')
+    return (
+      <div
+        role="status"
+        className="flex min-h-svh items-center justify-center bg-background text-sm text-muted-foreground"
+      >
+        {studioI18n.t('studio:loading')}
+      </div>
+    )
   return (
     <AppShellInner key={identityScopeKey}>
       <ConnectionScopedRouteContent serverMode={serverMode}>

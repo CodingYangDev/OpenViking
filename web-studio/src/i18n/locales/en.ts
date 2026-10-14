@@ -1,3 +1,4 @@
+import onboarding from './en/onboarding'
 import studio from './en/studio'
 import vikingbot from './en/vikingbot'
 import compile from './en/compile'
@@ -10,6 +11,7 @@ import gateway from './en/gateway'
 
 const en = {
   studio,
+  onboarding,
   gateway,
   compile,
   vikingbot,

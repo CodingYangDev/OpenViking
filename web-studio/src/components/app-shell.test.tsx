@@ -1,9 +1,14 @@
 // @vitest-environment jsdom
 
 import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { ConnectionScopedRouteContent } from './app-shell'
+import { AppShell, ConnectionScopedRouteContent } from './app-shell'
+
+vi.mock('@tanstack/react-router', async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  useNavigate: () => vi.fn(),
+}))
 
 afterEach(cleanup)
 
@@ -30,4 +35,19 @@ describe('ConnectionScopedRouteContent', () => {
       expect(screen.getByTestId('identity-scoped-route')).toBeTruthy()
     },
   )
+})
+
+it('shows first-use setup before mounting business routes or the connection provider', () => {
+  localStorage.clear()
+  sessionStorage.clear()
+  render(
+    <AppShell>
+      <span data-testid="business-route" />
+    </AppShell>,
+  )
+  expect(screen.queryByTestId('business-route')).toBeNull()
+  expect(screen.getByRole('heading', { level: 1 }).textContent).toContain(
+    'Welcome',
+  )
+  expect(localStorage.getItem('ov_console_connection_profiles')).toBeNull()
 })
