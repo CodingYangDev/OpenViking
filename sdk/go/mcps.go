@@ -106,6 +106,7 @@ func (c *Client) MountMCPTool(ctx context.Context, toolURI string, nodeURI strin
 	arguments := map[string]any{}
 	var tags []string
 	var description *string
+	wait := false
 	if opts != nil {
 		description = opts.Description
 		if opts.TimeoutSeconds != 0 {
@@ -115,6 +116,7 @@ func (c *Client) MountMCPTool(ctx context.Context, toolURI string, nodeURI strin
 			arguments = opts.Arguments
 		}
 		tags = opts.Tags
+		wait = opts.Wait
 	}
 	payload := map[string]any{
 		"tool_uri":        NormalizeURI(toolURI),
@@ -123,6 +125,7 @@ func (c *Client) MountMCPTool(ctx context.Context, toolURI string, nodeURI strin
 		"description":     description,
 		"timeout_seconds": timeoutSeconds,
 		"arguments":       arguments,
+		"wait":            wait,
 	}
 	if tags != nil {
 		payload["tags"] = tags
@@ -132,11 +135,75 @@ func (c *Client) MountMCPTool(ctx context.Context, toolURI string, nodeURI strin
 	return result, err
 }
 
+// BatchMountMCPTools creates or replaces multiple MCP-backed live context nodes.
+func (c *Client) BatchMountMCPTools(ctx context.Context, mounts []MCPToolMount, opts ...*WaitOptions) (map[string]any, error) {
+	items := make([]map[string]any, 0, len(mounts))
+	for _, mount := range mounts {
+		timeoutSeconds := mount.TimeoutSeconds
+		if timeoutSeconds == 0 {
+			timeoutSeconds = 60
+		}
+		arguments := mount.Arguments
+		if arguments == nil {
+			arguments = map[string]any{}
+		}
+		item := map[string]any{
+			"tool_uri":        NormalizeURI(mount.ToolURI),
+			"node_uri":        NormalizeURI(mount.NodeURI),
+			"title":           mount.Title,
+			"description":     mount.Description,
+			"timeout_seconds": timeoutSeconds,
+			"arguments":       arguments,
+		}
+		if mount.Tags != nil {
+			item["tags"] = mount.Tags
+		}
+		items = append(items, item)
+	}
+	wait := false
+	if len(opts) > 0 && opts[0] != nil {
+		wait = opts[0].Wait
+	}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/mcps/batch-mount", nil, map[string]any{
+		"mounts": items,
+		"wait":   wait,
+	}, &result)
+	return result, err
+}
+
 // UnmountMCPTool removes a live context mount and its node.
-func (c *Client) UnmountMCPTool(ctx context.Context, nodeURI string) (map[string]any, error) {
+func (c *Client) UnmountMCPTool(ctx context.Context, nodeURI string, opts ...*WaitOptions) (map[string]any, error) {
 	query := url.Values{"node_uri": []string{NormalizeURI(nodeURI)}}
+	wait := false
+	if len(opts) > 0 && opts[0] != nil {
+		wait = opts[0].Wait
+	}
+	queryBool(query, "wait", wait)
 	var result map[string]any
 	err := c.doJSON(ctx, http.MethodDelete, "/api/v1/mcps/mount", query, nil, &result)
+	return result, err
+}
+
+// BatchUnmountMCPTools removes multiple live context mounts and their nodes.
+func (c *Client) BatchUnmountMCPTools(ctx context.Context, nodeURIs []string, opts ...*WaitOptions) (map[string]any, error) {
+	normalized := make([]string, len(nodeURIs))
+	for index, nodeURI := range nodeURIs {
+		normalized[index] = NormalizeURI(nodeURI)
+	}
+	wait := false
+	if len(opts) > 0 && opts[0] != nil {
+		wait = opts[0].Wait
+	}
+	var result map[string]any
+	err := c.doJSON(
+		ctx,
+		http.MethodPost,
+		"/api/v1/mcps/batch-unmount",
+		nil,
+		map[string]any{"node_uris": normalized, "wait": wait},
+		&result,
+	)
 	return result, err
 }
 

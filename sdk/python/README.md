@@ -306,6 +306,22 @@ mounted = client.mount_mcp_tool(
     timeout_seconds=60,
     arguments={"city": "Beijing"},
     tags=["project=weather", "kind=live-context"],
+    wait=True,
+)
+batch_result = client.batch_mount_mcp_tools(
+    [
+        {
+            "tool_uri": "viking://agent/tools/weather/current.json",
+            "node_uri": "viking://resources/arranger/shanghai-weather.md",
+            "title": "Shanghai Weather",
+            "arguments": {"city": "Shanghai"},
+        }
+    ],
+    wait=True,
+)
+client.batch_unmount_mcp_tools(
+    ["viking://resources/arranger/shanghai-weather.md"],
+    wait=True,
 )
 sync_result = client.sync_mcp("weather")
 print(sync_result["changes"])
@@ -315,7 +331,8 @@ print(sync_result["affected_mounts"])
 The async client exposes the same methods. MCP operations include `add_mcp`,
 `remove_mcp`, `list_mcps`, `get_mcp`, `validate_mcp`, `sync_mcp`,
 `get_mcp_status`, `find_mcp_tools`, `invoke_mcp_tool`, `mount_mcp_tool`,
-`unmount_mcp_tool`, and `list_mcp_mounts`.
+`batch_mount_mcp_tools`, `unmount_mcp_tool`, `batch_unmount_mcp_tools`, and
+`list_mcp_mounts`.
 
 ### Core Parameters and Options
 

@@ -67,7 +67,7 @@ _, _, _ = imageResults, storedImageResults, similarPosters
 |------|---------|
 | 资源和技能导入 | `AddResource`, `AddSkill`, `WaitProcessed` |
 | 技能管理 | `ListSkills`, `FindSkills`, `ValidateSkill`, `GetSkill`, `UpdateSkill`, `DeleteSkill` |
-| MCP Server 与实时上下文 | `AddMCP`, `RemoveMCP`, `ListMCPs`, `FindMCPTools`, `ValidateMCP`, `GetMCP`, `SyncMCP`, `GetMCPStatus`, `InvokeMCPTool`, `MountMCPTool`, `UnmountMCPTool`, `ListMCPMounts` |
+| MCP Server 与实时上下文 | `AddMCP`, `RemoveMCP`, `ListMCPs`, `FindMCPTools`, `ValidateMCP`, `GetMCP`, `SyncMCP`, `GetMCPStatus`, `InvokeMCPTool`, `MountMCPTool`, `BatchMountMCPTools`, `UnmountMCPTool`, `BatchUnmountMCPTools`, `ListMCPMounts` |
 | Watch 管理 | `ListWatches`, `GetWatch`, `UpdateWatch`, `DeleteWatch`, `TriggerWatch` |
 | 文件系统和内容 | `List`, `Tree`, `Stat`, `Attrs`, `Mkdir`, `Remove`, `Move`, `Read`, `Abstract`, `Overview`, `Write`, `SetTags`, `Reindex` |
 | 检索 | `Find`, `Search`, `Grep`, `Glob` |
@@ -154,11 +154,25 @@ mounted, err := client.MountMCPTool(
         TimeoutSeconds: 60,
         Arguments:      map[string]any{"city": "Beijing"},
         Tags:           []string{"project=weather", "kind=live-context"},
+        Wait:           true,
     },
+)
+batchMounted, err := client.BatchMountMCPTools(ctx, []openviking.MCPToolMount{
+    {
+        ToolURI:   "viking://agent/tools/weather/current.json",
+        NodeURI:   "viking://resources/arranger/shanghai-weather.md",
+        Title:     "上海天气",
+        Arguments: map[string]any{"city": "Shanghai"},
+    },
+}, &openviking.WaitOptions{Wait: true})
+batchUnmounted, err := client.BatchUnmountMCPTools(
+    ctx,
+    []string{"viking://resources/arranger/shanghai-weather.md"},
+    &openviking.WaitOptions{Wait: true},
 )
 syncResult, err := client.SyncMCP(ctx, "weather")
 
-_, _, _, _ = tools, mounted, syncResult, err
+_, _, _, _, _, _ = tools, mounted, batchMounted, batchUnmounted, syncResult, err
 ```
 
 `AddResource` 在 `WatchInterval > 0` 时会创建 watch；已有任务可用专用 watch 方法管理：

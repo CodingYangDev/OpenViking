@@ -11,6 +11,7 @@ import re
 import sqlite3
 import tempfile
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -55,6 +56,17 @@ CREATE TABLE IF NOT EXISTS live_context_nodes (
 CREATE INDEX IF NOT EXISTS idx_live_context_nodes_tool
 ON live_context_nodes (mcp_name, tool_name);
 """
+
+
+@dataclass(frozen=True, slots=True)
+class MCPToolMount:
+    tool_uri: str
+    node_uri: str
+    title: str
+    description: str | None
+    timeout_seconds: int
+    arguments: dict[str, Any]
+    tags: list[str] | None
 
 
 def _now() -> str:
@@ -535,6 +547,17 @@ class MCPService:
         return normalized
 
     @staticmethod
+    def _batch_mount_root(node_uri: str) -> str | None:
+        prefix = "viking://resources/"
+        if not node_uri.startswith(prefix):
+            return None
+        relative = node_uri[len(prefix) :]
+        top_level, separator, _ = relative.partition("/")
+        if not separator or not top_level:
+            return None
+        return f"{prefix}{top_level}"
+
+    @staticmethod
     def _render_live_context_node(
         tool_uri: str,
         tool_document: dict[str, Any],
@@ -832,6 +855,7 @@ class MCPService:
         ctx: RequestContext,
         *,
         tags: list[str] | None = None,
+        wait: bool = False,
     ) -> dict[str, Any]:
         if not title.strip():
             raise InvalidArgumentError("Live context node title must not be empty")
@@ -867,7 +891,7 @@ class MCPService:
                     content,
                     ctx=ctx,
                     mode="replace",
-                    wait=True,
+                    wait=wait,
                     tags=tags,
                 )
                 connection.execute(
@@ -910,7 +934,164 @@ class MCPService:
             "mounted": True,
         }
 
-    async def unmount(self, node_uri: str, ctx: RequestContext) -> dict[str, Any]:
+    async def batch_mount(
+        self,
+        mounts: list[MCPToolMount],
+        ctx: RequestContext,
+        *,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        if not mounts:
+            raise InvalidArgumentError("Batch mount must contain at least one mount")
+
+        async with self._lock(ctx.account_id):
+            prepared: list[dict[str, Any]] = []
+            seen_node_uris: set[str] = set()
+            tool_documents: dict[str, dict[str, Any]] = {}
+            for mount in mounts:
+                title = mount.title
+                timeout_seconds = mount.timeout_seconds
+                arguments = mount.arguments
+                if not title.strip():
+                    raise InvalidArgumentError("Live context node title must not be empty")
+                if timeout_seconds <= 0:
+                    raise InvalidArgumentError("Live context node timeout_seconds must be positive")
+                node_uri = self._validate_node_uri(mount.node_uri, ctx)
+                if node_uri in seen_node_uris:
+                    raise InvalidArgumentError(f"Duplicate batch mount node URI: {node_uri}")
+                seen_node_uris.add(node_uri)
+
+                tool_uri = mount.tool_uri
+                tool_document = tool_documents.get(tool_uri)
+                if tool_document is None:
+                    tool_document = await self._tool(tool_uri, ctx)
+                    tool_documents[tool_uri] = tool_document
+                self._validate_tool_arguments(tool_document, arguments)
+                match = _TOOL_URI_RE.fullmatch(tool_uri)
+                assert match is not None
+                prepared.append(
+                    {
+                        "tool_uri": mount.tool_uri,
+                        "node_uri": node_uri,
+                        "title": mount.title,
+                        "description": mount.description,
+                        "timeout_seconds": mount.timeout_seconds,
+                        "arguments": mount.arguments,
+                        "tags": mount.tags,
+                        "tool_document": tool_document,
+                        "server_name": match.group("server"),
+                        "tool_name": match.group("tool"),
+                        "content": self._render_live_context_node(
+                            tool_uri,
+                            tool_document,
+                            title,
+                            mount.description,
+                            timeout_seconds,
+                            arguments,
+                        ),
+                    }
+                )
+
+            connection = await self._open_mount_database(ctx)
+            try:
+                for item in prepared:
+                    existing = connection.execute(
+                        "SELECT created_at FROM live_context_nodes WHERE node_uri = ?",
+                        (item["node_uri"],),
+                    ).fetchone()
+                    item["created_at"] = existing["created_at"] if existing is not None else _now()
+
+                operations_by_root: dict[str, list[dict[str, Any]]] = {}
+                direct_writes: list[dict[str, Any]] = []
+                for item in prepared:
+                    root_uri = self._batch_mount_root(item["node_uri"])
+                    if root_uri is None:
+                        direct_writes.append(item)
+                        continue
+                    operation = {
+                        "uri": item["node_uri"],
+                        "content": item["content"],
+                        "mode": "replace",
+                    }
+                    if item.get("tags") is not None:
+                        operation["tags"] = item["tags"]
+                    operations_by_root.setdefault(root_uri, []).append(operation)
+
+                for root_uri, operations in operations_by_root.items():
+                    await self._ensure_directory(root_uri, ctx)
+                    await self._service.fs.batch_write(
+                        root_uri=root_uri,
+                        operations=operations,
+                        ctx=ctx,
+                        wait=wait,
+                    )
+                for item in direct_writes:
+                    await self._service.fs.write(
+                        item["node_uri"],
+                        item["content"],
+                        ctx=ctx,
+                        mode="replace",
+                        wait=wait,
+                        tags=item.get("tags"),
+                    )
+
+                for item in prepared:
+                    connection.execute(
+                        """
+                        INSERT INTO live_context_nodes (
+                            node_uri, mcp_name, tool_name, tool_uri, revision, args_json,
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(node_uri) DO UPDATE SET
+                            mcp_name = excluded.mcp_name,
+                            tool_name = excluded.tool_name,
+                            tool_uri = excluded.tool_uri,
+                            revision = excluded.revision,
+                            args_json = excluded.args_json
+                        """,
+                        (
+                            item["node_uri"],
+                            item["server_name"],
+                            item["tool_name"],
+                            item["tool_uri"],
+                            item["tool_document"]["revision"],
+                            json.dumps(
+                                item["arguments"],
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            item["created_at"],
+                        ),
+                    )
+                await self._write_mount_database(connection, ctx)
+            finally:
+                self._close_mount_database(connection)
+
+        results = [
+            {
+                "node_uri": item["node_uri"],
+                "mcp": item["server_name"],
+                "tool": item["tool_name"],
+                "tool_uri": item["tool_uri"],
+                "revision": item["tool_document"]["revision"],
+                "title": item["title"],
+                "description": item.get("description"),
+                "timeout_seconds": item["timeout_seconds"],
+                "arguments": item["arguments"],
+                "created_at": item["created_at"],
+                "mounted": True,
+            }
+            for item in prepared
+        ]
+        return {"mounts": results, "total": len(results)}
+
+    async def unmount(
+        self,
+        node_uri: str,
+        ctx: RequestContext,
+        *,
+        wait: bool = False,
+    ) -> dict[str, Any]:
         node_uri = self._validate_node_uri(node_uri, ctx)
         async with self._lock(ctx.account_id):
             connection = await self._open_mount_database(ctx)
@@ -925,7 +1106,7 @@ class MCPService:
                     content = await self._service.fs.read(node_uri, ctx=ctx)
                 except (AGFSNotFoundError, NotFoundError, FileNotFoundError):
                     content = None
-                await self._service.fs.rm(node_uri, ctx=ctx, recursive=False, wait=True)
+                await self._service.fs.rm(node_uri, ctx=ctx, recursive=False, wait=wait)
                 connection.execute(
                     "DELETE FROM live_context_nodes WHERE node_uri = ?",
                     (node_uri,),
@@ -951,6 +1132,97 @@ class MCPService:
             "tool_uri": row["tool_uri"],
             "unmounted": True,
         }
+
+    async def batch_unmount(
+        self,
+        node_uris: list[str],
+        ctx: RequestContext,
+        *,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        if not node_uris:
+            raise InvalidArgumentError("Batch unmount must contain at least one node URI")
+
+        normalized_node_uris: list[str] = []
+        seen_node_uris: set[str] = set()
+        for raw_node_uri in node_uris:
+            node_uri = self._validate_node_uri(raw_node_uri, ctx)
+            if node_uri in seen_node_uris:
+                raise InvalidArgumentError(f"Duplicate batch unmount node URI: {node_uri}")
+            seen_node_uris.add(node_uri)
+            normalized_node_uris.append(node_uri)
+
+        async with self._lock(ctx.account_id):
+            connection = await self._open_mount_database(ctx)
+            try:
+                rows = []
+                contents: dict[str, str | None] = {}
+                for node_uri in normalized_node_uris:
+                    row = connection.execute(
+                        "SELECT * FROM live_context_nodes WHERE node_uri = ?",
+                        (node_uri,),
+                    ).fetchone()
+                    if row is None:
+                        raise NotFoundError(node_uri, "live context mount")
+                    rows.append(row)
+                    try:
+                        contents[node_uri] = await self._service.fs.read(node_uri, ctx=ctx)
+                    except (AGFSNotFoundError, NotFoundError, FileNotFoundError):
+                        contents[node_uri] = None
+
+                deleted_node_uris: list[str] = []
+                try:
+                    for node_uri in normalized_node_uris:
+                        await self._service.fs.rm(
+                            node_uri,
+                            ctx=ctx,
+                            recursive=False,
+                            wait=wait,
+                        )
+                        deleted_node_uris.append(node_uri)
+                except Exception:
+                    for node_uri in deleted_node_uris:
+                        content = contents[node_uri]
+                        if content is not None:
+                            await self._service.fs.write(
+                                node_uri,
+                                content,
+                                ctx=ctx,
+                                mode="create",
+                                wait=True,
+                            )
+                    raise
+                connection.executemany(
+                    "DELETE FROM live_context_nodes WHERE node_uri = ?",
+                    [(node_uri,) for node_uri in normalized_node_uris],
+                )
+                try:
+                    await self._write_mount_database(connection, ctx)
+                except Exception:
+                    for node_uri, content in contents.items():
+                        if content is not None:
+                            await self._service.fs.write(
+                                node_uri,
+                                content,
+                                ctx=ctx,
+                                mode="create",
+                                wait=True,
+                            )
+                    raise
+            finally:
+                self._close_mount_database(connection)
+
+        results = [
+            {
+                "node_uri": row["node_uri"],
+                "mcp": row["mcp_name"],
+                "tool": row["tool_name"],
+                "tool_uri": row["tool_uri"],
+                "unmounted": True,
+            }
+            for row in rows
+        ]
+        return {"unmounts": results, "total": len(results)}
 
     async def mounts(
         self,

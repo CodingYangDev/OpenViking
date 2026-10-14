@@ -39,8 +39,24 @@ async def test_async_http_client_exposes_all_mcp_operations():
         timeout_seconds=120,
         arguments={"city": "Beijing"},
         tags=["project=demo", "kind=live-context"],
+        wait=True,
     )
-    await client.unmount_mcp_tool("resources/demo/weather.md")
+    await client.batch_mount_mcp_tools(
+        [
+            {
+                "tool_uri": "agent/tools/demo/current.json",
+                "node_uri": "resources/demo/batch.md",
+                "title": "Batch Weather",
+                "tags": ["project=demo"],
+            }
+        ],
+        wait=True,
+    )
+    await client.unmount_mcp_tool("resources/demo/weather.md", wait=True)
+    await client.batch_unmount_mcp_tools(
+        ["resources/demo/batch.md"],
+        wait=True,
+    )
     await client.list_mcp_mounts("demo", tool="current")
 
     assert fake_http.request.await_args_list == [
@@ -91,12 +107,42 @@ async def test_async_http_client_exposes_all_mcp_operations():
                 "timeout_seconds": 120,
                 "arguments": {"city": "Beijing"},
                 "tags": ["project=demo", "kind=live-context"],
+                "wait": True,
+            },
+        ),
+        call(
+            "POST",
+            "/api/v1/mcps/batch-mount",
+            json={
+                "mounts": [
+                    {
+                        "tool_uri": "viking://agent/tools/demo/current.json",
+                        "node_uri": "viking://resources/demo/batch.md",
+                        "title": "Batch Weather",
+                        "description": None,
+                        "timeout_seconds": 60,
+                        "arguments": {},
+                        "tags": ["project=demo"],
+                    }
+                ],
+                "wait": True,
             },
         ),
         call(
             "DELETE",
             "/api/v1/mcps/mount",
-            params={"node_uri": "viking://resources/demo/weather.md"},
+            params={
+                "node_uri": "viking://resources/demo/weather.md",
+                "wait": True,
+            },
+        ),
+        call(
+            "POST",
+            "/api/v1/mcps/batch-unmount",
+            json={
+                "node_uris": ["viking://resources/demo/batch.md"],
+                "wait": True,
+            },
         ),
         call(
             "GET",
@@ -119,6 +165,17 @@ async def test_async_http_client_mcp_defaults_match_server_contract():
         "viking://resources/demo/weather.md",
         "Weather",
     )
+    await client.batch_mount_mcp_tools(
+        [
+            {
+                "tool_uri": "viking://agent/tools/demo/current.json",
+                "node_uri": "viking://resources/demo/batch.md",
+                "title": "Batch Weather",
+            }
+        ]
+    )
+    await client.unmount_mcp_tool("viking://resources/demo/weather.md")
+    await client.batch_unmount_mcp_tools(["viking://resources/demo/batch.md"])
     await client.list_mcp_mounts("demo")
 
     assert fake_http.request.await_args_list == [
@@ -140,6 +197,40 @@ async def test_async_http_client_mcp_defaults_match_server_contract():
                 "description": None,
                 "timeout_seconds": 60,
                 "arguments": {},
+                "wait": False,
+            },
+        ),
+        call(
+            "POST",
+            "/api/v1/mcps/batch-mount",
+            json={
+                "mounts": [
+                    {
+                        "tool_uri": "viking://agent/tools/demo/current.json",
+                        "node_uri": "viking://resources/demo/batch.md",
+                        "title": "Batch Weather",
+                        "description": None,
+                        "timeout_seconds": 60,
+                        "arguments": {},
+                    }
+                ],
+                "wait": False,
+            },
+        ),
+        call(
+            "DELETE",
+            "/api/v1/mcps/mount",
+            params={
+                "node_uri": "viking://resources/demo/weather.md",
+                "wait": False,
+            },
+        ),
+        call(
+            "POST",
+            "/api/v1/mcps/batch-unmount",
+            json={
+                "node_uris": ["viking://resources/demo/batch.md"],
+                "wait": False,
             },
         ),
         call("GET", "/api/v1/mcps/mounts", params={"mcp": "demo"}),
@@ -158,7 +249,9 @@ def test_sync_http_client_exposes_and_forwards_mcp_operations():
         "get_mcp_status",
         "invoke_mcp_tool",
         "mount_mcp_tool",
+        "batch_mount_mcp_tools",
         "unmount_mcp_tool",
+        "batch_unmount_mcp_tools",
         "list_mcp_mounts",
     ]
     assert all(name in SyncHTTPClient.__dict__ for name in method_names)
@@ -174,6 +267,7 @@ def test_sync_http_client_exposes_and_forwards_mcp_operations():
         timeout_seconds=90,
         arguments={"city": "Beijing"},
         tags=["project=demo"],
+        wait=True,
     )
 
     assert result == {"mounted": True}
@@ -185,4 +279,5 @@ def test_sync_http_client_exposes_and_forwards_mcp_operations():
         timeout_seconds=90,
         arguments={"city": "Beijing"},
         tags=["project=demo"],
+        wait=True,
     )

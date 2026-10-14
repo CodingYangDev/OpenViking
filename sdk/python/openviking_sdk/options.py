@@ -108,6 +108,19 @@ class BatchWriteOptions(_ExtraOptions, total=False):
     skip_conflicts: bool
 
 
+class _RequiredMCPToolMount(TypedDict):
+    tool_uri: str
+    node_uri: str
+    title: str
+
+
+class MCPToolMount(_RequiredMCPToolMount, total=False):
+    description: str
+    timeout_seconds: int
+    arguments: Mapping[str, Any]
+    tags: List[str]
+
+
 class CompileOptions(_ExtraOptions, total=False):
     instruction: str
     args: Dict[str, Any]

@@ -159,6 +159,23 @@ type MountMCPToolOptions struct {
 	TimeoutSeconds int
 	Arguments      map[string]any
 	Tags           []string
+	Wait           bool
+}
+
+// WaitOptions controls whether an asynchronous operation waits for processing.
+type WaitOptions struct {
+	Wait bool
+}
+
+// MCPToolMount describes one live context mount in a batch request.
+type MCPToolMount struct {
+	ToolURI        string
+	NodeURI        string
+	Title          string
+	Description    *string
+	TimeoutSeconds int
+	Arguments      map[string]any
+	Tags           []string
 }
 
 // WaitProcessedOptions controls WaitProcessed.

@@ -69,12 +69,42 @@ func TestMCPOperationsMatchServerContract(t *testing.T) {
 				"timeout_seconds": float64(120),
 				"arguments":       map[string]any{"city": "Beijing"},
 				"tags":            []any{"project=demo", "kind=live-context"},
+				"wait":            true,
+			},
+		},
+		{
+			method: http.MethodPost,
+			path:   "/api/v1/mcps/batch-mount",
+			body: map[string]any{
+				"mounts": []any{
+					map[string]any{
+						"tool_uri":        "viking://agent/tools/demo/current.json",
+						"node_uri":        "viking://resources/demo/batch.md",
+						"title":           "Batch Weather",
+						"description":     nil,
+						"timeout_seconds": float64(60),
+						"arguments":       map[string]any{},
+						"tags":            []any{"project=demo"},
+					},
+				},
+				"wait": true,
 			},
 		},
 		{
 			method: http.MethodDelete,
 			path:   "/api/v1/mcps/mount",
-			query:  map[string]string{"node_uri": "viking://resources/demo/weather.md"},
+			query: map[string]string{
+				"node_uri": "viking://resources/demo/weather.md",
+				"wait":     "true",
+			},
+		},
+		{
+			method: http.MethodPost,
+			path:   "/api/v1/mcps/batch-unmount",
+			body: map[string]any{
+				"node_uris": []any{"viking://resources/demo/batch.md"},
+				"wait":      true,
+			},
 		},
 		{
 			method: http.MethodGet,
@@ -149,11 +179,33 @@ func TestMCPOperationsMatchServerContract(t *testing.T) {
 			TimeoutSeconds: 120,
 			Arguments:      map[string]any{"city": "Beijing"},
 			Tags:           []string{"project=demo", "kind=live-context"},
+			Wait:           true,
 		},
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.UnmountMCPTool(ctx, "resources/demo/weather.md"); err != nil {
+	if _, err := client.BatchMountMCPTools(ctx, []MCPToolMount{
+		{
+			ToolURI: "agent/tools/demo/current.json",
+			NodeURI: "resources/demo/batch.md",
+			Title:   "Batch Weather",
+			Tags:    []string{"project=demo"},
+		},
+	}, &WaitOptions{Wait: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.UnmountMCPTool(
+		ctx,
+		"resources/demo/weather.md",
+		&WaitOptions{Wait: true},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.BatchUnmountMCPTools(
+		ctx,
+		[]string{"resources/demo/batch.md"},
+		&WaitOptions{Wait: true},
+	); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.ListMCPMounts(ctx, "demo", "current"); err != nil {
@@ -167,7 +219,10 @@ func TestMCPOperationsMatchServerContract(t *testing.T) {
 func TestMCPDefaultsMatchServerContract(t *testing.T) {
 	requestIndex := 0
 	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body := readJSONBody(t, r)
+		var body map[string]any
+		if r.Method != http.MethodDelete {
+			body = readJSONBody(t, r)
+		}
 		switch requestIndex {
 		case 0:
 			if body["limit"] != float64(10) {
@@ -186,6 +241,21 @@ func TestMCPDefaultsMatchServerContract(t *testing.T) {
 			}
 			if !reflect.DeepEqual(body["arguments"], map[string]any{}) {
 				t.Fatalf("mount arguments = %#v", body["arguments"])
+			}
+			if body["wait"] != false {
+				t.Fatalf("mount wait = %#v", body["wait"])
+			}
+		case 3:
+			if body["wait"] != false {
+				t.Fatalf("batch mount wait = %#v", body["wait"])
+			}
+		case 4:
+			if r.URL.Query().Get("wait") != "false" {
+				t.Fatalf("unmount wait = %q", r.URL.Query().Get("wait"))
+			}
+		case 5:
+			if body["wait"] != false {
+				t.Fatalf("batch unmount wait = %#v", body["wait"])
 			}
 		default:
 			t.Fatalf("unexpected request")
@@ -208,6 +278,25 @@ func TestMCPDefaultsMatchServerContract(t *testing.T) {
 		"viking://resources/demo/weather.md",
 		"Weather",
 		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.BatchMountMCPTools(ctx, []MCPToolMount{{
+		ToolURI: "viking://agent/tools/demo/current.json",
+		NodeURI: "viking://resources/demo/batch.md",
+		Title:   "Batch Weather",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.UnmountMCPTool(
+		ctx,
+		"viking://resources/demo/weather.md",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.BatchUnmountMCPTools(
+		ctx,
+		[]string{"viking://resources/demo/batch.md"},
 	); err != nil {
 		t.Fatal(err)
 	}

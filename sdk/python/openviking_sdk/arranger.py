@@ -18,15 +18,14 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Unio
 from ._utils import run_async
 from .client import AsyncHTTPClient, SyncHTTPClient, VikingURI
 from .errors import FailedPreconditionError, NotFoundError
+from .options import MCPToolMount
 
 _OWNER_TAG_KEY = "ov-cac-owner"
 _KIND_TAG_KEY = "ov-cac-kind"
 _SPEC_TAG_KEY = "ov-cac-spec"
 _RESERVED_TAG_KEYS = frozenset({_OWNER_TAG_KEY, _KIND_TAG_KEY, _SPEC_TAG_KEY})
 _OWNER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-_TOOL_URI_RE = re.compile(
-    r"^viking://agent/tools/(?P<server>[^/]+)/(?P<tool>[^/]+)\.json$"
-)
+_TOOL_URI_RE = re.compile(r"^viking://agent/tools/(?P<server>[^/]+)/(?P<tool>[^/]+)\.json$")
 
 
 class ContextResourceKind(str, Enum):
@@ -59,6 +58,7 @@ class LiveContext:
     @property
     def kind(self) -> ContextResourceKind:
         return ContextResourceKind.LIVE_CONTEXT
+
 
 @dataclass(frozen=True)
 class ContextChange:
@@ -182,9 +182,7 @@ class _ContextArrangerBase:
         if not uri.endswith(".md"):
             raise ValueError("Live context path must end with .md")
         if not _TOOL_URI_RE.fullmatch(normalized_tool_uri):
-            raise ValueError(
-                "tool_uri must match viking://agent/tools/<server>/<tool>.json"
-            )
+            raise ValueError("tool_uri must match viking://agent/tools/<server>/<tool>.json")
         if not title.strip():
             raise ValueError("Live context title must not be empty")
         if timeout_seconds <= 0:
@@ -376,7 +374,13 @@ class _ContextArrangerBase:
             changes=tuple(changes),
         )
 
-    async def _apply(self, *, prune: bool, dry_run: bool) -> ContextApplyResult:
+    async def _apply(
+        self,
+        *,
+        prune: bool,
+        dry_run: bool,
+        wait: bool,
+    ) -> ContextApplyResult:
         plan = await self._plan()
         if plan.has_conflicts:
             conflicts = [
@@ -392,6 +396,8 @@ class _ContextArrangerBase:
             return ContextApplyResult(plan=plan, prune=prune, dry_run=True, applied=())
 
         applied = []
+        mount_changes = []
+        mounts: list[MCPToolMount] = []
         for change in plan.changes:
             if change.action not in {
                 ContextChangeAction.CREATE,
@@ -399,28 +405,42 @@ class _ContextArrangerBase:
             }:
                 continue
             resource = self._resources[change.uri]
-            tags = _managed_tags(self.owner_tag, resource)
-            await self._client.mount_mcp_tool(
-                resource.tool_uri,
-                resource.uri,
-                resource.title,
-                description=resource.description,
-                timeout_seconds=resource.timeout_seconds,
-                arguments=resource.arguments,
-                tags=tags,
-            )
-            applied.append(change)
+            mount: MCPToolMount = {
+                "tool_uri": resource.tool_uri,
+                "node_uri": resource.uri,
+                "title": resource.title,
+                "timeout_seconds": resource.timeout_seconds,
+                "arguments": resource.arguments,
+                "tags": _managed_tags(self.owner_tag, resource),
+            }
+            if resource.description is not None:
+                mount["description"] = resource.description
+            mounts.append(mount)
+            mount_changes.append(change)
+        if mounts:
+            await self._client.batch_mount_mcp_tools(mounts, wait=wait)
+            applied.extend(mount_changes)
 
+        delete_changes = []
         for change in plan.changes:
             if change.action != ContextChangeAction.DELETE:
                 continue
             if not prune:
                 continue
+            delete_changes.append(change)
+        if delete_changes:
             try:
-                await self._client.unmount_mcp_tool(change.uri)
+                await self._client.batch_unmount_mcp_tools(
+                    [change.uri for change in delete_changes],
+                    wait=wait,
+                )
             except NotFoundError:
-                await self._client.rm(change.uri, wait=True)
-            applied.append(change)
+                for change in delete_changes:
+                    try:
+                        await self._client.unmount_mcp_tool(change.uri, wait=wait)
+                    except NotFoundError:
+                        await self._client.rm(change.uri, wait=wait)
+            applied.extend(delete_changes)
 
         return ContextApplyResult(
             plan=plan,
@@ -441,8 +461,9 @@ class AsyncContextArranger(_ContextArrangerBase):
         *,
         prune: bool = False,
         dry_run: bool = False,
+        wait: bool = False,
     ) -> ContextApplyResult:
-        return await self._apply(prune=prune, dry_run=dry_run)
+        return await self._apply(prune=prune, dry_run=dry_run, wait=wait)
 
 
 class ContextArranger(_ContextArrangerBase):
@@ -456,15 +477,15 @@ class ContextArranger(_ContextArrangerBase):
         *,
         prune: bool = False,
         dry_run: bool = False,
+        wait: bool = False,
     ) -> ContextApplyResult:
-        return run_async(self._apply(prune=prune, dry_run=dry_run))
+        return run_async(self._apply(prune=prune, dry_run=dry_run, wait=wait))
 
     def main(self, argv: Optional[Sequence[str]] = None) -> int:
         """Run this project as a small command-line application."""
         parser = argparse.ArgumentParser(
             description=(
-                f"Plan or apply OpenViking context arrangement '{self.name}' "
-                f"under {self.root_uri}."
+                f"Plan or apply OpenViking context arrangement '{self.name}' under {self.root_uri}."
             )
         )
         commands = parser.add_subparsers(dest="command", required=True)
@@ -489,13 +510,23 @@ class ContextArranger(_ContextArrangerBase):
             action="store_true",
             help="Print the apply plan without changing OpenViking.",
         )
+        apply_parser.add_argument(
+            "-w",
+            "--wait",
+            action="store_true",
+            help="Wait until processing is complete.",
+        )
         _add_output_argument(apply_parser)
 
         args = parser.parse_args(argv)
         if args.command == "plan":
             result: Union[ContextPlan, ContextApplyResult] = self.plan()
         else:
-            result = self.apply(prune=args.prune, dry_run=args.dry_run)
+            result = self.apply(
+                prune=args.prune,
+                dry_run=args.dry_run,
+                wait=args.wait,
+            )
         if args.output == "json":
             output = json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
         else:
@@ -617,9 +648,7 @@ def _format_change_rows(
         for line_index in range(row_height):
             output.append(
                 "  ".join(
-                    (
-                        cell[line_index] if line_index < len(cell) else ""
-                    ).ljust(widths[column])
+                    (cell[line_index] if line_index < len(cell) else "").ljust(widths[column])
                     for column, cell in enumerate(wrapped_cells)
                 ).rstrip()
             )

@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 from .actor_peer import get_actor_peer_id, use_actor_peer
-from .client import AsyncHTTPClient, SyncHTTPClient
 from .arranger import AsyncContextArranger, ContextArranger
+from .client import AsyncHTTPClient, SyncHTTPClient
 from .errors import (
     AbortedError,
     ConflictError,
@@ -25,6 +25,7 @@ from .options import (
     ExperienceTrajectoryOptions,
     FindOptions,
     ListPage,
+    MCPToolMount,
     Message,
     PreflightAssetOptions,
     ReindexOptions,
@@ -60,6 +61,7 @@ __all__ = [
     "get_actor_peer_id",
     "ImagePart",
     "ListPage",
+    "MCPToolMount",
     "Message",
     "MessagePart",
     "OpenVikingError",

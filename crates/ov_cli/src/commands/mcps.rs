@@ -478,6 +478,7 @@ pub async fn mount(
     description: Option<&str>,
     timeout_seconds: u64,
     raw_arguments: &str,
+    wait: bool,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -492,6 +493,7 @@ pub async fn mount(
                 "description": description,
                 "timeout_seconds": timeout_seconds,
                 "arguments": arguments,
+                "wait": wait,
             }),
         )
         .await?;
@@ -502,10 +504,14 @@ pub async fn mount(
 pub async fn unmount(
     client: &HttpClient,
     node_uri: &str,
+    wait: bool,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
-    let params = vec![("node_uri".to_string(), node_uri.to_string())];
+    let params = vec![
+        ("node_uri".to_string(), node_uri.to_string()),
+        ("wait".to_string(), wait.to_string()),
+    ];
     let response: Value = client.delete("/api/v1/mcps/mount", &params).await?;
     print_response(&response, output_format, compact);
     Ok(())

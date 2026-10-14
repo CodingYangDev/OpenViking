@@ -11,6 +11,7 @@ from openviking.server.auth import get_request_context
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
 from openviking.server.models import Response
+from openviking.service.mcp_service import MCPToolMount
 
 router = APIRouter(prefix="/api/v1/mcps", tags=["mcps"])
 
@@ -37,7 +38,7 @@ class InvokeMCPToolRequest(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
-class MountMCPToolRequest(BaseModel):
+class MCPToolMountRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tool_uri: str
@@ -47,6 +48,24 @@ class MountMCPToolRequest(BaseModel):
     timeout_seconds: int = Field(default=60, gt=0)
     arguments: dict[str, Any] = Field(default_factory=dict)
     tags: list[str] | None = None
+
+
+class MountMCPToolRequest(MCPToolMountRequest):
+    wait: bool = False
+
+
+class BatchMountMCPToolsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mounts: list[MCPToolMountRequest] = Field(min_length=1)
+    wait: bool = False
+
+
+class BatchUnmountMCPToolsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_uris: list[str] = Field(min_length=1)
+    wait: bool = False
 
 
 @router.post("")
@@ -72,16 +91,52 @@ async def mount_mcp_tool(
         body.arguments,
         ctx,
         tags=body.tags,
+        wait=body.wait,
     )
+    return Response(status="ok", result=result)
+
+
+@router.post("/batch-mount")
+async def batch_mount_mcp_tools(
+    body: BatchMountMCPToolsRequest,
+    ctx: RequestContext = Depends(get_request_context),
+):
+    mounts = [
+        MCPToolMount(
+            tool_uri=mount.tool_uri,
+            node_uri=mount.node_uri,
+            title=mount.title,
+            description=mount.description,
+            timeout_seconds=mount.timeout_seconds,
+            arguments=mount.arguments,
+            tags=mount.tags,
+        )
+        for mount in body.mounts
+    ]
+    result = await get_service().mcps.batch_mount(mounts, ctx, wait=body.wait)
     return Response(status="ok", result=result)
 
 
 @router.delete("/mount")
 async def unmount_mcp_tool(
     node_uri: str = Query(),
+    wait: bool = Query(default=False),
     ctx: RequestContext = Depends(get_request_context),
 ):
-    result = await get_service().mcps.unmount(node_uri, ctx)
+    result = await get_service().mcps.unmount(node_uri, ctx, wait=wait)
+    return Response(status="ok", result=result)
+
+
+@router.post("/batch-unmount")
+async def batch_unmount_mcp_tools(
+    body: BatchUnmountMCPToolsRequest,
+    ctx: RequestContext = Depends(get_request_context),
+):
+    result = await get_service().mcps.batch_unmount(
+        body.node_uris,
+        ctx,
+        wait=body.wait,
+    )
     return Response(status="ok", result=result)
 
 

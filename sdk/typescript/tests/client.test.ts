@@ -973,9 +973,24 @@ describe("OpenVikingClient", () => {
         timeoutSeconds: 120,
         arguments: { city: "Beijing" },
         tags: ["project=demo", "kind=live-context"],
+        wait: true,
       },
     );
-    await client.unmountMCPTool("resources/demo/weather.md");
+    await client.batchMountMCPTools(
+      [
+        {
+          toolUri: "agent/tools/demo/current.json",
+          nodeUri: "resources/demo/batch.md",
+          title: "Batch Weather",
+          tags: ["project=demo"],
+        },
+      ],
+      { wait: true },
+    );
+    await client.unmountMCPTool("resources/demo/weather.md", { wait: true });
+    await client.batchUnmountMCPTools(["resources/demo/batch.md"], {
+      wait: true,
+    });
     await client.listMCPMounts("demo", "current");
 
     expect(synced.changes.unchanged).toEqual(["current"]);
@@ -995,7 +1010,9 @@ describe("OpenVikingClient", () => {
       ["GET", "/api/v1/mcps/status"],
       ["POST", "/api/v1/mcps/invoke"],
       ["POST", "/api/v1/mcps/mount"],
+      ["POST", "/api/v1/mcps/batch-mount"],
       ["DELETE", "/api/v1/mcps/mount"],
+      ["POST", "/api/v1/mcps/batch-unmount"],
       ["GET", "/api/v1/mcps/mounts"],
     ]);
     expect(JSON.parse(String(fetcher.mock.calls[0]![1]?.body))).toEqual({
@@ -1024,15 +1041,36 @@ describe("OpenVikingClient", () => {
       timeout_seconds: 120,
       arguments: { city: "Beijing" },
       tags: ["project=demo", "kind=live-context"],
+      wait: true,
+    });
+    expect(JSON.parse(String(fetcher.mock.calls[10]![1]?.body))).toEqual({
+      mounts: [
+        {
+          tool_uri: "viking://agent/tools/demo/current.json",
+          node_uri: "viking://resources/demo/batch.md",
+          title: "Batch Weather",
+          timeout_seconds: 60,
+          arguments: {},
+          tags: ["project=demo"],
+        },
+      ],
+      wait: true,
+    });
+    expect(JSON.parse(String(fetcher.mock.calls[12]![1]?.body))).toEqual({
+      node_uris: ["viking://resources/demo/batch.md"],
+      wait: true,
     });
     expect(
       new URL(String(fetcher.mock.calls[7]![0])).searchParams.get("name"),
     ).toBe("demo");
     expect(
-      new URL(String(fetcher.mock.calls[10]![0])).searchParams.get("node_uri"),
+      new URL(String(fetcher.mock.calls[11]![0])).searchParams.get("node_uri"),
     ).toBe("viking://resources/demo/weather.md");
     expect(
-      new URL(String(fetcher.mock.calls[11]![0])).searchParams.get("tool"),
+      new URL(String(fetcher.mock.calls[11]![0])).searchParams.get("wait"),
+    ).toBe("true");
+    expect(
+      new URL(String(fetcher.mock.calls[13]![0])).searchParams.get("tool"),
     ).toBe("current");
   });
 
@@ -1051,6 +1089,15 @@ describe("OpenVikingClient", () => {
       "viking://resources/demo/weather.md",
       "Weather",
     );
+    await client.batchMountMCPTools([
+      {
+        toolUri: "viking://agent/tools/demo/current.json",
+        nodeUri: "viking://resources/demo/batch.md",
+        title: "Batch Weather",
+      },
+    ]);
+    await client.unmountMCPTool("viking://resources/demo/weather.md");
+    await client.batchUnmountMCPTools(["viking://resources/demo/batch.md"]);
     await client.listMCPMounts("demo");
 
     expect(JSON.parse(String(fetcher.mock.calls[0]![1]?.body))).toEqual({
@@ -1063,9 +1110,29 @@ describe("OpenVikingClient", () => {
       title: "Weather",
       timeout_seconds: 60,
       arguments: {},
+      wait: false,
+    });
+    expect(JSON.parse(String(fetcher.mock.calls[2]![1]?.body))).toEqual({
+      mounts: [
+        {
+          tool_uri: "viking://agent/tools/demo/current.json",
+          node_uri: "viking://resources/demo/batch.md",
+          title: "Batch Weather",
+          timeout_seconds: 60,
+          arguments: {},
+        },
+      ],
+      wait: false,
     });
     expect(
-      new URL(String(fetcher.mock.calls[2]![0])).searchParams.has("tool"),
+      new URL(String(fetcher.mock.calls[3]![0])).searchParams.get("wait"),
+    ).toBe("false");
+    expect(JSON.parse(String(fetcher.mock.calls[4]![1]?.body))).toEqual({
+      node_uris: ["viking://resources/demo/batch.md"],
+      wait: false,
+    });
+    expect(
+      new URL(String(fetcher.mock.calls[5]![0])).searchParams.has("tool"),
     ).toBe(false);
   });
 

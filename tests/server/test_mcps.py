@@ -15,7 +15,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
 from openviking.server.routers import mcps as mcps_router_module
-from openviking.service.mcp_service import MCPService
+from openviking.service.mcp_service import MCPService, MCPToolMount
 from openviking_cli.exceptions import InvalidArgumentError, UnavailableError
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -403,6 +403,7 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
         {"city": "Beijing"},
         _ctx(),
         tags=["project=demo", "kind=live-context"],
+        wait=True,
     )
 
     assert mounted["mounted"] is True
@@ -452,16 +453,142 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
     assert "title: Shanghai Weather" in updated
     assert "city: Shanghai" in updated
     assert "timeout_seconds: 120" in updated
+    assert fs.write.await_args.kwargs["wait"] is False
 
     listed = await service.mounts("weather", "current", _ctx())
     assert listed["total"] == 1
     assert listed["mounts"][0]["arguments"] == {"city": "Shanghai"}
 
     fs.read.return_value = updated
-    unmounted = await service.unmount(node_uri, _ctx())
+    unmounted = await service.unmount(node_uri, _ctx(), wait=True)
     assert unmounted["unmounted"] is True
     fs.rm.assert_awaited_once_with(node_uri, ctx=_ctx(), recursive=False, wait=True)
     assert (await service.mounts("weather", None, _ctx()))["mounts"] == []
+
+
+async def test_batch_mount_and_unmount_share_filesystem_and_database_work(monkeypatch):
+    stored: dict[str, bytes] = {}
+
+    async def read_storage(path):
+        if path not in stored:
+            raise FileNotFoundError(path)
+        return stored[path]
+
+    async def write_storage(path, content):
+        stored[path] = content
+
+    agfs = SimpleNamespace(
+        read=AsyncMock(side_effect=read_storage),
+        write=AsyncMock(side_effect=write_storage),
+        ensure_parent_dirs=AsyncMock(),
+    )
+    fs = SimpleNamespace(
+        batch_write=AsyncMock(return_value={}),
+        write=AsyncMock(return_value={}),
+        read=AsyncMock(return_value="content"),
+        rm=AsyncMock(return_value={}),
+        mkdir=AsyncMock(return_value={}),
+    )
+    backing = SimpleNamespace(
+        fs=fs,
+        viking_fs=SimpleNamespace(exists=AsyncMock(return_value=True)),
+    )
+    service = MCPService(backing)
+    monkeypatch.setattr(service, "_async_agfs", agfs)
+
+    async def tool(tool_uri, _ctx):
+        tool_name = tool_uri.rsplit("/", 1)[-1].removesuffix(".json")
+        return {
+            "server": "weather",
+            "revision": f"revision-{tool_name}",
+            "tool": {
+                "name": tool_name,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+
+    tool_mock = AsyncMock(side_effect=tool)
+    monkeypatch.setattr(service, "_tool", tool_mock)
+    mounts = [
+        MCPToolMount(
+            tool_uri="viking://agent/tools/weather/current.json",
+            node_uri="viking://resources/demo/current.md",
+            title="Current weather",
+            description=None,
+            timeout_seconds=60,
+            arguments={"city": "Beijing"},
+            tags=["project=demo"],
+        ),
+        MCPToolMount(
+            tool_uri="viking://agent/tools/weather/current.json",
+            node_uri="viking://resources/demo/forecast.md",
+            title="Weather forecast",
+            description="Forecast",
+            timeout_seconds=120,
+            arguments={"city": "Shanghai"},
+            tags=None,
+        ),
+    ]
+
+    mounted = await service.batch_mount(mounts, _ctx(), wait=True)
+
+    assert mounted["total"] == 2
+    assert [item["node_uri"] for item in mounted["mounts"]] == [mount.node_uri for mount in mounts]
+    fs.batch_write.assert_awaited_once()
+    batch_call = fs.batch_write.await_args.kwargs
+    assert batch_call["root_uri"] == "viking://resources/demo"
+    assert batch_call["wait"] is True
+    assert batch_call["operations"][0]["tags"] == ["project=demo"]
+    assert "tags" not in batch_call["operations"][1]
+    assert fs.write.await_count == 0
+    tool_mock.assert_awaited_once_with(
+        "viking://agent/tools/weather/current.json",
+        _ctx(),
+    )
+
+    database = stored["/local/account-1/_system/live_context_nodes.dat"]
+    connection = sqlite3.connect(":memory:")
+    connection.deserialize(database)
+    rows = connection.execute(
+        "SELECT node_uri FROM live_context_nodes ORDER BY node_uri"
+    ).fetchall()
+    connection.close()
+    assert [row[0] for row in rows] == sorted(mount.node_uri for mount in mounts)
+
+    fs.rm.side_effect = [{}, RuntimeError("delete failed")]
+    with pytest.raises(RuntimeError, match="delete failed"):
+        await service.batch_unmount(
+            [mount.node_uri for mount in mounts],
+            _ctx(),
+        )
+    fs.write.assert_awaited_once_with(
+        mounts[0].node_uri,
+        "content",
+        ctx=_ctx(),
+        mode="create",
+        wait=True,
+    )
+    fs.rm.reset_mock(side_effect=True)
+    fs.write.reset_mock()
+
+    unmounted = await service.batch_unmount(
+        [mount.node_uri for mount in mounts],
+        _ctx(),
+        wait=True,
+    )
+
+    assert unmounted["total"] == 2
+    assert fs.rm.await_count == 2
+    assert all(call.kwargs["wait"] is True for call in fs.rm.await_args_list)
+    database = stored["/local/account-1/_system/live_context_nodes.dat"]
+    connection = sqlite3.connect(":memory:")
+    connection.deserialize(database)
+    assert connection.execute("SELECT COUNT(*) FROM live_context_nodes").fetchone()[0] == 0
+    connection.close()
 
 
 async def test_mount_validates_node_uri_and_arguments(monkeypatch):
@@ -728,7 +855,9 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
             "status",
             "invoke",
             "mount",
+            "batch_mount",
             "unmount",
+            "batch_unmount",
             "mounts",
         )
     }
@@ -772,12 +901,35 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
                 "timeout_seconds": 120,
                 "arguments": {"city": "Beijing"},
                 "tags": ["project=demo"],
+                "wait": True,
+            },
+        ),
+        (
+            "POST",
+            "/api/v1/mcps/batch-mount",
+            {
+                "mounts": [
+                    {
+                        "tool_uri": "viking://agent/tools/demo/current.json",
+                        "node_uri": "viking://resources/demo/batch.md",
+                        "title": "Batch Weather",
+                    }
+                ],
+                "wait": True,
             },
         ),
         (
             "DELETE",
-            "/api/v1/mcps/mount?node_uri=viking%3A%2F%2Fresources%2Fdemo%2Fcurrent.md",
+            "/api/v1/mcps/mount?node_uri=viking%3A%2F%2Fresources%2Fdemo%2Fcurrent.md&wait=true",
             None,
+        ),
+        (
+            "POST",
+            "/api/v1/mcps/batch-unmount",
+            {
+                "node_uris": ["viking://resources/demo/batch.md"],
+                "wait": True,
+            },
         ),
         ("GET", "/api/v1/mcps/mounts?mcp=demo&tool=current", None),
     ]
@@ -796,4 +948,30 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
         {"city": "Beijing"},
         _ctx(),
         tags=["project=demo"],
+        wait=True,
+    )
+    methods["batch_mount"].assert_awaited_once_with(
+        [
+            MCPToolMount(
+                tool_uri="viking://agent/tools/demo/current.json",
+                node_uri="viking://resources/demo/batch.md",
+                title="Batch Weather",
+                description=None,
+                timeout_seconds=60,
+                arguments={},
+                tags=None,
+            )
+        ],
+        _ctx(),
+        wait=True,
+    )
+    methods["unmount"].assert_awaited_once_with(
+        "viking://resources/demo/current.md",
+        _ctx(),
+        wait=True,
+    )
+    methods["batch_unmount"].assert_awaited_once_with(
+        ["viking://resources/demo/batch.md"],
+        _ctx(),
+        wait=True,
     )

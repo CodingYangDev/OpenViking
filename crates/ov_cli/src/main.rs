@@ -1988,12 +1988,18 @@ enum McpCommands {
         /// Fixed tool arguments as a JSON object
         #[arg(long = "args", default_value = "{}", value_name = "json")]
         arguments: String,
+        /// Wait until processing is complete
+        #[arg(short = 'w', long)]
+        wait: bool,
     },
     /// Remove a mounted live context node
     Unmount {
         /// Live context Markdown node URI
         #[arg(value_name = "live-context-node-uri")]
         node_uri: String,
+        /// Wait until processing is complete
+        #[arg(short = 'w', long)]
+        wait: bool,
     },
     /// List live context nodes mounted from an MCP server
     Mounts {
@@ -3695,6 +3701,7 @@ async fn main() {
                     description,
                     timeout_seconds,
                     arguments,
+                    wait,
                 } => {
                     commands::mcps::mount(
                         &client,
@@ -3704,14 +3711,21 @@ async fn main() {
                         description.as_deref(),
                         timeout_seconds,
                         &arguments,
+                        wait,
                         ctx.output_format,
                         ctx.compact,
                     )
                     .await
                 }
-                McpCommands::Unmount { node_uri } => {
-                    commands::mcps::unmount(&client, &node_uri, ctx.output_format, ctx.compact)
-                        .await
+                McpCommands::Unmount { node_uri, wait } => {
+                    commands::mcps::unmount(
+                        &client,
+                        &node_uri,
+                        wait,
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
                 }
                 McpCommands::Mounts { mcp, tool } => {
                     commands::mcps::mounts(
@@ -6367,6 +6381,7 @@ mod tests {
                     "120",
                     "--args",
                     r#"{"city":"Beijing"}"#,
+                    "--wait",
                 ])
                 .expect("mount should parse");
                 assert!(matches!(
@@ -6378,7 +6393,8 @@ mod tests {
                             title,
                             description,
                             timeout_seconds,
-                            arguments
+                            arguments,
+                            wait
                         }
                     } if tool_uri.ends_with("/current.json")
                         && node_uri.ends_with("/weather.md")
@@ -6386,6 +6402,7 @@ mod tests {
                         && description.as_deref() == Some("Current weather in Beijing")
                         && *timeout_seconds == 120
                         && arguments.contains("Beijing")
+                        && *wait
                 ));
 
                 let default_timeout = Cli::try_parse_from([
@@ -6402,9 +6419,11 @@ mod tests {
                     &default_timeout.command,
                     Commands::Mcps {
                         action: McpCommands::Mount {
-                            timeout_seconds, ..
+                            timeout_seconds,
+                            wait,
+                            ..
                         }
-                    } if *timeout_seconds == 60
+                    } if *timeout_seconds == 60 && !wait
                 ));
             })
             .unwrap()
@@ -6443,13 +6462,28 @@ mod tests {
                     "mcps",
                     "unmount",
                     "viking://resources/demo/weather.md",
+                    "-w",
                 ])
                 .expect("unmount should parse");
                 assert!(matches!(
                     &unmount.command,
                     Commands::Mcps {
-                        action: McpCommands::Unmount { node_uri }
-                    } if node_uri.ends_with("/weather.md")
+                        action: McpCommands::Unmount { node_uri, wait }
+                    } if node_uri.ends_with("/weather.md") && *wait
+                ));
+
+                let default_wait = Cli::try_parse_from([
+                    "ov",
+                    "mcps",
+                    "unmount",
+                    "viking://resources/demo/weather.md",
+                ])
+                .expect("unmount without wait should parse");
+                assert!(matches!(
+                    &default_wait.command,
+                    Commands::Mcps {
+                        action: McpCommands::Unmount { wait, .. }
+                    } if !wait
                 ));
             })
             .unwrap()

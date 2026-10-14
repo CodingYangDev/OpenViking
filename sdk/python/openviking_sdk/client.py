@@ -54,6 +54,7 @@ from .options import (
     ExperienceTrajectoryOptions,
     FindOptions,
     ListPage,
+    MCPToolMount,
     Message,
     PreflightAssetOptions,
     ReindexOptions,
@@ -1029,6 +1030,7 @@ class AsyncHTTPClient:
         timeout_seconds: int = 60,
         arguments: Optional[Mapping[str, Any]] = None,
         tags: Optional[Sequence[str]] = None,
+        wait: bool = False,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "tool_uri": VikingURI.normalize(tool_uri),
@@ -1037,6 +1039,7 @@ class AsyncHTTPClient:
             "description": description,
             "timeout_seconds": timeout_seconds,
             "arguments": dict(arguments or {}),
+            "wait": wait,
         }
         if tags is not None:
             payload["tags"] = list(tags)
@@ -1047,11 +1050,61 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
-    async def unmount_mcp_tool(self, node_uri: str) -> Dict[str, Any]:
+    async def batch_mount_mcp_tools(
+        self,
+        mounts: Sequence[MCPToolMount],
+        *,
+        wait: bool = False,
+    ) -> Dict[str, Any]:
+        payloads = []
+        for mount in mounts:
+            payload: Dict[str, Any] = {
+                "tool_uri": VikingURI.normalize(str(mount["tool_uri"])),
+                "node_uri": VikingURI.normalize(str(mount["node_uri"])),
+                "title": mount["title"],
+                "description": mount.get("description"),
+                "timeout_seconds": mount.get("timeout_seconds", 60),
+                "arguments": dict(mount.get("arguments") or {}),
+            }
+            if mount.get("tags") is not None:
+                payload["tags"] = list(mount["tags"])
+            payloads.append(payload)
+        response = await self._request(
+            "POST",
+            "/api/v1/mcps/batch-mount",
+            json={"mounts": payloads, "wait": wait},
+        )
+        return self._handle_response(response)
+
+    async def unmount_mcp_tool(
+        self,
+        node_uri: str,
+        *,
+        wait: bool = False,
+    ) -> Dict[str, Any]:
         response = await self._request(
             "DELETE",
             "/api/v1/mcps/mount",
-            params={"node_uri": VikingURI.normalize(node_uri)},
+            params={
+                "node_uri": VikingURI.normalize(node_uri),
+                "wait": wait,
+            },
+        )
+        return self._handle_response(response)
+
+    async def batch_unmount_mcp_tools(
+        self,
+        node_uris: Sequence[str],
+        *,
+        wait: bool = False,
+    ) -> Dict[str, Any]:
+        response = await self._request(
+            "POST",
+            "/api/v1/mcps/batch-unmount",
+            json={
+                "node_uris": [VikingURI.normalize(node_uri) for node_uri in node_uris],
+                "wait": wait,
+            },
         )
         return self._handle_response(response)
 
@@ -2659,6 +2712,7 @@ class SyncHTTPClient:
         timeout_seconds: int = 60,
         arguments: Optional[Mapping[str, Any]] = None,
         tags: Optional[Sequence[str]] = None,
+        wait: bool = False,
     ) -> Dict[str, Any]:
         return run_async(
             self._async_client.mount_mcp_tool(
@@ -2669,11 +2723,28 @@ class SyncHTTPClient:
                 timeout_seconds=timeout_seconds,
                 arguments=arguments,
                 tags=tags,
+                wait=wait,
             )
         )
 
-    def unmount_mcp_tool(self, node_uri: str) -> Dict[str, Any]:
-        return run_async(self._async_client.unmount_mcp_tool(node_uri))
+    def unmount_mcp_tool(self, node_uri: str, *, wait: bool = False) -> Dict[str, Any]:
+        return run_async(self._async_client.unmount_mcp_tool(node_uri, wait=wait))
+
+    def batch_mount_mcp_tools(
+        self,
+        mounts: Sequence[MCPToolMount],
+        *,
+        wait: bool = False,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.batch_mount_mcp_tools(mounts, wait=wait))
+
+    def batch_unmount_mcp_tools(
+        self,
+        node_uris: Sequence[str],
+        *,
+        wait: bool = False,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.batch_unmount_mcp_tools(node_uris, wait=wait))
 
     def list_mcp_mounts(
         self,

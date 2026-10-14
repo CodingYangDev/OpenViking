@@ -78,14 +78,31 @@ const mounted = await client.mountMCPTool(
     timeoutSeconds: 60,
     arguments: { city: "Beijing" },
     tags: ["project=weather", "kind=live-context"],
+    wait: true,
   },
+);
+const batchMounted = await client.batchMountMCPTools(
+  [
+    {
+      toolUri: "viking://agent/tools/weather/current.json",
+      nodeUri: "viking://resources/arranger/shanghai-weather.md",
+      title: "上海天气",
+      arguments: { city: "Shanghai" },
+    },
+  ],
+  { wait: true },
+);
+await client.batchUnmountMCPTools(
+  ["viking://resources/arranger/shanghai-weather.md"],
+  { wait: true },
 );
 const syncResult = await client.syncMCP("weather");
 console.log(syncResult.changes, syncResult.affected_mounts);
 ```
 
 客户端还提供 `removeMCP`、`listMCPs`、`validateMCP`、`getMCP`、
-`getMCPStatus`、`invokeMCPTool`、`unmountMCPTool` 和 `listMCPMounts`。
+`getMCPStatus`、`invokeMCPTool`、`batchMountMCPTools`、`unmountMCPTool`、
+`batchUnmountMCPTools` 和 `listMCPMounts`。
 
 OVPack 导出和备份与 Python、Go SDK 契约一致：内容会流式写入 Node.js 本地文件，并返回最终文件路径。
 

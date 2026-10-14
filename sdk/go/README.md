@@ -168,7 +168,7 @@ Implemented:
 |------|------------|
 | Resource and skill import | `AddResource`, `AddSkill`, `WaitProcessed` |
 | Skill management | `ListSkills`, `FindSkills`, `ValidateSkill`, `GetSkill`, `UpdateSkill`, `DeleteSkill` |
-| MCP servers and live context | `AddMCP`, `RemoveMCP`, `ListMCPs`, `FindMCPTools`, `ValidateMCP`, `GetMCP`, `SyncMCP`, `GetMCPStatus`, `InvokeMCPTool`, `MountMCPTool`, `UnmountMCPTool`, `ListMCPMounts` |
+| MCP servers and live context | `AddMCP`, `RemoveMCP`, `ListMCPs`, `FindMCPTools`, `ValidateMCP`, `GetMCP`, `SyncMCP`, `GetMCPStatus`, `InvokeMCPTool`, `MountMCPTool`, `BatchMountMCPTools`, `UnmountMCPTool`, `BatchUnmountMCPTools`, `ListMCPMounts` |
 | Watch management | `ListWatches`, `GetWatch`, `UpdateWatch`, `DeleteWatch`, `TriggerWatch` |
 | Filesystem and content | `List`, `ListPage`, `Tree`, `TreePage`, `Stat`, `Attrs`, `Mkdir`, `Remove`, `Move`, `Read`, `Abstract`, `Overview`, `Write`, `SetTags`, `Reindex` |
 | Retrieval | `Find`, `Search`, `Grep`, `Glob` |
@@ -266,11 +266,25 @@ mounted, err := client.MountMCPTool(
 		TimeoutSeconds: 60,
 		Arguments:      map[string]any{"city": "Beijing"},
 		Tags:           []string{"project=weather", "kind=live-context"},
+		Wait:           true,
 	},
+)
+batchMounted, err := client.BatchMountMCPTools(ctx, []openviking.MCPToolMount{
+	{
+		ToolURI:  "viking://agent/tools/weather/current.json",
+		NodeURI:  "viking://resources/arranger/shanghai-weather.md",
+		Title:    "Shanghai Weather",
+		Arguments: map[string]any{"city": "Shanghai"},
+	},
+}, &openviking.WaitOptions{Wait: true})
+batchUnmounted, err := client.BatchUnmountMCPTools(
+	ctx,
+	[]string{"viking://resources/arranger/shanghai-weather.md"},
+	&openviking.WaitOptions{Wait: true},
 )
 syncResult, err := client.SyncMCP(ctx, "weather")
 
-_, _, _, _ = tools, mounted, syncResult, err
+_, _, _, _, _, _ = tools, mounted, batchMounted, batchUnmounted, syncResult, err
 ```
 
 ## Watch Management

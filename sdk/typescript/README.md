@@ -78,14 +78,31 @@ const mounted = await client.mountMCPTool(
     timeoutSeconds: 60,
     arguments: { city: "Beijing" },
     tags: ["project=weather", "kind=live-context"],
+    wait: true,
   },
+);
+const batchMounted = await client.batchMountMCPTools(
+  [
+    {
+      toolUri: "viking://agent/tools/weather/current.json",
+      nodeUri: "viking://resources/arranger/shanghai-weather.md",
+      title: "Shanghai Weather",
+      arguments: { city: "Shanghai" },
+    },
+  ],
+  { wait: true },
+);
+await client.batchUnmountMCPTools(
+  ["viking://resources/arranger/shanghai-weather.md"],
+  { wait: true },
 );
 const syncResult = await client.syncMCP("weather");
 console.log(syncResult.changes, syncResult.affected_mounts);
 ```
 
 The client also exposes `removeMCP`, `listMCPs`, `validateMCP`, `getMCP`,
-`getMCPStatus`, `invokeMCPTool`, `unmountMCPTool`, and `listMCPMounts`.
+`getMCPStatus`, `invokeMCPTool`, `batchMountMCPTools`, `unmountMCPTool`,
+`batchUnmountMCPTools`, and `listMCPMounts`.
 
 OVPack exports and backups follow the Python and Go SDK contract: they are streamed to a Node.js local file and return its final path.
 

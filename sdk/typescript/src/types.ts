@@ -83,6 +83,17 @@ export interface MountMCPToolOptions {
   timeoutSeconds?: number;
   arguments?: JsonObject;
   tags?: string[];
+  wait?: boolean;
+}
+/** One MCP-backed live context node in a batch mount request. */
+export interface MCPToolMount {
+  toolUri: string;
+  nodeUri: string;
+  title: string;
+  description?: string;
+  timeoutSeconds?: number;
+  arguments?: JsonObject;
+  tags?: string[];
 }
 /** One live context mount affected by an MCP catalog sync. */
 export interface MCPAffectedMount {

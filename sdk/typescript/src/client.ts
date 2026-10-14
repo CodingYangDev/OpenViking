@@ -34,6 +34,7 @@ import type {
   GlobOptions,
   ImportPackOptions,
   MCPSyncResult,
+  MCPToolMount,
   Message,
   MountMCPToolOptions,
   ObserverFormat,
@@ -376,13 +377,54 @@ export class OpenVikingClient {
         timeout_seconds: options.timeoutSeconds ?? 60,
         arguments: options.arguments ?? {},
         tags: options.tags,
+        wait: options.wait ?? false,
       }),
     });
   }
+  /** Create or replace multiple MCP-backed live context nodes. */
+  batchMountMCPTools(
+    mounts: MCPToolMount[],
+    options: Pick<WaitOptions, "wait"> = {},
+  ): Promise<JsonObject> {
+    return this.request("POST", "/api/v1/mcps/batch-mount", {
+      body: {
+        mounts: mounts.map((mount) =>
+          compact({
+            tool_uri: normalizeURI(mount.toolUri),
+            node_uri: normalizeURI(mount.nodeUri),
+            title: mount.title,
+            description: mount.description,
+            timeout_seconds: mount.timeoutSeconds ?? 60,
+            arguments: mount.arguments ?? {},
+            tags: mount.tags,
+          }),
+        ),
+        wait: options.wait ?? false,
+      },
+    });
+  }
   /** Remove a live context mount and its node. */
-  unmountMCPTool(nodeUri: string): Promise<JsonObject> {
+  unmountMCPTool(
+    nodeUri: string,
+    options: Pick<WaitOptions, "wait"> = {},
+  ): Promise<JsonObject> {
     return this.request("DELETE", "/api/v1/mcps/mount", {
-      query: { node_uri: normalizeURI(nodeUri) },
+      query: {
+        node_uri: normalizeURI(nodeUri),
+        wait: options.wait ?? false,
+      },
+    });
+  }
+  /** Remove multiple live context mounts and their nodes. */
+  batchUnmountMCPTools(
+    nodeUris: string[],
+    options: Pick<WaitOptions, "wait"> = {},
+  ): Promise<JsonObject> {
+    return this.request("POST", "/api/v1/mcps/batch-unmount", {
+      body: {
+        node_uris: nodeUris.map(normalizeURI),
+        wait: options.wait ?? false,
+      },
     });
   }
   /** List live context mounts for one MCP server and optional tool. */

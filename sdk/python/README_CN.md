@@ -302,6 +302,22 @@ mounted = client.mount_mcp_tool(
     timeout_seconds=60,
     arguments={"city": "Beijing"},
     tags=["project=weather", "kind=live-context"],
+    wait=True,
+)
+batch_result = client.batch_mount_mcp_tools(
+    [
+        {
+            "tool_uri": "viking://agent/tools/weather/current.json",
+            "node_uri": "viking://resources/arranger/shanghai-weather.md",
+            "title": "上海天气",
+            "arguments": {"city": "Shanghai"},
+        }
+    ],
+    wait=True,
+)
+client.batch_unmount_mcp_tools(
+    ["viking://resources/arranger/shanghai-weather.md"],
+    wait=True,
 )
 sync_result = client.sync_mcp("weather")
 print(sync_result["changes"])
@@ -311,7 +327,8 @@ print(sync_result["affected_mounts"])
 异步客户端提供相同的方法。MCP 操作包括 `add_mcp`、`remove_mcp`、
 `list_mcps`、`get_mcp`、`validate_mcp`、`sync_mcp`、
 `get_mcp_status`、`find_mcp_tools`、`invoke_mcp_tool`、
-`mount_mcp_tool`、`unmount_mcp_tool` 和 `list_mcp_mounts`。
+`mount_mcp_tool`、`batch_mount_mcp_tools`、`unmount_mcp_tool`、
+`batch_unmount_mcp_tools` 和 `list_mcp_mounts`。
 
 ### 高频参数与 Options
 

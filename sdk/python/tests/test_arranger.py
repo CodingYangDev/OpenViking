@@ -54,6 +54,22 @@ class FakeClient:
         }
         return {}
 
+    async def batch_mount_mcp_tools(
+        self,
+        mounts: list[dict[str, Any]],
+        *,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        self.calls.append(("batch_mount", mounts, wait))
+        for mount in mounts:
+            self.entries[mount["node_uri"]] = {
+                "isDir": False,
+                "tags": list(mount.get("tags") or []),
+                "tool_uri": mount["tool_uri"],
+                "arguments": dict(mount["arguments"]),
+            }
+        return {"mounts": mounts, "total": len(mounts)}
+
     async def list_mcp_mounts(self, _mcp: str, *, tool: str) -> dict[str, Any]:
         mounts = [
             {
@@ -78,12 +94,31 @@ class FakeClient:
         self.entries[uri]["tags"] = list(tags)
         return {}
 
-    async def unmount_mcp_tool(self, uri: str) -> dict[str, Any]:
-        self.calls.append(("unmount", uri))
+    async def unmount_mcp_tool(
+        self,
+        uri: str,
+        *,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        self.calls.append(("unmount", uri, wait))
         if uri not in self.entries:
             raise NotFoundError(uri, "live context mount")
         del self.entries[uri]
         return {}
+
+    async def batch_unmount_mcp_tools(
+        self,
+        node_uris: list[str],
+        *,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        self.calls.append(("batch_unmount", node_uris, wait))
+        for uri in node_uris:
+            if uri not in self.entries:
+                raise NotFoundError(uri, "live context mount")
+        for uri in node_uris:
+            del self.entries[uri]
+        return {"unmounts": node_uris, "total": len(node_uris)}
 
     async def rm(self, uri: str, *, wait: bool) -> None:
         self.calls.append(("rm", uri, wait))
@@ -123,12 +158,11 @@ async def test_async_project_converges_live_context() -> None:
     plan = await project.plan()
     assert plan.changes[0].action == ContextChangeAction.CREATE
 
-    result = await project.apply()
+    result = await project.apply(wait=True)
     assert len(result.applied) == 1
-    assert [call[0] for call in client.calls] == ["mount"]
-    assert project.owner_tag in client.entries[
-        "viking://resources/ops/alerts.md"
-    ]["tags"]
+    assert [call[0] for call in client.calls] == ["batch_mount"]
+    assert client.calls[0][2] is True
+    assert project.owner_tag in client.entries["viking://resources/ops/alerts.md"]["tags"]
 
     converged = await project.plan()
     assert converged.has_changes is False
@@ -155,35 +189,28 @@ async def test_dry_run_and_prune_only_delete_owned_live_contexts() -> None:
     desired = AsyncContextArranger(client, "demo", "resources/demo")
     declare_alerts(desired)
     plan = await desired.plan()
-    deleted = [
-        change.uri
-        for change in plan.changes
-        if change.action == ContextChangeAction.DELETE
-    ]
+    deleted = [change.uri for change in plan.changes if change.action == ContextChangeAction.DELETE]
     assert deleted == ["viking://resources/demo/weather.md"]
 
     without_prune = await desired.apply()
     assert without_prune.prune is False
     assert "viking://resources/demo/weather.md" in client.entries
-    assert all(
-        change.action != ContextChangeAction.DELETE
-        for change in without_prune.applied
-    )
+    assert all(change.action != ContextChangeAction.DELETE for change in without_prune.applied)
 
     dry_run = await desired.apply(prune=True, dry_run=True)
 
     assert dry_run.dry_run is True
     assert dry_run.prune is True
     dry_run_deletes = [
-        change.uri
-        for change in dry_run.plan.changes
-        if change.action == ContextChangeAction.DELETE
+        change.uri for change in dry_run.plan.changes if change.action == ContextChangeAction.DELETE
     ]
     assert dry_run_deletes == ["viking://resources/demo/weather.md"]
 
-    await desired.apply(prune=True)
+    await desired.apply(prune=True, wait=True)
     assert "viking://resources/demo/weather.md" not in client.entries
     assert "viking://resources/demo/manual.md" in client.entries
+    assert client.calls[-1][0] == "batch_unmount"
+    assert client.calls[-1][2] is True
 
 
 @pytest.mark.asyncio
@@ -233,9 +260,7 @@ async def test_changed_live_context_declaration_produces_update() -> None:
 
     assert plan.changes[0].action == ContextChangeAction.UPDATE
     await updated.apply()
-    assert client.entries["viking://resources/demo/alerts.md"]["arguments"] == {
-        "service": "worker"
-    }
+    assert client.entries["viking://resources/demo/alerts.md"]["arguments"] == {"service": "worker"}
 
 
 @pytest.mark.asyncio
@@ -244,9 +269,7 @@ async def test_plan_detects_live_mount_drift() -> None:
     project = AsyncContextArranger(client, "demo", "resources/demo")
     declare_alerts(project)
     await project.apply()
-    client.entries["viking://resources/demo/alerts.md"]["arguments"] = {
-        "service": "worker"
-    }
+    client.entries["viking://resources/demo/alerts.md"]["arguments"] = {"service": "worker"}
 
     plan = await project.plan()
 
@@ -262,9 +285,9 @@ async def test_new_live_context_mounts_with_ownership_tags() -> None:
     await project.apply()
 
     mount_call = client.calls[-1]
-    assert mount_call[0] == "mount"
-    assert project.owner_tag in mount_call[4]["tags"]
-    assert "ov-cac-kind=live_context" in mount_call[4]["tags"]
+    assert mount_call[0] == "batch_mount"
+    assert project.owner_tag in mount_call[1][0]["tags"]
+    assert "ov-cac-kind=live_context" in mount_call[1][0]["tags"]
 
 
 def test_sync_project_uses_the_same_declaration_and_plan_model() -> None:
@@ -310,7 +333,7 @@ def test_project_main_plans_and_applies_from_cli_arguments(capsys: Any) -> None:
     assert apply_output["plan"]["counts"]["create"] == 1
     assert backend.calls == []
 
-    assert project.main(["apply"]) == 0
+    assert project.main(["apply", "--wait"]) == 0
     apply_table = capsys.readouterr().out
     assert "OpenViking Context Apply Result" in apply_table
     assert "1 created, 0 updated, 0 pending deletion" in apply_table
@@ -318,6 +341,7 @@ def test_project_main_plans_and_applies_from_cli_arguments(capsys: Any) -> None:
     assert "CREATED" in apply_table
     assert "created successfully" in apply_table
     assert "target does not exist" not in apply_table
+    assert backend.calls[-1][2] is True
 
     empty = ContextArranger(client, "demo", "resources/demo")
     assert empty.main(["apply"]) == 0
@@ -354,7 +378,10 @@ def test_project_main_provides_generated_help(capsys: Any) -> None:
     with pytest.raises(SystemExit) as exc_info:
         project.main(["apply", "--help"])
     assert exc_info.value.code == 0
-    assert "--prune" in capsys.readouterr().out
+    apply_help = capsys.readouterr().out
+    assert "--prune" in apply_help
+    assert "-w, --wait" in apply_help
+    assert "Wait until processing is complete." in apply_help
 
 
 def test_declarations_validate_scope_tags_and_live_context_fields() -> None:
