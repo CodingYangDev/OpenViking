@@ -8,8 +8,6 @@ import inspect
 import mimetypes
 import os
 import tempfile
-import uuid
-import zipfile
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Type, Union
@@ -17,7 +15,7 @@ from urllib.parse import quote
 
 import httpx
 
-from ._utils import _path_is_relative_to, run_async
+from ._utils import run_async
 from .actor_peer import _request_actor_peer_headers
 from .config import resolve_client_config
 from .errors import (
@@ -55,6 +53,7 @@ from .options import (
     ExperienceOutcomeOptions,
     ExperienceTrajectoryOptions,
     FindOptions,
+    ListPage,
     Message,
     PreflightAssetOptions,
     ReindexOptions,
@@ -63,10 +62,12 @@ from .options import (
     SearchContextResult,
     SearchOptions,
     SetTagsOptions,
+    TreePage,
     UpdateSessionConfigOptions,
     UpdateSkillOptions,
     WriteOptions,
 )
+from .uploads import zip_directory
 
 ERROR_CODE_TO_EXCEPTION = {
     "INVALID_ARGUMENT": InvalidArgumentError,
@@ -652,53 +653,40 @@ class AsyncHTTPClient:
         exc_class = ERROR_CODE_TO_EXCEPTION.get(code, OpenVikingError)
 
         if exc_class == OpenVikingError:
-            raise exc_class(message, code=code, details=details)
-        if exc_class in (
+            exception = exc_class(message, code=code, details=details)
+        elif exc_class in (
             InvalidArgumentError,
             FailedPreconditionError,
             ResourceExhaustedError,
             AbortedError,
             UnimplementedError,
         ):
-            raise exc_class(message, details=details)
-        if exc_class == InvalidURIError:
+            exception = exc_class(message, details=details)
+        elif exc_class == InvalidURIError:
             uri = details.get("uri", "") if details else ""
             reason = details.get("reason", "") if details else ""
-            raise exc_class(uri, reason)
-        if exc_class == NotFoundError:
+            exception = exc_class(uri, reason)
+        elif exc_class == NotFoundError:
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
             reason = details.get("reason") if details else None
-            raise exc_class(resource, resource_type, reason=reason)
-        if exc_class == AlreadyExistsError:
+            exception = exc_class(resource, resource_type, reason=reason)
+        elif exc_class == AlreadyExistsError:
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
-            raise exc_class(resource, resource_type)
-        if exc_class == UnavailableError:
+            exception = exc_class(resource, resource_type)
+        elif exc_class == UnavailableError:
             service = details.get("service", "service") if details else "service"
             reason = details.get("reason", "") if details else message
-            raise exc_class(service, reason)
-        raise exc_class(message)
+            exception = exc_class(service, reason)
+        else:
+            exception = exc_class(message)
+        if details is not None:
+            exception.details.update(details)
+        raise exception
 
     def _zip_directory(self, dir_path: str) -> str:
-        dir_path = Path(dir_path)
-        if not dir_path.is_dir():
-            raise ValueError(f"Path {dir_path} is not a directory")
-
-        root = dir_path.resolve()
-        zip_path = Path(tempfile.gettempdir()) / f"temp_upload_{uuid.uuid4().hex}.zip"
-        entry_count = 0
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for file_path in dir_path.rglob("*"):
-                if file_path.is_symlink():
-                    continue
-                if file_path.is_file():
-                    if not _path_is_relative_to(file_path.resolve(), root):
-                        continue
-                    arcname = str(file_path.relative_to(dir_path)).replace("\\", "/")
-                    zipf.write(file_path, arcname=arcname)
-                    entry_count += 1
-        return str(zip_path)
+        return zip_directory(dir_path)
 
     async def _upload_temp_file(self, file_path: str) -> str:
         with open(file_path, "rb") as f:
@@ -1193,7 +1181,51 @@ class AsyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
     ) -> List[Any]:
+        page = await self.ls_page(
+            uri,
+            simple=simple,
+            recursive=recursive,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+        )
+        return page["result"]
+
+    async def ls_page(
+        self,
+        uri: str,
+        simple: bool = False,
+        recursive: bool = False,
+        output: str = "original",
+        abs_limit: int = 256,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+    ) -> ListPage:
         params: Dict[str, Any] = {
             "uri": VikingURI.normalize(uri),
             "simple": simple,
@@ -1203,7 +1235,12 @@ class AsyncHTTPClient:
             "show_all_hidden": show_all_hidden,
             "node_limit": node_limit,
             "offset": offset,
+            "overview_limit": overview_limit,
         }
+        if include_abstract is not None:
+            params["include_abstract"] = include_abstract
+        if include_overview is not None:
+            params["include_overview"] = include_overview
         if sort_by is not None:
             params["sort_by"] = sort_by
             params["sort_order"] = sort_order
@@ -1220,7 +1257,11 @@ class AsyncHTTPClient:
             "/api/v1/fs/ls",
             params=params,
         )
-        return self._handle_response(response)
+        data = self._handle_response_data(response)
+        return {
+            "result": data.get("result") or [],
+            "has_more": bool(data.get("has_more", False)),
+        }
 
     async def tree(
         self,
@@ -1235,7 +1276,48 @@ class AsyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
     ) -> List[Dict[str, Any]]:
+        page = await self.tree_page(
+            uri,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            level_limit=level_limit,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+            directories_only=directories_only,
+        )
+        return page["result"]
+
+    async def tree_page(
+        self,
+        uri: str,
+        output: str = "original",
+        abs_limit: int = 128,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        level_limit: int = 3,
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
+    ) -> TreePage:
         params: Dict[str, Any] = {
             "uri": VikingURI.normalize(uri),
             "output": output,
@@ -1244,7 +1326,14 @@ class AsyncHTTPClient:
             "node_limit": node_limit,
             "level_limit": level_limit,
             "offset": offset,
+            "overview_limit": overview_limit,
         }
+        if include_abstract is not None:
+            params["include_abstract"] = include_abstract
+        if include_overview is not None:
+            params["include_overview"] = include_overview
+        if directories_only:
+            params["directories_only"] = True
         if extra_fields:
             params["extra_fields"] = list(extra_fields)
         if tags is not None:
@@ -1258,7 +1347,11 @@ class AsyncHTTPClient:
             "/api/v1/fs/tree",
             params=params,
         )
-        return self._handle_response(response)
+        data = self._handle_response_data(response)
+        return {
+            "result": data.get("result") or [],
+            "has_more": bool(data.get("has_more", False)),
+        }
 
     async def stat(self, uri: str) -> Dict[str, Any]:
         response = await self._request(
@@ -1572,6 +1665,7 @@ class AsyncHTTPClient:
         exclude_uri: Optional[str] = None,
         tags: Optional[List[str]] = None,
         include_tags: bool = False,
+        level_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         request_json = {
             "uri": VikingURI.normalize(uri),
@@ -1579,6 +1673,8 @@ class AsyncHTTPClient:
             "case_insensitive": case_insensitive,
             "node_limit": node_limit,
         }
+        if level_limit is not None:
+            request_json["level_limit"] = level_limit
         if exclude_uri is not None:
             request_json["exclude_uri"] = VikingURI.normalize(exclude_uri)
         if tags is not None:
@@ -2650,9 +2746,52 @@ class SyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
     ) -> List[Any]:
+        return self.ls_page(
+            uri,
+            simple=simple,
+            recursive=recursive,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+        )["result"]
+
+    def ls_page(
+        self,
+        uri: str,
+        simple: bool = False,
+        recursive: bool = False,
+        output: str = "original",
+        abs_limit: int = 256,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+    ) -> ListPage:
         return run_async(
-            self._async_client.ls(
+            self._async_client.ls_page(
                 uri,
                 simple=simple,
                 recursive=recursive,
@@ -2667,6 +2806,9 @@ class SyncHTTPClient:
                 include_tags=include_tags,
                 offset=offset,
                 limit=limit,
+                include_abstract=include_abstract,
+                include_overview=include_overview,
+                overview_limit=overview_limit,
             )
         )
 
@@ -2683,9 +2825,49 @@ class SyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
     ) -> List[Dict[str, Any]]:
+        return self.tree_page(
+            uri,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            level_limit=level_limit,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+            directories_only=directories_only,
+        )["result"]
+
+    def tree_page(
+        self,
+        uri: str,
+        output: str = "original",
+        abs_limit: int = 128,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        level_limit: int = 3,
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
+    ) -> TreePage:
         return run_async(
-            self._async_client.tree(
+            self._async_client.tree_page(
                 uri,
                 output=output,
                 abs_limit=abs_limit,
@@ -2697,6 +2879,10 @@ class SyncHTTPClient:
                 include_tags=include_tags,
                 offset=offset,
                 limit=limit,
+                include_abstract=include_abstract,
+                include_overview=include_overview,
+                overview_limit=overview_limit,
+                directories_only=directories_only,
             )
         )
 
@@ -2867,6 +3053,7 @@ class SyncHTTPClient:
         exclude_uri: Optional[str] = None,
         tags: Optional[List[str]] = None,
         include_tags: bool = False,
+        level_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         return run_async(
             self._async_client.grep(
@@ -2877,6 +3064,7 @@ class SyncHTTPClient:
                 exclude_uri=exclude_uri,
                 tags=tags,
                 include_tags=include_tags,
+                level_limit=level_limit,
             )
         )
 

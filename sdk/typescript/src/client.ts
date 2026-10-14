@@ -27,6 +27,7 @@ import type {
   GitCommitOptions,
   GitRestoreOptions,
   JsonObject,
+  ListPage,
   ListOptions,
   GetSkillOptions,
   GrepOptions,
@@ -46,6 +47,7 @@ import type {
   SetTagsOptions,
   TaskListOptions,
   TreeOptions,
+  TreePage,
   UpdateSessionConfigOptions,
   UpdateWatchOptions,
   WaitOptions,
@@ -480,6 +482,9 @@ export class OpenVikingClient {
       image_url: imageUrl,
       session_id:
         kind === "search" ? (options as SearchOptions).sessionId : undefined,
+      events_time_decay_protection: options.eventsTimeDecayProtection,
+      search_type:
+        kind === "search" ? (options as SearchOptions).searchType : undefined,
       limit: options.limit,
       node_limit: options.nodeLimit,
       score_threshold: options.scoreThreshold,
@@ -509,6 +514,7 @@ export class OpenVikingClient {
     const body = compact({
       query,
       mode: "context",
+      search_type: options.searchType,
       image_url: imageUrl,
       session_id: options.sessionId,
       limit: options.limit,
@@ -521,6 +527,7 @@ export class OpenVikingClient {
       since: options.since,
       until: options.until,
       time_field: options.timeField,
+      events_time_decay_protection: options.eventsTimeDecayProtection,
       query_expansion: options.queryExpansion,
       max_tokens: options.maxTokens,
       quotas: options.quotas,
@@ -578,45 +585,74 @@ export class OpenVikingClient {
     });
   }
   /** List directory contents. */
-  list(uri: string, options: ListOptions = {}): Promise<unknown[]> {
-    return this.request("GET", "/api/v1/fs/ls", {
-      query: {
-        uri: normalizeURI(uri),
-        simple: options.simple ?? false,
-        recursive: options.recursive ?? false,
-        output: options.output ?? "original",
-        abs_limit: options.absLimit ?? 256,
-        show_all_hidden: options.showAllHidden ?? false,
-        node_limit: options.nodeLimit ?? 1000,
-        offset: options.offset,
-        limit: options.limit,
-        sort_by: options.sortBy,
-        sort_order: options.sortOrder,
-        tags: options.tags,
-        include_tags: options.includeTags || undefined,
+  async list(uri: string, options: ListOptions = {}): Promise<unknown[]> {
+    return (await this.listPage(uri, options)).result;
+  }
+  /** List directory contents with pagination metadata. */
+  async listPage(uri: string, options: ListOptions = {}): Promise<ListPage> {
+    const envelope = await this.transport.requestEnvelope<unknown[]>(
+      "GET",
+      "/api/v1/fs/ls",
+      {
+        query: {
+          uri: normalizeURI(uri),
+          simple: options.simple ?? false,
+          recursive: options.recursive ?? false,
+          output: options.output ?? "original",
+          abs_limit: options.absLimit ?? 256,
+          include_abstract: options.includeAbstract,
+          include_overview: options.includeOverview,
+          overview_limit: options.overviewLimit ?? 4000,
+          show_all_hidden: options.showAllHidden ?? false,
+          node_limit: options.nodeLimit ?? 1000,
+          offset: options.offset,
+          limit: options.limit,
+          sort_by: options.sortBy,
+          sort_order: options.sortOrder,
+          extra_fields: options.extraFields,
+          tags: options.tags,
+          include_tags: options.includeTags || undefined,
+        },
       },
-    });
+    );
+    return {
+      result: envelope.result ?? [],
+      hasMore: envelope.has_more ?? false,
+    };
   }
   /** Return a directory tree. */
-  tree(uri: string, options: TreeOptions = {}): Promise<JsonObject[]> {
-    return this.request("GET", "/api/v1/fs/tree", {
-      query: {
-        uri: normalizeURI(uri),
-        output: options.output ?? "original",
-        abs_limit: options.absLimit ?? 128,
-        include_abstract: options.includeAbstract,
-        include_overview: options.includeOverview,
-        overview_limit: options.overviewLimit ?? 4000,
-        show_all_hidden: options.showAllHidden ?? false,
-        directories_only: options.directoriesOnly || undefined,
-        node_limit: options.nodeLimit ?? 1000,
-        level_limit: options.levelLimit ?? 3,
-        offset: options.offset,
-        limit: options.limit,
-        tags: options.tags,
-        include_tags: options.includeTags || undefined,
+  async tree(uri: string, options: TreeOptions = {}): Promise<JsonObject[]> {
+    return (await this.treePage(uri, options)).result;
+  }
+  /** Return a directory tree with pagination metadata. */
+  async treePage(uri: string, options: TreeOptions = {}): Promise<TreePage> {
+    const envelope = await this.transport.requestEnvelope<JsonObject[]>(
+      "GET",
+      "/api/v1/fs/tree",
+      {
+        query: {
+          uri: normalizeURI(uri),
+          output: options.output ?? "original",
+          abs_limit: options.absLimit ?? 128,
+          include_abstract: options.includeAbstract,
+          include_overview: options.includeOverview,
+          overview_limit: options.overviewLimit ?? 4000,
+          show_all_hidden: options.showAllHidden ?? false,
+          directories_only: options.directoriesOnly || undefined,
+          node_limit: options.nodeLimit ?? 1000,
+          level_limit: options.levelLimit ?? 3,
+          offset: options.offset,
+          limit: options.limit,
+          extra_fields: options.extraFields,
+          tags: options.tags,
+          include_tags: options.includeTags || undefined,
+        },
       },
-    });
+    );
+    return {
+      result: envelope.result ?? [],
+      hasMore: envelope.has_more ?? false,
+    };
   }
   /** Return URI metadata. */
   stat(uri: string): Promise<JsonObject> {
@@ -758,11 +794,15 @@ export class OpenVikingClient {
           content: operation.content,
           content_base64: operation.contentBase64,
           mode: operation.mode,
+          tags: operation.tags,
+          tag_mode: operation.tagMode,
+          acl: operation.acl,
         }),
       ),
       wait: options.wait,
       timeout: options.timeout,
       telemetry: options.telemetry,
+      processing_mode: options.processingMode,
     });
     return this.request("POST", "/api/v1/content/batch-write", {
       body: mergeExtra(body, options.extra),
@@ -984,6 +1024,7 @@ export class OpenVikingClient {
       options = optionsOrKeepRecentCount;
     }
     const body = compact({
+      enable_working_memory: options.enableWorkingMemory,
       keep_recent_count: options.keepRecentCount,
       retention_mode: options.retentionMode,
       keep_recent_turn_count: options.keepRecentTurnCount,

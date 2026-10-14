@@ -349,17 +349,17 @@ class TestOpenAIVLMClientRetries:
         assert call_kwargs["max_retries"] == 0
 
     @pytest.mark.parametrize(
-        ("status_code", "message", "expected_attempts"),
+        ("status_code", "message"),
         [
-            (400, "Total tokens of multi-modal content and text exceed max message tokens.", 1),
-            (400, "The parameter model is invalid.", 1),
-            (401, "Unauthorized", 1),
-            (503, "Service Unavailable", 6),
+            (400, "Total tokens of multi-modal content and text exceed max message tokens."),
+            (400, "The parameter model is invalid."),
+            (401, "Unauthorized"),
+            (503, "Service Unavailable"),
         ],
     )
     @patch("volcenginesdkarkruntime.AsyncArk")
-    def test_volcengine_async_client_uses_shared_retry_policy(
-        self, mock_async_ark_class, status_code, message, expected_attempts
+    def test_volcengine_async_client_performs_single_request(
+        self, mock_async_ark_class, status_code, message
     ):
         error = ArkAPIStatusError(
             f"Error code: {status_code} - {message}",
@@ -382,12 +382,11 @@ class TestOpenAIVLMClientRetries:
             }
         )
 
-        with patch("openviking.utils.model_retry.asyncio.sleep", new=AsyncMock()):
-            with pytest.raises(ArkAPIStatusError) as raised:
-                asyncio.run(vlm.get_completion_async("hello"))
+        with pytest.raises(ArkAPIStatusError) as raised:
+            asyncio.run(vlm.get_completion_async("hello"))
 
         assert raised.value is error
-        assert mock_client.chat.completions.create.await_count == expected_attempts
+        assert mock_client.chat.completions.create.await_count == 1
         call_kwargs = mock_async_ark_class.call_args.kwargs
         assert call_kwargs["timeout"] == 12.0
         assert call_kwargs["max_retries"] == 0
@@ -531,7 +530,7 @@ class TestVLMExtraRequestBody:
             api_key="sk-test",
             http_client=httpx.Client(transport=httpx.MockTransport(send)),
         ) as client:
-            monkeypatch.setattr(vlm, "get_client", lambda: client)
+            monkeypatch.setattr(vlm.inner, "get_client", lambda: client)
             assert vlm.get_completion("hello") == "ok"
             assert vlm.get_vision_completion("describe", images=[b"\x89PNG\r\n\x1a\n"]) == "ok"
 
@@ -539,7 +538,7 @@ class TestVLMExtraRequestBody:
             api_key="sk-test",
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(send)),
         ) as async_client:
-            monkeypatch.setattr(vlm, "get_async_client", lambda: async_client)
+            monkeypatch.setattr(vlm.inner, "get_async_client", lambda: async_client)
             assert await vlm.get_completion_async("hello") == "ok"
             assert (
                 await vlm.get_vision_completion_async("describe", images=[b"\x89PNG\r\n\x1a\n"])
@@ -575,6 +574,104 @@ class TestVLMExtraRequestBody:
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
         assert call_kwargs["extra_body"] == {"seed": 7, "enable_thinking": True}
         assert call_kwargs["reasoning_effort"] == "low"
+
+    @pytest.mark.parametrize(
+        "model", ["claude-opus-4-5", "anthropic/claude-opus-4-5", "openai/claude-opus-4-5"]
+    )
+    async def test_litellm_anthropic_extra_body_on_the_wire(self, monkeypatch, model):
+        bodies = []
+
+        def send(client, request, **kwargs):
+            bodies.append(json.loads(request.content))
+            if model.startswith("openai/"):
+                assert request.url.path.endswith("/chat/completions")
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={
+                        "choices": [
+                            {
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    },
+                )
+            assert request.url.path == "/v1/messages"
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-opus-4-5",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+
+        async def send_async(client, request, **kwargs):
+            return send(client, request, **kwargs)
+
+        monkeypatch.setattr(httpx.Client, "send", send)
+        monkeypatch.setattr(httpx.AsyncClient, "send", send_async)
+        extra = {
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "output_config": {"effort": "low"},
+        }
+        vlm = LiteLLMVLMProvider(
+            {
+                "provider": "litellm",
+                "model": model,
+                "api_key": "sk-test",
+                "api_base": "http://localhost:9999",
+                "max_retries": 0,
+                "extra_request_body": extra,
+            }
+        )
+        assert vlm.get_completion("hello") == "ok"
+        assert await vlm.get_completion_async("hello") == "ok"
+        assert vlm.get_vision_completion("describe", images=[b"\x89PNG\r\n\x1a\n"]) == "ok"
+        assert (
+            await vlm.get_vision_completion_async("describe", images=[b"\x89PNG\r\n\x1a\n"]) == "ok"
+        )
+        assert len(bodies) == 4
+        for body in bodies:
+            assert "extra_body" not in body
+            assert {key: body[key] for key in extra} == extra
+        assert vlm.extra_request_body == extra
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "api_key",
+            "api_base",
+            "custom_llm_provider",
+            "model",
+            "messages",
+            "stream",
+            "tools",
+            "tool_choice",
+            "timeout",
+            "extra_headers",
+            "mock_response",
+        ],
+    )
+    def test_anthropic_extra_body_cannot_change_call_controls(self, monkeypatch, key):
+        call = MagicMock()
+        monkeypatch.setattr("openviking.models.vlm.backends.litellm_vlm.completion", call)
+        vlm = LiteLLMVLMProvider(
+            {
+                "model": "claude-opus-4-5",
+                "provider": "litellm",
+                "extra_request_body": {key: "override"},
+            }
+        )
+        with pytest.raises(ValueError, match=key):
+            vlm.get_completion("hello")
+        call.assert_not_called()
 
     def test_litellm_build_kwargs_passes_extra_request_body(self):
         vlm = LiteLLMVLMProvider(

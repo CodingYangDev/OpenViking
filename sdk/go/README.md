@@ -141,6 +141,23 @@ _ = session
 _ = commit
 ```
 
+## Pagination Metadata
+
+`List` and `Tree` preserve their existing return types for compatibility. Use
+`ListPage` or `TreePage` when the caller needs to know whether the server
+truncated the result because of `limit` or `node_limit`.
+
+```go
+page, err := client.TreePage(ctx, "viking://resources/", &openviking.TreeOptions{
+        NodeLimit: 1000,
+})
+if err != nil {
+        return err
+}
+fmt.Println("nodes:", len(page.Result))
+fmt.Println("has more:", page.HasMore)
+```
+
 ## API Coverage
 
 The Go SDK v1 intentionally follows the Python HTTP client surface.
@@ -153,7 +170,7 @@ Implemented:
 | Skill management | `ListSkills`, `FindSkills`, `ValidateSkill`, `GetSkill`, `UpdateSkill`, `DeleteSkill` |
 | MCP servers and live context | `AddMCP`, `RemoveMCP`, `ListMCPs`, `FindMCPTools`, `ValidateMCP`, `GetMCP`, `SyncMCP`, `GetMCPStatus`, `InvokeMCPTool`, `MountMCPTool`, `UnmountMCPTool`, `ListMCPMounts` |
 | Watch management | `ListWatches`, `GetWatch`, `UpdateWatch`, `DeleteWatch`, `TriggerWatch` |
-| Filesystem and content | `List`, `Tree`, `Stat`, `Attrs`, `Mkdir`, `Remove`, `Move`, `Read`, `Abstract`, `Overview`, `Write`, `SetTags`, `Reindex` |
+| Filesystem and content | `List`, `ListPage`, `Tree`, `TreePage`, `Stat`, `Attrs`, `Mkdir`, `Remove`, `Move`, `Read`, `Abstract`, `Overview`, `Write`, `SetTags`, `Reindex` |
 | Retrieval | `Find`, `Search`, `Grep`, `Glob` |
 | Sessions and tasks | `CreateSession`, `ListSessions`, `GetSession`, `UpdateSessionConfig`, `SessionExists`, `GetSessionContext`, `GetSessionArchive`, `DeleteSession`, `AddMessage`, `BatchAddMessages`, `CommitSession`, `GetTask`, `ListTasks` |
 | Packs | `ExportOVPack`, `BackupOVPack`, `ImportOVPack`, `RestoreOVPack` |

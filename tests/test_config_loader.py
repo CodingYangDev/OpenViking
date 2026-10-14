@@ -256,6 +256,14 @@ def test_generic_code_hosting_domains_include_supported_platforms():
     ]
 
 
+def test_example_config_loads_as_runtime_config():
+    example_path = Path(__file__).resolve().parents[1] / "examples" / "ov.conf.example"
+
+    config = OpenVikingConfig.from_dict(load_json_config(example_path))
+
+    assert config.storage.agfs.backend == "local"
+
+
 def test_example_code_hosting_domains_match_runtime_defaults():
     example_path = Path(__file__).resolve().parents[1] / "examples" / "ov.conf.example"
     example_text = example_path.read_text(encoding="utf-8")
@@ -439,7 +447,7 @@ def test_openviking_config_ignores_deprecated_code_summary_mode(monkeypatch):
     OpenVikingConfigSingleton.reset_instance()
 
 
-def test_openviking_config_retrieval_hotness_alpha_defaults_to_zero(monkeypatch):
+def test_openviking_config_transaction_redo_recovery_enabled_defaults_true(monkeypatch):
     monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
 
     from openviking_cli.utils.config.open_viking_config import (
@@ -449,8 +457,6 @@ def test_openviking_config_retrieval_hotness_alpha_defaults_to_zero(monkeypatch)
 
     config = OpenVikingConfig.from_dict({})
 
-    assert config.retrieval.hotness_alpha == 0.0
-    assert config.retrieval.score_propagation_alpha == 1.0
     assert config.storage.transaction.redo_recovery_enabled is True
 
     OpenVikingConfigSingleton.reset_instance()
@@ -473,31 +479,16 @@ def test_openviking_config_transaction_redo_recovery_enabled_can_be_disabled(mon
     OpenVikingConfigSingleton.reset_instance()
 
 
-@pytest.mark.parametrize("field_name", ["hotness_alpha", "score_propagation_alpha"])
-def test_openviking_config_retrieval_alpha_validates_range(monkeypatch, field_name):
-    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
-
-    from openviking_cli.utils.config.open_viking_config import (
-        OpenVikingConfig,
-        OpenVikingConfigSingleton,
-    )
-
-    with pytest.raises(ValueError):
-        OpenVikingConfig.from_dict({"retrieval": {field_name: 1.5}})
-
-    OpenVikingConfigSingleton.reset_instance()
-
-
 def test_openviking_config_singleton_preserves_value_error_for_bad_config(tmp_path, monkeypatch):
     monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
 
     from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
 
     config_path = tmp_path / "ov.conf"
-    config_path.write_text('{"retrieval": {"hotness_alpha": 1.5}}')
+    config_path.write_text('{"retrieval": {"recall_intent_timeout_s": 0}}')
 
     OpenVikingConfigSingleton.reset_instance()
-    with pytest.raises(ValueError, match="retrieval.hotness_alpha"):
+    with pytest.raises(ValueError, match="retrieval.recall_intent_timeout_s"):
         OpenVikingConfigSingleton.initialize(config_path=str(config_path))
     OpenVikingConfigSingleton.reset_instance()
 
