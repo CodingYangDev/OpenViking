@@ -12,13 +12,14 @@ from openviking.pyagfs.exceptions import (
     AGFSHTTPError,
     AGFSInternalError,
     AGFSIsADirectoryError,
+    AGFSMountPointNotFoundError,
     AGFSNotADirectoryError,
     AGFSNotSupportedError,
     AGFSPluginError,
     AGFSResourceExhaustedError,
     GitConcurrentCommitError,
 )
-from openviking.server.error_mapping import map_exception
+from openviking.server.error_mapping import is_not_found_error, map_exception
 from openviking.server.models import ERROR_CODE_TO_HTTP_STATUS
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 from openviking.utils.exceptions import AllCredentialsFailedError
@@ -58,6 +59,12 @@ def test_agfs_client_does_not_exist_maps_to_not_found():
     assert isinstance(mapped, NotFoundError)
     assert mapped.code == "NOT_FOUND"
     assert mapped.details == {"resource": "viking://missing", "type": "file"}
+
+
+def test_missing_mount_is_unavailable():
+    error = AGFSMountPointNotFoundError("mount point not found: /local")
+    assert not is_not_found_error(error)
+    assert map_exception(error).code == "UNAVAILABLE"
 
 
 def test_agfs_client_invalid_uri_maps_to_invalid_uri():

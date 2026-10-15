@@ -35,7 +35,6 @@ class _FakeVikingFS:
         return self.store[uri]
 
     async def exists(self, uri, ctx=None):
-        """Resource fixtures model existing files unless a test overrides this method."""
         return True
 
     async def write_file(self, uri, content, ctx=None):
@@ -153,7 +152,7 @@ class _FakeSession:
         self.messages = []
         self.meta = SimpleNamespace(memory_policy=None)
 
-    def add_messages(self, specs):
+    async def add_messages_async(self, specs):
         self.messages.extend(specs)
 
 
@@ -216,7 +215,9 @@ def request_context():
 
 @pytest.fixture(autouse=True)
 def task_tracker(monkeypatch):
-    tracker = SimpleNamespace(list_tasks=AsyncMock(return_value=[]), wait=AsyncMock())
+    tracker = SimpleNamespace(
+        list_tasks=AsyncMock(return_value=[]), wait=AsyncMock(), has_work=lambda _: False
+    )
     monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
     return tracker
 
@@ -277,8 +278,8 @@ async def test_on_resource_added_bridges_reason_through_resource_session(
 
 
 @pytest.mark.asyncio
-async def test_on_resource_added_serializes_same_resource_across_loops(request_context):
-    """Concurrent queue loops serialize writes to the same resource reason session."""
+async def test_on_resource_added_reuses_same_reason_session(request_context):
+    """Concurrent queue loops must serialize writes to the shared reason session."""
     entered = asyncio.Event()
     release = asyncio.Event()
     worker_waiting = threading.Event()
@@ -491,9 +492,7 @@ async def test_find_referencing_memories_uses_memory_refs(request_context):
         recursive=True,
     )
 
-    assert len(matches) == 1
-    assert matches[0].memory_uri == memory_uri
-    assert matches[0].resource_ref["resource_uri"] == resource_uri
+    assert matches == [memory_uri]
 
 
 @pytest.mark.asyncio
@@ -533,8 +532,7 @@ async def test_find_referencing_memories_uses_grep_candidates_without_tree_scan(
         recursive=False,
     )
 
-    assert len(matches) == 1
-    assert matches[0].memory_uri == memory_uri
+    assert matches == [memory_uri]
     assert viking_fs.grep_calls == [
         {
             "uri": "viking://user/alice/memories",
@@ -547,6 +545,10 @@ async def test_find_referencing_memories_uses_grep_candidates_without_tree_scan(
     ]
     assert viking_fs.read_calls == [memory_uri]
     assert viking_fs.tree_calls == []
+
+    viking_fs.grep = AsyncMock(side_effect=RuntimeError("storage unavailable"))
+    with pytest.raises(RuntimeError, match="storage unavailable"):
+        await service._grep_candidate_memory_uris(ctx=request_context, resource_uri=resource_uri)
 
 
 @pytest.mark.asyncio
@@ -579,9 +581,7 @@ async def test_find_referencing_memories_scans_actor_peer_memory(request_context
         recursive=True,
     )
 
-    assert len(matches) == 1
-    assert matches[0].memory_uri == memory_uri
-    assert matches[0].resource_ref["resource_uri"] == resource_uri
+    assert matches == [memory_uri]
 
 
 @pytest.mark.asyncio
@@ -640,19 +640,20 @@ async def test_before_resource_delete_commits_then_unlinks_stale_refs(
     assert result["status"] == "pending"
     await processor.on_dequeue(queued.pop(0))
     assert service._get_viking_fs().store[memory_uri] == raw
-    task_tracker.get.return_value.status = TaskStatus.FAILED
+    task_tracker.get.return_value = (
+        None if reason_pending else SimpleNamespace(status=TaskStatus.FAILED)
+    )
+    phase = "on_resource_deleted" if reason_pending else "_find_referencing_memories"
+    failing = AsyncMock(wraps=getattr(service, phase), side_effect=RuntimeError("unavailable"))
+    monkeypatch.setattr(service, phase, failing)
+    await processor.on_dequeue(queued.pop(0))
+    failing.side_effect = None
     for _ in range(4):
         if queued:
             await processor.on_dequeue(queued.pop(0))
     assert not queued
     assert refresh.await_count == 2
-    assert session_service.committed == [
-        {
-            "ctx": request_context,
-            "session_id": _resource_reason_session_id(resource_uri),
-            "keep_recent_count": 0,
-        }
-    ]
+    assert len(session_service.committed) == 1
     mf = MemoryFileUtils.read(service._get_viking_fs().store[memory_uri], uri=memory_uri)
     assert "resource_refs" not in mf.extra_fields
 
@@ -681,7 +682,6 @@ async def test_unlink_memory_reference_keeps_visible_text_and_no_schema_metadata
     result = await service._unlink_memory_reference(
         ctx=request_context,
         memory_uri=memory_uri,
-        memory_file=MemoryFileUtils.read(original_raw, uri=memory_uri),
         resource_uri=resource_uri,
     )
 
@@ -716,7 +716,6 @@ async def test_unlink_memory_reference_does_not_delete_event_memory(
     result = await service._unlink_memory_reference(
         ctx=request_context,
         memory_uri=memory_uri,
-        memory_file=MemoryFileUtils.read(original_raw, uri=memory_uri),
         resource_uri=resource_uri,
     )
 

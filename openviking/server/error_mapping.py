@@ -429,6 +429,8 @@ def _map_upstream_api_error(exc: Exception) -> OpenVikingError | None:
 
 
 def is_not_found_error(exc: Exception) -> bool:
+    if isinstance(exc, AGFSMountPointNotFoundError):
+        return False
     if isinstance(exc, FileNotFoundError):
         return True
     if isinstance(exc, AGFSNotFoundError):
