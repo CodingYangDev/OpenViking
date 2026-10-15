@@ -316,7 +316,11 @@ export function createMemorySessionManager({ config, pluginRoot }) {
     const run = (state.flushChain ?? Promise.resolve()).then(async () => {
       const added = await flushPendingMessages(opencodeSessionId, state)
       if (commit && isCaptureEnabled(config)) {
-        await commitOvSession(state.ovSessionId, { force: true, reason })
+        const result = await commitOvSession(state.ovSessionId, { force: true, reason })
+        // Server lost the session (reset/reinstall); drop the stale mapping.
+        if (result.status === "not_found" && sessions.get(opencodeSessionId) === state) {
+          sessions.delete(opencodeSessionId)
+        }
       } else if (added > 0) {
         await maybeCommitByThreshold(state)
       }
@@ -514,6 +518,14 @@ export function createMemorySessionManager({ config, pluginRoot }) {
         status: res.status,
       })
       return { status: "queued" }
+    }
+    if (res.status === 404) {
+      log("WARN", "session", "OpenViking session not found", {
+        openviking_session: ovSessionId,
+        reason,
+        trace_id: res.traceId,
+      })
+      return { status: "not_found" }
     }
     log("ERROR", "session", "Failed to commit OpenViking session", {
       openviking_session: ovSessionId,

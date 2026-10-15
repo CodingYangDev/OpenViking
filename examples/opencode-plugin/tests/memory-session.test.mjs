@@ -657,3 +657,60 @@ test("explicit commit writes the response trace_id to the plugin log", async () 
     await new Promise((resolve) => server.close(resolve))
   }
 })
+
+test("commit of a session the server no longer has drops the stale local mapping", async () => {
+  const requests = []
+  const server = createServer(async (req, res) => {
+    let body = ""
+    req.setEncoding("utf8")
+    for await (const chunk of req) body += chunk
+    requests.push({ method: req.method, url: req.url, body })
+    res.setHeader("Content-Type", "application/json")
+    if (req.url === "/health") {
+      res.end(JSON.stringify({ status: "ok" }))
+    } else {
+      res.statusCode = 404
+      res.end(JSON.stringify({ status: "error", error: { code: "NOT_FOUND", message: "Session not found" } }))
+    }
+  })
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve))
+  try {
+    await withTempDir("ov-oc-session-stale-", async (dir) => {
+      const statePath = join(dir, "openviking-session-state.json")
+      // Recent activity keeps these out of the startup prune; only the server has lost them.
+      const now = Date.now()
+      const staleSession = (ovSessionId) => ({
+        ovSessionId,
+        createdAt: now,
+        lastActivityAt: now,
+        messages: [["msg-1", { role: "user", captured: true, parts: [] }]],
+      })
+      await fs.promises.writeFile(statePath, JSON.stringify({
+        version: 2,
+        sessions: {
+          "oc-stale-a": staleSession("oc-oc-stale-a"),
+          "oc-stale-b": staleSession("oc-oc-stale-b"),
+        },
+      }), "utf8")
+      const { port } = server.address()
+      const manager = createMemorySessionManager({ config: baseConfig(`http://127.0.0.1:${port}`), pluginRoot: dir })
+
+      await manager.init({ deferNetwork: true })
+      await manager.handleEvent({ type: "session.deleted", properties: { info: { id: "oc-stale-a" } } })
+      await manager.flushAll({ commit: true })
+      await manager.flushAll({ commit: true })
+      assert.deepEqual(await manager.commitSession("oc-oc-stale-c"), { status: "not_found" })
+
+      const commits = requests.filter((request) => request.url?.endsWith("/commit"))
+      assert.deepEqual(commits.map((request) => request.url), [
+        "/api/v1/sessions/oc-oc-stale-a/commit",
+        "/api/v1/sessions/oc-oc-stale-b/commit",
+        "/api/v1/sessions/oc-oc-stale-c/commit",
+      ])
+      const state = JSON.parse(await fs.promises.readFile(statePath, "utf8"))
+      assert.deepEqual(state.sessions, {})
+    })
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
+})
