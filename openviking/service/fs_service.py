@@ -488,7 +488,13 @@ class FSService:
         context_type = context_type_for_uri(uri)
         refresh_parent_uri = self._semantic_refresh_parent_uri(uri, context_type)
         memory_overview_uri = self._memory_overview_parent_uri(uri, context_type)
-        result = await viking_fs.rm(uri, recursive=recursive, ctx=ctx)
+        reason_resource_uris = None
+        async with self._uri_mutation_coordinator.mutation(ctx.account_id, [uri]):
+            if self._resource_memory_link_service and context_type == "resource":
+                reason_resource_uris = await self._reason_resource_uris_for_delete(
+                    uri, ctx, recursive=recursive
+                )
+            result = await viking_fs.rm(uri, recursive=recursive, ctx=ctx)
         await self._sync_watch_after_rm(uri, account_id=ctx.account_id, context_type=context_type)
         # A refresh on a parent that no longer exists would lock its sidecar
         # paths and thereby recreate the deleted directory. Nothing to
@@ -511,6 +517,7 @@ class FSService:
                     ctx=ctx,
                     resource_uri=uri,
                     recursive=recursive,
+                    reason_resource_uris=reason_resource_uris,
                 )
             if memory_overview_uri:
                 await MemoryUpdater.refresh_schema_overview(
@@ -542,6 +549,24 @@ class FSService:
             if queue_status is not None:
                 result["queue_status"] = queue_status
         return result
+
+    async def _reason_resource_uris_for_delete(
+        self, uri: str, ctx: RequestContext, *, recursive: bool
+    ) -> Optional[List[str]]:
+        """Snapshot URIs under the mutation lease; return None for a missing subtree."""
+        if not recursive:
+            return [uri]
+        viking_fs = self._ensure_initialized()
+        try:
+            stat = await viking_fs.stat(uri, ctx=ctx, skip_count=True)
+        except (NotFoundError, FileNotFoundError):
+            return None
+        if not stat.get("isDir"):
+            return [uri]
+        descendants = await viking_fs._collect_uris(
+            viking_fs._uri_to_path(uri, ctx=ctx), recursive=True, ctx=ctx, strict=True
+        )
+        return list(dict.fromkeys([uri, *descendants]))
 
     @staticmethod
     def _semantic_refresh_status(

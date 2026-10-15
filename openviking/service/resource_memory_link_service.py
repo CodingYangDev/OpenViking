@@ -8,7 +8,9 @@ files' MEMORY_FIELDS metadata.
 
 from __future__ import annotations
 
+import hashlib
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
@@ -22,6 +24,7 @@ from openviking.core.namespace import (
 )
 from openviking.core.peer_id import normalize_peer_id
 from openviking.message.part import TextPart
+from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.memory_updater import MemoryUpdateResult
@@ -44,6 +47,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _RESOURCE_REASON_SESSION_ID = "__openviking_resource_reason__"
+_RESOURCE_REASON_SESSION_PREFIX = "__reason__"
 _RESOURCE_REASON_MEMORY_TYPES = ["entities", "events", "preferences"]
 _RESOURCE_DELETION_MEMORY_TYPES = ["entities", "preferences"]
 _RESOURCE_REASON_COMMIT_TIMEOUT_SECONDS = 1800.0
@@ -52,6 +56,13 @@ _ABSTRACT_NOT_READY_MARKERS = (
     "[.abstract.md is not ready]",
     "[Directory abstract is not ready]",
 )
+
+
+def _resource_reason_session_id(resource_uri: str) -> str:
+    """Return the stable reason session ID for a normalized resource URI."""
+    canonical_uri = "viking://" + "/".join(uri_parts(resource_uri))
+    digest = hashlib.sha256(canonical_uri.encode("utf-8")).hexdigest()[:32]
+    return f"{_RESOURCE_REASON_SESSION_PREFIX}{digest}"
 
 
 def _resource_memory_policy(
@@ -123,10 +134,12 @@ class ResourceMemoryLinkService:
         vikingdb: Optional[VikingDBManager] = None,
         viking_fs: Optional[VikingFS] = None,
         session_service: Optional["SessionService"] = None,
+        uri_mutation_coordinator: Optional[UriMutationCoordinator] = None,
     ):
         self._vikingdb = vikingdb
         self._viking_fs = viking_fs
         self._session_service = session_service
+        self._uri_mutation_coordinator = uri_mutation_coordinator or UriMutationCoordinator()
         # Additions run on queue loops; deletions can run on the HTTP loop.
         self._reason_session_lock = AsyncSemaphore()
 
@@ -153,7 +166,7 @@ class ResourceMemoryLinkService:
         reason: str,
         source_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Bridge add-resource reason extraction through normal session commit."""
+        """Durably enqueue a resource reason; return its task ID without waiting for extraction."""
         reason = (reason or "").strip()
         if not reason:
             return {"status": "skipped", "reason": "empty_reason"}
@@ -163,13 +176,18 @@ class ResourceMemoryLinkService:
             return {"status": "skipped", "reason": "session_service_unavailable"}
 
         added_at = datetime.now(timezone.utc).isoformat()
-        resource_abstract = await self._read_resource_directory_abstract(resource_uri, ctx)
-        session_id = _RESOURCE_REASON_SESSION_ID
+        resource_uri = "viking://" + "/".join(uri_parts(resource_uri))
+        session_id = _resource_reason_session_id(resource_uri)
         target_peer_id = _resource_reason_peer_id(ctx, resource_uri)
         commit_result: Dict[str, Any] = {}
-        task_result: Optional[Dict[str, Any]] = None
 
-        async with self._reason_session_lock:
+        async with (
+            self._uri_mutation_coordinator.access(ctx.account_id, [resource_uri]),
+            self._reason_session_lock,
+        ):
+            if not await self._get_viking_fs().exists(resource_uri, ctx=ctx):
+                return {"status": "skipped", "reason": "resource_not_found"}
+            resource_abstract = await self._read_resource_directory_abstract(resource_uri, ctx)
             session = await self._session_service.get(
                 session_id,
                 ctx,
@@ -205,17 +223,12 @@ class ResourceMemoryLinkService:
             )
 
         task_id = commit_result.get("task_id")
-        if task_id:
-            task_result = await self._wait_for_commit_task(
-                task_id=str(task_id),
-                ctx=ctx,
-            )
         return {
-            "status": "success",
+            "status": "accepted",
             "session_id": session_id,
             "commit_task_id": task_id,
             "archive_uri": commit_result.get("archive_uri"),
-            "commit_task": task_result,
+            "commit_task": None,
         }
 
     async def on_resource_deleted(
@@ -233,7 +246,7 @@ class ResourceMemoryLinkService:
             return {"status": "skipped", "reason": "session_service_unavailable"}
 
         deleted_at = datetime.now(timezone.utc).isoformat()
-        session_id = _RESOURCE_REASON_SESSION_ID
+        session_id = _resource_reason_session_id(resource_uri)
         target_peer_id = _resource_reason_peer_id(ctx, resource_uri)
         commit_result: Dict[str, Any] = {}
         task_result: Optional[Dict[str, Any]] = None
@@ -274,10 +287,20 @@ class ResourceMemoryLinkService:
 
         task_id = commit_result.get("task_id")
         if task_id:
-            task_result = await self._wait_for_commit_task(
-                task_id=str(task_id),
-                ctx=ctx,
-            )
+            try:
+                task_result = await self._wait_for_commit_task(
+                    task_id=str(task_id),
+                    ctx=ctx,
+                )
+            except TimeoutError:
+                return {
+                    "status": "pending",
+                    "session_id": session_id,
+                    "commit_task_id": task_id,
+                    "archive_uri": commit_result.get("archive_uri"),
+                    "commit_task": None,
+                    "pending_task_ids": [str(task_id)],
+                }
         return {
             "status": "success",
             "session_id": session_id,
@@ -353,10 +376,23 @@ class ResourceMemoryLinkService:
         ctx: RequestContext,
         resource_uri: str,
         recursive: bool = False,
+        reason_resource_uris: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
-        """Commit mutable memory updates and unlink stale references to a deleted resource."""
+        """Wait for reason commits before unlinking; return pending IDs on timeout.
+
+        A missing recursive snapshot includes all of the user's reason sessions.
+        """
         if context_type_for_uri(resource_uri) != "resource":
             return {"status": "skipped", "reason": "not_resource"}
+
+        pending_ids = await self._wait_for_pending_reason_commits(
+            ctx=ctx,
+            resource_uri=resource_uri,
+            recursive=recursive,
+            reason_resource_uris=reason_resource_uris,
+        )
+        if pending_ids:
+            return {"status": "pending", "pending_task_ids": pending_ids, "memory_uris": []}
 
         matches = await self._find_referencing_memories(
             ctx=ctx,
@@ -377,6 +413,13 @@ class ResourceMemoryLinkService:
         except Exception as exc:
             logger.warning("Resource deletion memory commit failed for %s: %s", resource_uri, exc)
             commit_result = {"status": "failed", "error": str(exc)}
+        if commit_result.get("status") == "pending":
+            return {
+                "status": "pending",
+                "pending_task_ids": commit_result["pending_task_ids"],
+                "memory_uris": [],
+                "memory_commit": commit_result,
+            }
 
         post_commit_matches = await self._find_referencing_memories(
             ctx=ctx,
@@ -418,11 +461,64 @@ class ResourceMemoryLinkService:
                 "resource memory cleanup failed before deleting resource: " + "; ".join(errors)
             )
         return {
-            "status": "success",
+            "status": "failed" if commit_result.get("status") == "failed" else "success",
             "memory_uris": list(dict.fromkeys(cleaned)),
             "deleted_memory_uris": list(dict.fromkeys(deleted)),
             "memory_commit": commit_result,
         }
+
+    async def _wait_for_pending_reason_commits(
+        self,
+        *,
+        ctx: RequestContext,
+        resource_uri: str,
+        recursive: bool,
+        reason_resource_uris: Optional[Sequence[str]],
+    ) -> List[str]:
+        """Wait without changing tasks; return IDs not observed terminal before timeout.
+
+        All legacy commits participate because their task records have no resource URI.
+        """
+        from openviking.service.task_tracker import TaskStatus, get_task_tracker
+
+        session_ids = {
+            _RESOURCE_REASON_SESSION_ID,
+            _resource_reason_session_id(resource_uri),
+            *(_resource_reason_session_id(uri) for uri in reason_resource_uris or ()),
+        }
+        include_all_reasons = recursive and reason_resource_uris is None
+        tracker = get_task_tracker()
+        deadline = time.monotonic() + _RESOURCE_REASON_COMMIT_TIMEOUT_SECONDS
+        tasks = await tracker.list_tasks(
+            task_type="session_commit",
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            limit=None,
+        )
+        pending = [
+            task
+            for task in tasks
+            if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+            and (
+                task.resource_id in session_ids
+                or (
+                    include_all_reasons
+                    and (task.resource_id or "").startswith(_RESOURCE_REASON_SESSION_PREFIX)
+                )
+            )
+        ]
+        for index, task in enumerate(pending):
+            try:
+                await tracker.wait(
+                    task.task_id,
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                    timeout=max(0.0, deadline - time.monotonic()),
+                    poll_interval=0.1,
+                )
+            except TimeoutError:
+                return [unsettled.task_id for unsettled in pending[index:]]
+        return []
 
     async def _unlink_memory_reference(
         self,

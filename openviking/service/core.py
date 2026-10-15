@@ -120,7 +120,9 @@ class OpenVikingService:
         )
         self._pack_service = PackService()
         self._search_service = SearchService()
-        self._resource_memory_link_service = ResourceMemoryLinkService()
+        self._resource_memory_link_service = ResourceMemoryLinkService(
+            uri_mutation_coordinator=self._uri_mutation_coordinator,
+        )
         self._resource_service = ResourceService()
         self._session_service = SessionService()
         self._debug_service = DebugService()

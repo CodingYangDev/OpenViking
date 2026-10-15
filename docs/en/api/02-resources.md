@@ -162,7 +162,7 @@ This endpoint is the core entry point for resource management. It supports vario
 4. Build the directory tree and write to AGFS
 5. Run post-ingest processing according to `processing_mode`: `semantic_and_vectors` generates semantic artifacts and vectors; `vectors_only` skips semantic understanding and only enqueues file vectorization
 6. Return a `task_id` by default; callers confirm completion through the Task API
-7. If `reason` is non-empty, append it to the fixed resource reason session and commit through the normal memory extraction pipeline so suitable user memories can reference the resource URI
+7. If `reason` is non-empty, persist it in a session derived from the final resource URI and enqueue a memory extraction commit; release the resource import worker once the commit is accepted
 8. Set up scheduled update task if `watch_interval` is specified
 
 **Code Entry Points**:
@@ -184,7 +184,7 @@ This endpoint is the core entry point for resource management. It supports vario
 | create_parent | bool | No | False | Automatically create parent directory if it does not exist (server-side flag) |
 | add_type | string | No | None | Explicit connector type; requires `path` and exact `to`, and cannot be combined with `parent` or `temp_file_id` |
 | source_name | string | No | None | Source display name; uploaded files use their original filename when omitted |
-| reason | string | No | "" | Reason for adding the resource. When non-empty, OpenViking runs it through the normal session memory extraction pipeline with the resource URI and records resource references in the resulting memory |
+| reason | string | No | "" | Reason for adding the resource. After resource processing, a non-empty reason is persisted with the resource URI and submitted for background session memory extraction |
 | instruction | string | No | "" | Processing instructions for semantic extraction (experimental feature) |
 | wait | bool | No | False | Whether to wait for semantic processing and vectorization to complete before returning |
 | strict | bool | No | False | Whether to use strict mode |
@@ -224,7 +224,9 @@ This endpoint is the core entry point for resource management. It supports vario
 - Native HTTPS Git credentials in `args.auth_config` remain request-local when `watch_interval <= 0`. When `watch_interval > 0`, OpenViking stores the repository-bound username/token in private watch state and restores it only for later Git fetches. The credentials are excluded from ordinary queue payloads and watch API/MCP/CLI responses. Git PATs have no generic refresh flow; rotate an expired or revoked token by recreating the watch. Legacy URL-embedded credentials such as `https://user:token@host/repo.git` remain accepted and are passed through unchanged; because that URL is also the source identifier, it may be recorded in process arguments, logs, queues, resource metadata, and watch state. Prefer `args.auth_config` for new integrations. Plaintext HTTP authentication and authenticated redirects for `args.auth_config` remain rejected.
 - The token travels in the HTTPS request body. Keep diagnostic request-body dumping disabled in production because explicitly enabling it can record secrets.
 - Memory generated from `reason` is extracted through the same pipeline as `session.commit`. It uses `reason`, the resource URI, available source name, and available directory abstract; it does not inspect or expand the full resource content. OpenViking writes to existing memory types such as `entities`, `events`, or `preferences`, not a dedicated resource memory directory.
-- When deleting a resource, OpenViking scans the self or peer memories targeted by the current context before deletion, removes the matching resource URI and content introduced by that `reason`, and refreshes the semantic index for the affected memories.
+- The resource import waits only until the reason commit is durably accepted, including with `wait=true`; memory extraction continues independently. `memory_linking.status="accepted"` means the commit is queued, not that memories are available. Poll `memory_linking.commit_task_id` through `GET /api/v1/tasks/{task_id}` to check extraction completion.
+- Reason sessions are stable for each final resource URI within the current user's session scope. Commits for the same resource retain their order, while different resource sessions can run concurrently within the shared SessionCommit worker limit. Existing sessions and queued commits are preserved and continue processing; new reason commits use the resource-derived session.
+- When deleting a resource, OpenViking waits for related unfinished reason commits, including applicable commits in the shared reason session, before cleaning references from the self or peer memories targeted by the current context. Cleanup removes the matching resource URI and content introduced by that `reason`, and refreshes the semantic index for affected memories. `memory_cleanup.status="pending"` means cleanup cannot yet finish; it does not mark those background commits as failed or cancel them.
 - Other sources with `wait=false` finish source parsing, target resolution, and AGFS writes before returning. Only semantic and embedding queues continue asynchronously.
 - `processing_mode=vectors_only` does not call the VLM semantic-understanding stage and does not generate or refresh `.abstract.md` / `.overview.md`. For existing targets, it preserves existing semantic artifacts and existing semantic vectors. It still updates the resource tree, vectorizes current non-hidden files when `build_index=true`, and removes detail vectors for files deleted during refresh.
 - `processing_mode` belongs to `add_resource`. The admin `reindex` API/CLI continues to use `mode` (`vectors_only`, `semantic_and_vectors`) for maintenance operations on already-ingested data.
@@ -622,7 +624,7 @@ task_id      uuid-xxx
 | `errors` | array | List of errors encountered during processing |
 | `warnings` | array | Optional warnings, including partial processing or memory-linking failures |
 | `queue_status` | object | Queue summary when waiting synchronously or reading a completed task result; grouped by queue with `processed`, `requeue_count`, `error_count`, and `errors` |
-| `memory_linking` | object | Optional result of linking the resource URI to memories generated from `reason` |
+| `memory_linking` | object | Optional reason commit submission result; `status="accepted"` reports durable submission, and `commit_task_id` identifies the separate memory extraction task |
 
 **Completed add-resource task result**
 

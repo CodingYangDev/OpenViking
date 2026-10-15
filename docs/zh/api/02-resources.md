@@ -162,7 +162,7 @@ Connector 要求精确的 `to` 目标，不支持 `wait=true`。`tos://` 来源�
 4. 构建目录树并写入 AGFS
 5. 按 `processing_mode` 执行入库后的处理：`semantic_and_vectors` 生成语义产物和向量；`vectors_only` 跳过语义理解，只提交文件向量化
 6. 默认返回 `task_id`；调用方通过任务 API 确认处理完成
-7. 如果 `reason` 非空，将其追加到固定的资源 reason session 并 commit，复用常规记忆抽取链路，让合适的用户记忆引用该资源 URI
+7. 如果 `reason` 非空，将其持久化到由最终资源 URI 派生的 session 并提交记忆抽取任务；任务受理后释放资源导入 worker
 8. 如指定 `--watch-interval`，设置定时更新任务
 
 **代码入口**：
@@ -184,7 +184,7 @@ Connector 要求精确的 `to` 目标，不支持 `wait=true`。`tos://` 来源�
 | create_parent | bool | 否 | False | 如果父目录不存在，自动创建父目录（服务端标志） |
 | add_type | string | 否 | None | 显式指定 Connector 类型；要求同时传 `path` 和精确的 `to`，不能与 `parent` 或 `temp_file_id` 组合 |
 | source_name | string | 否 | None | 来源显示名；上传文件省略时使用原始文件名 |
-| reason | string | 否 | "" | 添加资源的原因；非空时会随资源 URI 进入常规 session 记忆抽取链路，并在生成的记忆中记录资源引用 |
+| reason | string | 否 | "" | 添加资源的原因；资源处理完成后，非空的 reason 会随资源 URI 持久化，并提交后台 session 记忆抽取任务 |
 | instruction | string | 否 | "" | 语义提取的处理指令（实验特性） |
 | wait | bool | 否 | False | 是否等待语义处理和向量化完成才返回；不支持单独的 `timeout` 参数，HTTP 超时使用客户端配置 |
 | strict | bool | 否 | False | 是否使用严格模式 |
@@ -224,7 +224,9 @@ Connector 要求精确的 `to` 目标，不支持 `wait=true`。`tos://` 来源�
 - 原生 HTTPS Git 的 `args.auth_config` 在 `watch_interval <= 0` 时只用于本次请求；当 `watch_interval > 0` 时，OpenViking 会把与仓库 URL 绑定的 username/token 保存到 Watch 私有鉴权状态，并只在后续 Git 拉取时恢复使用。凭据不会进入普通持久队列，也不会出现在 Watch API/MCP/CLI 返回中。Git PAT 没有通用刷新流程，过期或撤销后需要重建 Watch 来更换 token。为兼容已有用法，系统仍接受 `https://user:token@host/repo.git` 形式的 URL 内嵌凭据并原样传递；由于该 URL 同时也是资源来源标识，它可能被记录到进程参数、日志、队列、资源元数据和 Watch 状态中。新接入建议使用 `args.auth_config`。`args.auth_config` 的明文 HTTP 鉴权和带鉴权重定向仍会被拒绝。
 - token 会放在 HTTPS 请求体中传输。生产环境应保持诊断请求体 dump 关闭；显式启用该功能可能记录秘密。
 - `reason` 触发的记忆生成复用 `session.commit` 的抽取链路，只使用 `reason`、资源 URI、可用的资源名称和目录摘要，不会读取或展开完整资源正文；系统会写入 `entities`、`events`、`preferences` 等已有记忆类型，不创建独立的资源记忆目录。
-- 删除资源时，系统会在删除前扫描本次上下文对应的 self 或 peer 记忆中的 `resource_refs`，清理对应资源 URI 和由该 `reason` 引入的内容，并重新刷新相关记忆的语义索引。
+- 资源导入只等待 reason commit 持久化并受理，`wait=true` 也不等待记忆抽取完成。`memory_linking.status="accepted"` 表示任务已入队，不表示记忆已经生成；通过 `GET /api/v1/tasks/{task_id}` 查询 `memory_linking.commit_task_id` 可确认记忆抽取状态。
+- 在当前用户的 session 作用域内，同一最终资源 URI 稳定对应同一个 reason session。同一资源的 commit 按顺序执行，不同资源的 session 可以在共享 SessionCommit worker 的并发额度内并行。已有 session 和已排队的 commit 保留并继续执行，新的 reason commit 使用按资源派生的 session。
+- 删除资源时，系统先等待相关尚未结束的 reason commit，包括共享 reason session 中适用的任务，再清理本次上下文对应的 self 或 peer 记忆中的资源引用及由该 `reason` 引入的内容，并刷新相关记忆的语义索引。`memory_cleanup.status="pending"` 表示清理暂未完成，不会将这些后台 commit 标记为失败或取消它们。
 - 其他来源在 `wait=false` 时会在响应前完成来源解析、目标解析和 AGFS 写入，仅 semantic 与 embedding 队列继续异步处理。
 - `processing_mode=vectors_only` 不调用 VLM 语义理解阶段，也不会生成或刷新 `.abstract.md` / `.overview.md`。对已存在目标，它会保留旧的语义产物和旧的语义向量；仍会更新资源树，在 `build_index=true` 时向量化当前非隐藏文件，并清理由本次刷新删除的文件 detail 向量。
 - `processing_mode` 只属于 `add_resource`。管理员维护已有数据时，`reindex` API/CLI 仍使用 `mode`（`vectors_only`、`semantic_and_vectors`）。
@@ -621,7 +623,7 @@ task_id      uuid-xxx
 | `errors` | array | 处理过程中的错误列表 |
 | `warnings` | array | 可选警告，包括部分处理失败或资源记忆关联失败 |
 | `queue_status` | object | 同步等待或已完成任务结果中的队列汇总，按队列返回 `processed`、`requeue_count`、`error_count` 和 `errors` |
-| `memory_linking` | object | （可选，仅当 `reason` 触发记忆生成时）本次资源 URI 与用户记忆的关联结果 |
+| `memory_linking` | object | 可选的 reason commit 提交结果；`status="accepted"` 表示已持久化受理，`commit_task_id` 是独立记忆抽取任务的 ID |
 
 **完成后的资源添加任务结果**
 
