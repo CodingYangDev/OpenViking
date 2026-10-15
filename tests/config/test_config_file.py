@@ -26,13 +26,11 @@ def config_file(tmp_path, monkeypatch):
             "temperature": 0.4,
         },
         "embedding": {
-            "dense": {
-                "provider": "openai",
-                "model": "text-embedding-3-small",
-                "dimension": 1024,
-                "api_key": "dummy-review-key",
-                "extra_body": {"routing": "keep"},
-            }
+            "provider": "openai",
+            "model": "text-embedding-3-small",
+            "dimension": 1024,
+            "api_key": "dummy-review-key",
+            "extra_body": {"routing": "keep"},
         },
         "rerank": {"provider": "jev", "api_key": "dummy-review-key", "model": "jev-latest"},
         "storage": {"workspace": str(tmp_path / "data")},
@@ -74,12 +72,12 @@ def test_embedding_binding_rotation_preserves_implicit_input_and_identity(config
     path, raw = config_file
     result = read_config_file()
     _save_form(
-        {"embedding": {"dense": {"credentials": [{"provider": "openai", "api_key": "rotated"}]}}},
+        {"embedding": {"credentials": [{"provider": "openai", "api_key": "rotated"}]}},
         result["revision"],
     )
-    dense = json.loads(path.read_text())["embedding"]["dense"]
+    dense = json.loads(path.read_text())["embedding"]
     assert "input" not in dense
-    assert dense["model"] == raw["embedding"]["dense"]["model"]
+    assert dense["model"] == raw["embedding"]["model"]
     assert dense["dimension"] == 1024 and dense["extra_body"] == {"routing": "keep"}
 
 
@@ -91,9 +89,9 @@ def test_programmatic_configuration_never_guesses_a_file(monkeypatch):
 
 def test_embedding_credentials_display_parent_fallbacks(config_file):
     path, raw = config_file
-    raw["embedding"]["dense"]["credentials"] = [{"id": "primary", "provider": "openai"}]
+    raw["embedding"]["credentials"] = [{"id": "primary", "provider": "openai"}]
     path.write_text(json.dumps(raw))
-    binding = read_config_file()["models"]["embedding"]["config"]["dense"]["credentials"][0]
+    binding = read_config_file()["models"]["embedding"]["config"]["credentials"][0]
     assert binding["model"] == "text-embedding-3-small"
     assert binding["api_key"] == "dummy-review-key"
 
@@ -101,19 +99,19 @@ def test_embedding_credentials_display_parent_fallbacks(config_file):
 @pytest.mark.parametrize("kind", ["vlm", "embedding"])
 def test_cleared_legacy_binding_fields_do_not_return(config_file, kind):
     path, raw = config_file
-    section = raw["vlm"] if kind == "vlm" else raw["embedding"]["dense"]
+    section = raw["vlm"] if kind == "vlm" else raw["embedding"]
     section.update(api_base="https://old.example/v1", extra_headers={"X-Old": "obsolete"})
     path.write_text(json.dumps(raw))
     result = read_config_file()
     config = result["models"][kind]["config"]
-    binding_section = config if kind == "vlm" else config["dense"]
+    binding_section = config
     binding_section["credentials"][0].update(api_base=None, extra_headers={})
     _save_form({kind: config}, result["revision"])
     stored = json.loads(path.read_text())
-    stored_section = stored[kind] if kind == "vlm" else stored[kind]["dense"]
+    stored_section = stored[kind]
     assert "api_base" not in stored_section and "api_key" not in stored_section
     current = read_config_file()["models"][kind]["config"]
-    current_section = current if kind == "vlm" else current["dense"]
+    current_section = current
     assert not current_section["credentials"][0].get("api_base")
     assert not current_section["credentials"][0].get("extra_headers")
     assert current_section["credentials"][0]["api_key"] == "dummy-review-key"
@@ -208,20 +206,18 @@ def test_keyless_embedding_does_not_inherit_legacy_key(config_file):
     _save_form(
         {
             "embedding": {
-                "dense": {
-                    "credentials": [
-                        {
-                            "provider": "openai",
-                            "api_key": None,
-                            "api_base": "http://localhost:8000/v1",
-                        }
-                    ]
-                }
+                "credentials": [
+                    {
+                        "provider": "openai",
+                        "api_key": None,
+                        "api_base": "http://localhost:8000/v1",
+                    }
+                ]
             }
         },
         result["revision"],
     )
-    current = read_config_file()["models"]["embedding"]["config"]["dense"]["credentials"][0]
+    current = read_config_file()["models"]["embedding"]["config"]["credentials"][0]
     assert not current.get("api_key")
     assert current["api_base"] == "http://localhost:8000/v1"
 
@@ -229,16 +225,14 @@ def test_keyless_embedding_does_not_inherit_legacy_key(config_file):
 @pytest.mark.parametrize("null_provider", [False, True])
 def test_partial_embedding_credentials_preserve_legacy_backend(config_file, null_provider):
     path, raw = config_file
-    dense = raw["embedding"]["dense"]
+    dense = raw["embedding"]
     dense["backend"] = dense.pop("provider")
     if null_provider:
         dense["provider"] = None
     path.write_text(json.dumps(raw))
     result = read_config_file()
-    _save_form(
-        {"embedding": {"dense": {"credentials": [{"api_key": "rotated"}]}}}, result["revision"]
-    )
-    current = read_config_file()["models"]["embedding"]["config"]["dense"]
+    _save_form({"embedding": {"credentials": [{"api_key": "rotated"}]}}, result["revision"])
+    current = read_config_file()["models"]["embedding"]["config"]
     assert current["credentials"][0]["provider"] == "openai"
     assert current["credentials"][0]["api_key"] == "rotated"
 

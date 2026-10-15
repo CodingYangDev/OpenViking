@@ -32,7 +32,7 @@ from openviking_cli.doctor import (
 class TestCheckConfig:
     def test_pass_with_valid_config(self, tmp_path: Path):
         config = tmp_path / "ov.conf"
-        config.write_text(json.dumps({"embedding": {"dense": {}}}))
+        config.write_text(json.dumps({"embedding": {}}))
         with patch("openviking_cli.doctor._find_config", return_value=config):
             ok, detail, fix = check_config()
         assert ok
@@ -40,7 +40,7 @@ class TestCheckConfig:
 
     def test_pass_with_utf8_bom_config(self, tmp_path: Path):
         config = tmp_path / "ov.conf"
-        config.write_text("\ufeff" + json.dumps({"embedding": {"dense": {}}}))
+        config.write_text("\ufeff" + json.dumps({"embedding": {}}))
         with patch("openviking_cli.doctor._find_config", return_value=config):
             ok, detail, fix = check_config()
         assert ok
@@ -221,16 +221,7 @@ class TestCheckEmbedding:
     def test_fail_local_unknown_model(self, tmp_path: Path):
         config = tmp_path / "ov.conf"
         config.write_text(
-            json.dumps(
-                {
-                    "embedding": {
-                        "dense": {
-                            "provider": "local",
-                            "model": "unknown-local-model",
-                        }
-                    }
-                }
-            )
+            json.dumps({"embedding": {"provider": "local", "model": "unknown-local-model"}})
         )
 
         with patch("openviking_cli.doctor._find_config", return_value=config):
@@ -246,11 +237,9 @@ class TestCheckEmbedding:
             json.dumps(
                 {
                     "embedding": {
-                        "dense": {
-                            "provider": "openai",
-                            "model": "text-embedding-3-small",
-                            "api_key": "sk-test123",
-                        }
+                        "provider": "openai",
+                        "model": "text-embedding-3-small",
+                        "api_key": "sk-test123",
                     }
                 }
             )
@@ -271,12 +260,10 @@ class TestCheckEmbedding:
             json.dumps(
                 {
                     "embedding": {
-                        "dense": {
-                            "provider": "ollama",
-                            "model": "bge-m3",
-                            "api_base": "http://localhost:11434/v1",
-                            "dimension": 1024,
-                        }
+                        "provider": "ollama",
+                        "model": "bge-m3",
+                        "api_base": "http://localhost:11434/v1",
+                        "dimension": 1024,
                     }
                 }
             )
@@ -298,11 +285,9 @@ class TestCheckEmbedding:
             json.dumps(
                 {
                     "embedding": {
-                        "dense": {
-                            "provider": "openai",
-                            "model": "text-embedding-3-small",
-                            "api_key": "${OPENAI_API_KEY}",
-                        }
+                        "provider": "openai",
+                        "model": "text-embedding-3-small",
+                        "api_key": "${OPENAI_API_KEY}",
                     }
                 }
             )
@@ -323,11 +308,9 @@ class TestCheckEmbedding:
             json.dumps(
                 {
                     "embedding": {
-                        "dense": {
-                            "provider": "openai",
-                            "model": "text-embedding-3-small",
-                            "api_key": "{your-api-key}",
-                        }
+                        "provider": "openai",
+                        "model": "text-embedding-3-small",
+                        "api_key": "{your-api-key}",
                     }
                 }
             )
@@ -357,8 +340,8 @@ class TestCheckEmbedding:
                 side_effect=RuntimeError("model not found"),
             ):
                 ok, detail, fix = _probe_embedding_provider(
-                    {"max_retries": 0},
                     {
+                        "max_retries": 0,
                         "provider": "ollama",
                         "model": "missing-model",
                         "api_base": "http://localhost:11434/v1",
@@ -387,7 +370,6 @@ class TestCheckEmbedding:
                 side_effect=fake_embed_compat,
             ):
                 ok, detail, fix = _probe_embedding_provider(
-                    {},
                     {
                         "provider": "openai",
                         "model": "custom-embed",
@@ -398,7 +380,7 @@ class TestCheckEmbedding:
 
         assert not ok
         assert "no dense vector" in detail
-        assert "embedding.dense" in fix
+        assert "embedding" in fix
 
     def test_embedding_probe_fails_on_dimension_mismatch(self):
         class FakeEmbedder:
@@ -417,7 +399,6 @@ class TestCheckEmbedding:
                 side_effect=fake_embed_compat,
             ):
                 ok, detail, fix = _probe_embedding_provider(
-                    {},
                     {
                         "provider": "openai",
                         "model": "custom-embed",
@@ -429,15 +410,15 @@ class TestCheckEmbedding:
         assert not ok
         assert "dimension mismatch" in detail
         assert "expected 3, got 2" in detail
-        assert "embedding.dense.dimension" in fix
+        assert "embedding.dimension" in fix
 
-    def test_embedding_probe_uses_embedder_dimension_when_config_omits_dimension(self):
+    def test_embedding_probe_uses_schema_dimension_when_config_omits_dimension(self):
         class FakeEmbedder:
             def get_dimension(self):
                 return 2
 
         async def fake_embed_compat(*args, **kwargs):
-            return type("Result", (), {"dense_vector": [0.1, 0.2]})()
+            return type("Result", (), {"dense_vector": [0.1] * 1536})()
 
         with patch(
             "openviking_cli.utils.config.embedding_config.EmbeddingConfig.get_embedder",
@@ -448,19 +429,18 @@ class TestCheckEmbedding:
                 side_effect=fake_embed_compat,
             ):
                 ok, detail, fix = _probe_embedding_provider(
-                    {},
                     {
                         "provider": "openai",
-                        "model": "custom-embed",
+                        "model": "text-embedding-3-small",
                         "api_base": "http://localhost:11434/v1",
                     },
                 )
 
         assert ok
-        assert "dimension=2" in detail
+        assert "dimension=1536" in detail
         assert fix is None
 
-    def test_embedding_probe_fails_when_inferred_dimension_mismatches_probe(self):
+    def test_embedding_probe_fails_when_schema_dimension_mismatches_probe(self):
         class FakeEmbedder:
             def get_dimension(self):
                 return 3
@@ -477,18 +457,17 @@ class TestCheckEmbedding:
                 side_effect=fake_embed_compat,
             ):
                 ok, detail, fix = _probe_embedding_provider(
-                    {},
                     {
                         "provider": "openai",
-                        "model": "custom-embed",
+                        "model": "text-embedding-3-small",
                         "api_base": "http://localhost:11434/v1",
                     },
                 )
 
         assert not ok
         assert "dimension mismatch" in detail
-        assert "expected 3, got 2" in detail
-        assert "embedding.dense.dimension" in fix
+        assert "expected 1536, got 2" in detail
+        assert "embedding.dimension" in fix
 
 
 class TestCheckVlm:
@@ -624,12 +603,7 @@ class TestCheckOllama:
         config.write_text(
             json.dumps(
                 {
-                    "embedding": {
-                        "dense": {
-                            "provider": "openai",
-                            "model": "text-embedding-3-small",
-                        }
-                    },
+                    "embedding": {"provider": "openai", "model": "text-embedding-3-small"},
                     "vlm": {"provider": "openai", "model": "gpt-4o-mini"},
                 }
             )
@@ -646,11 +620,9 @@ class TestCheckOllama:
             json.dumps(
                 {
                     "embedding": {
-                        "dense": {
-                            "provider": "ollama",
-                            "model": "bge-m3",
-                            "api_base": "http://embedding-host:11435/v1",
-                        }
+                        "provider": "ollama",
+                        "model": "bge-m3",
+                        "api_base": "http://embedding-host:11435/v1",
                     }
                 }
             )
@@ -693,9 +665,7 @@ class TestCheckOllama:
         config.write_text(
             json.dumps(
                 {
-                    "embedding": {
-                        "dense": {"provider": "openai", "model": "text-embedding-3-small"}
-                    },
+                    "embedding": {"provider": "openai", "model": "text-embedding-3-small"},
                     "vlm": {"provider": "openai", "model": "gpt-4o-mini"},
                     "query_planner": {
                         "provider": "litellm",
@@ -741,11 +711,9 @@ class TestCheckOllama:
             json.dumps(
                 {
                     "embedding": {
-                        "dense": {
-                            "provider": "ollama",
-                            "model": "bge-m3",
-                            "api_base": "http://localhost:11434/v1",
-                        }
+                        "provider": "ollama",
+                        "model": "bge-m3",
+                        "api_base": "http://localhost:11434/v1",
                     }
                 }
             )
@@ -1041,7 +1009,7 @@ class TestRunDoctor:
         config.write_text(
             json.dumps(
                 {
-                    "embedding": {"dense": {"provider": "openai", "model": "m", "api_key": "sk-x"}},
+                    "embedding": {"provider": "openai", "model": "m", "api_key": "sk-x"},
                     "vlm": {"provider": "openai", "model": "m", "api_key": "sk-x"},
                 }
             )
