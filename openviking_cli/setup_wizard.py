@@ -2260,6 +2260,10 @@ def _config_section(data: dict[str, Any], *keys: str) -> dict[str, Any]:
         if not isinstance(node, dict):
             return {}
         node = node.get(key)
+    if isinstance(node, dict) and keys == ("embedding",):
+        from openviking_cli.utils.config.embedding_config import normalize_embedding_config
+
+        return normalize_embedding_config(node)
     return node if isinstance(node, dict) else {}
 
 

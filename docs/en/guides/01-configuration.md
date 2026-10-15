@@ -302,7 +302,7 @@ Use a vision-capable GLM model such as `glm-4.6v` or `glm-5v-turbo` when OpenVik
 
 ### embedding
 
-Vector search uses one embedding model. `output` selects `dense` (default) or `dense_sparse`; the latter returns both vectors from the same model in one request. Model fields live directly under `embedding`. The old nested `dense`, `sparse`, and `hybrid` sections are rejected.
+Vector search uses one embedding model. `output` selects `dense` (default) or `dense_sparse`; the latter returns both vectors from the same model in one request. New model fields live directly under `embedding`. Existing `embedding.dense` configurations remain supported and normalize to the single-model config with `output: "dense"` by default. Multimodal input, environment references, and outer execution policies retain their meaning. Reading does not rewrite the file; editing Embedding through the Web form or CLI saves the flat structure. The old `sparse` and `hybrid` sections are rejected, and nested `dense` cannot be mixed with top-level model fields.
 
 #### Dense Embedding
 

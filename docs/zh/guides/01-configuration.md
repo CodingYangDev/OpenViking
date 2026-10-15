@@ -298,7 +298,7 @@ OpenAI 已于 2026 年 8 月 31 日[停止在 ChatGPT 登录的 Codex 中提供 
 
 ### embedding
 
-向量搜索使用一个 Embedding 模型。`output` 可选 `dense`（默认）或 `dense_sparse`；后者由同一模型在一次请求中返回两种向量。配置字段直接放在 `embedding` 下，旧 `dense`、`sparse`、`hybrid` 嵌套配置不再接受。
+向量搜索使用一个 Embedding 模型。`output` 可选 `dense`（默认）或 `dense_sparse`；后者由同一模型在一次请求中返回两种向量。新配置字段直接放在 `embedding` 下。旧的 `embedding.dense` 配置仍可使用，加载时转换为单模型配置，默认 `output: "dense"`；`input: "multimodal"`、环境变量和外层执行策略保持原意。读取不会改写文件，通过 Web 表单或 CLI 更新 Embedding 配置时保存为新结构。旧 `sparse`、`hybrid` 配置不再接受，`dense` 嵌套配置不能与顶层模型字段混写。
 
 #### Dense Embedding
 

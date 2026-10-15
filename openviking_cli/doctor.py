@@ -26,6 +26,7 @@ from openviking.server.config import (
 )
 from openviking_cli.utils.config.config_loader import resolve_config_path
 from openviking_cli.utils.config.consts import OPENVIKING_CONFIG_ENV
+from openviking_cli.utils.config.embedding_config import normalize_embedding_config
 from openviking_cli.utils.config.ovcli_config import load_ovcli_config
 from openviking_cli.utils.config.vlm_config import VLMConfig
 
@@ -66,8 +67,11 @@ def _load_config_json(config_path: Path) -> Optional[dict]:
     try:
         raw = config_path.read_text(encoding="utf-8-sig")
         raw = os.path.expandvars(raw)
-        return json.loads(raw)
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(raw)
+        if "embedding" in data:
+            data["embedding"] = normalize_embedding_config(data["embedding"])
+        return data
+    except (OSError, ValueError):
         return None
 
 

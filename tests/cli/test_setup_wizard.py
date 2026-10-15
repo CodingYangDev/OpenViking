@@ -1525,6 +1525,9 @@ class TestPartialUpdate:
             credentials=[{"provider": "volcengine", "model": "ep-old", "api_key": "old"}],
             max_retries=7,
         )
+        if output == "dense":
+            policy = original["embedding"].pop("max_retries")
+            original["embedding"] = {"dense": original["embedding"], "max_retries": policy}
         config_path.write_text(json.dumps(original), encoding="utf-8")
         new_dense = {"provider": "local", "model": "bge-small-zh-v1.5-f16", "dimension": 512}
 

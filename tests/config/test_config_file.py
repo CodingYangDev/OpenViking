@@ -68,15 +68,25 @@ def test_stale_revision_readonly_invalid_and_non_model_writes_leave_file_unchang
     assert path.read_bytes() == original
 
 
-def test_embedding_binding_rotation_preserves_implicit_input_and_identity(config_file):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_embedding_binding_rotation_preserves_implicit_input_and_identity(config_file, legacy):
     path, raw = config_file
+    if legacy:
+        path.write_text(
+            json.dumps({**raw, "embedding": {"dense": raw["embedding"], "max_retries": 7}})
+        )
+    original = path.read_bytes()
     result = read_config_file()
+    assert path.read_bytes() == original
+    assert "dense" not in result["models"]["embedding"]["config"]
     _save_form(
         {"embedding": {"credentials": [{"provider": "openai", "api_key": "rotated"}]}},
         result["revision"],
     )
     dense = json.loads(path.read_text())["embedding"]
-    assert "input" not in dense
+    assert "input" not in dense and "dense" not in dense
+    if legacy:
+        assert dense["max_retries"] == 7
     assert dense["model"] == raw["embedding"]["model"]
     assert dense["dimension"] == 1024 and dense["extra_body"] == {"routing": "keep"}
 
@@ -355,7 +365,14 @@ def test_environment_files_are_form_readonly_and_saved_verbatim(
     path, _ = config_file
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
-    content = '{\n  "vlm": {"model": "gpt-4o", "provider": "openai", ' + fragment + "}\n}\n"
+    monkeypatch.setenv("EMBEDDING_API_KEY", "secret-from-env")
+    content = (
+        '{\n  "vlm": {"model": "gpt-4o", "provider": "openai", '
+        + fragment
+        + '},\n  "embedding": {"dense": {"provider": "volcengine", '
+        '"model": "doubao-embedding-vision-251215", "api_key": "$EMBEDDING_API_KEY", '
+        '"dimension": 1024, "input": "multimodal"}}\n}\n'
+    )
     path.write_text(content)
     loaded = read_config_file()
     assert loaded["content"] == content
@@ -370,6 +387,9 @@ def test_environment_files_are_form_readonly_and_saved_verbatim(
     save_config_file(edited, loaded["revision"])
     assert path.read_bytes() == edited.encode()
     runtime = OpenVikingConfigSingleton._load_from_file(str(path))
+    assert runtime.embedding.output == "dense"
+    assert runtime.embedding.input == "multimodal"
+    assert runtime.embedding.api_key == "secret-from-env"
     if "\\u0024" in content:
         assert runtime.vlm.credentials[0].api_key == "$STUDIO_TEST_KEY"
 

@@ -231,7 +231,8 @@ class TestCheckEmbedding:
         assert "unsupported local model" in detail
         assert "Unknown local embedding model" in fix
 
-    def test_pass_with_api_key(self, tmp_path: Path):
+    @pytest.mark.parametrize("legacy", [False, True])
+    def test_pass_with_api_key(self, tmp_path: Path, legacy):
         config = tmp_path / "ov.conf"
         config.write_text(
             json.dumps(
@@ -244,6 +245,10 @@ class TestCheckEmbedding:
                 }
             )
         )
+        if legacy:
+            raw = json.loads(config.read_text())
+            raw["embedding"] = {"dense": raw["embedding"]}
+            config.write_text(json.dumps(raw))
         with patch("openviking_cli.doctor._find_config", return_value=config):
             with patch(
                 "openviking_cli.doctor._probe_embedding_provider",

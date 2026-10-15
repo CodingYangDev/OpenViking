@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Embedding output configuration and Ark request contracts."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from openviking.models.embedder.volcengine_embedders import VolcengineEmbedder
+from openviking_cli.utils.config.config_loader import load_json_config
 from openviking_cli.utils.config.embedding_config import EmbeddingConfig
 
 _MULTIMODAL_INPUT = [
@@ -17,7 +19,7 @@ _MULTIMODAL_INPUT = [
 ]
 
 
-def test_output_configuration_validates_model_and_every_credential():
+def test_output_configuration_validates_model_and_every_credential(tmp_path, monkeypatch):
     values = dict(
         provider="volcengine",
         model="doubao-embedding-vision-251215",
@@ -25,6 +27,24 @@ def test_output_configuration_validates_model_and_every_credential():
         input="text",
         output="dense_sparse",
     )
+    legacy_model = {
+        "provider": "volcengine",
+        "api_key": "$EMBEDDING_API_KEY",
+        "model": "doubao-embedding-vision-251215",
+        "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+        "dimension": 1024,
+        "input": "multimodal",
+    }
+    path = tmp_path / "ov.conf"
+    path.write_text(json.dumps({"embedding": {"dense": legacy_model, "max_retries": 7}}))
+    monkeypatch.setenv("EMBEDDING_API_KEY", "resolved-key")
+    legacy = EmbeddingConfig(**load_json_config(path)["embedding"])
+    flat = EmbeddingConfig(**{**legacy_model, "api_key": "resolved-key", "max_retries": 7})
+    assert legacy.model_dump() == flat.model_dump()
+    assert legacy.output == "dense" and legacy.input == "multimodal"
+    assert "dense" not in legacy.model_dump()
+    assert json.loads(path.read_text())["embedding"]["dense"] == legacy_model
+
     config = EmbeddingConfig(**values)
     assert config.output == "dense_sparse"
     assert EmbeddingConfig().output == "dense"
@@ -66,6 +86,9 @@ def test_output_configuration_validates_model_and_every_credential():
             "credentials": [{"api_key": "first"}, {"model": "doubao-embedding-vision-241215"}],
         },
         {"dense": values},
+        {"dense": legacy_model, "model": "another-model"},
+        {"dense": legacy_model, "sparse": values},
+        {"dense": None},
         {"hybrid": values},
         {"sparse": values},
     ]:

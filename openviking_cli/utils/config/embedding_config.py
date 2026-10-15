@@ -592,6 +592,22 @@ class EmbeddingModelConfig(BaseModel):
         return 2048
 
 
+def normalize_embedding_config(data: Any) -> Any:
+    """Accept the published dense-only config shape at raw configuration boundaries."""
+    if not isinstance(data, dict) or "dense" not in data:
+        return data
+    dense = data["dense"]
+    if not isinstance(dense, dict):
+        raise ValueError("embedding.dense must be an object")
+    if EmbeddingModelConfig.model_fields.keys() & data.keys():
+        raise ValueError("embedding.dense cannot be combined with flat model fields")
+    if dense.keys() - EmbeddingModelConfig.model_fields.keys():
+        raise ValueError("embedding.dense must contain only model configuration fields")
+    if dense.get("output", "dense") != "dense":
+        raise ValueError("embedding.dense only supports dense output; use flat embedding config")
+    return {**{key: value for key, value in data.items() if key != "dense"}, **dense}
+
+
 class EmbeddingCircuitBreakerConfig(BaseModel):
     failure_threshold: int = Field(
         default=5,
@@ -658,6 +674,7 @@ class EmbeddingConfig(EmbeddingModelConfig):
     @model_validator(mode="before")
     @classmethod
     def apply_default_local_model(cls, data: Any) -> Any:
+        data = normalize_embedding_config(data)
         if data is None:
             data = {}
         if isinstance(data, dict) and not any(

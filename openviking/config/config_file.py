@@ -10,7 +10,10 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from openviking_cli.utils.config.embedding_config import EmbeddingCredential
+from openviking_cli.utils.config.embedding_config import (
+    EmbeddingCredential,
+    normalize_embedding_config,
+)
 from openviking_cli.utils.config.open_viking_config import (
     OpenVikingConfig,
     OpenVikingConfigSingleton,
@@ -115,6 +118,8 @@ def _model_view(content: str, config: OpenVikingConfig) -> dict:
         model = getattr(config, kind)
         value = model.model_dump(exclude_none=True)
         original = raw.get(kind) or {}
+        if kind == "embedding":
+            original = normalize_embedding_config(original)
         value = _merge(value, original)
         if kind == "vlm":
             # VLM normalization synthesizes provider maps from parent fields.
@@ -256,7 +261,10 @@ def _apply_model_changes(raw: dict, settings: dict) -> None:
         raise ValueError("Only model sections can be edited through the form")
     for kind, value in settings.items():
         if isinstance(value, dict):
-            raw[kind] = _merge_credentials(raw.get(kind) or {}, value, kind == "embedding")
+            original = raw.get(kind) or {}
+            if kind == "embedding":
+                original = normalize_embedding_config(original)
+            raw[kind] = _merge_credentials(original, value, kind == "embedding")
         else:
             raise ValueError("Model configuration must be an object")
 
