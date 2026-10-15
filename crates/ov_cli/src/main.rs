@@ -840,6 +840,14 @@ enum Commands {
         /// ACL JSON, for example {"acl_mode":"restricted","entries":[]}
         #[arg(long, value_parser = |s: &str| serde_json::from_str::<serde_json::Value>(s))]
         acl: Option<serde_json::Value>,
+        /// Who made the edit, recorded in Compile output versions
+        #[arg(
+            long = "edit-source",
+            default_value = "agent",
+            value_parser = ["manual", "agent"],
+            help_heading = "Advanced options"
+        )]
+        edit_source: String,
     },
     /// [Data] Update explicit retrieval tags metadata for a file or directory
     #[command(hide = true)]
@@ -3792,6 +3800,7 @@ async fn main() {
             tags,
             tag_mode,
             acl,
+            edit_source,
         } => {
             let effective_mode = if let Some(m) = mode {
                 m
@@ -3810,6 +3819,7 @@ async fn main() {
                 tags,
                 tag_mode,
                 acl,
+                edit_source,
                 ctx,
             )
             .await

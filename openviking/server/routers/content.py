@@ -50,6 +50,8 @@ class WriteContentRequest(BaseModel):
     tags: list[str] | None = None
     tag_mode: Literal["replace", "append", "clear"] = "replace"
     acl: AclSpec | None = None
+    # Who made the edit; versions of Compile outputs record it (console edit = manual).
+    edit_source: Literal["manual", "agent"] = "agent"
 
 
 class BatchWriteOperation(BaseModel):
@@ -255,6 +257,7 @@ async def write(
             tags=request.tags,
             tag_mode=request.tag_mode,
             acl=request.acl,
+            edit_source=request.edit_source,
         ),
     )
     return Response(
