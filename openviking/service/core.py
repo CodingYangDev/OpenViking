@@ -634,6 +634,7 @@ class OpenVikingService:
                 self._queue_manager.SESSION_COMMIT,
                 dequeue_handler=SessionCommitProcessor(
                     self._session_service,
+                    self._resource_memory_link_service,
                 ),
                 allow_create=True,
             )

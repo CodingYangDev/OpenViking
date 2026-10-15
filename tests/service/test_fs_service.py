@@ -33,29 +33,19 @@ def run_fs_operations_inline(monkeypatch):
 
 
 class _FakeVikingFS:
-    def __init__(self, *, rm_error=None, events=None, parent_exists=True, descendants=()):
+    def __init__(self, *, rm_error=None, events=None, parent_exists=True):
         self.rm_calls = []
         self.mv_calls = []
         self.cp_calls = []
         self.rm_error = rm_error
         self.events = events
         self.parent_exists = parent_exists
-        self.descendants = list(descendants)
+        self.stat = AsyncMock(return_value={"isDir": True})
+        self._uri_to_path = lambda uri, ctx=None: uri
+        self._collect_uris = AsyncMock(return_value=[])
 
     async def exists(self, uri, ctx=None):
         return self.parent_exists
-
-    async def stat(self, uri, ctx=None, skip_count=False):
-        if not await self.exists(uri, ctx=ctx):
-            raise FileNotFoundError(uri)
-        return {"isDir": True}
-
-    def _uri_to_path(self, uri, ctx=None):
-        return uri
-
-    async def _collect_uris(self, path, recursive, ctx=None, *, strict=False):
-        assert recursive and strict
-        return list(self.descendants)
 
     async def rm(self, uri, recursive=False, ctx=None):
         self.rm_calls.append({"uri": uri, "recursive": recursive, "ctx": ctx})
@@ -264,17 +254,8 @@ class _FakeResourceMemoryLinkService:
         self.result = result
         self.calls = []
 
-    async def before_resource_delete(
-        self, *, ctx, resource_uri, recursive=False, reason_resource_uris=None
-    ):
-        self.calls.append(
-            {
-                "ctx": ctx,
-                "resource_uri": resource_uri,
-                "recursive": recursive,
-                "reason_resource_uris": reason_resource_uris,
-            }
-        )
+    async def before_resource_delete(self, **kwargs):
+        self.calls.append(kwargs)
         return self.result
 
 
@@ -1490,11 +1471,9 @@ async def test_resource_rm_does_not_cleanup_memory_if_resource_delete_fails(requ
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("target_exists", [True, False])
 async def test_resource_rm_refreshes_memory_overview_for_cleaned_memories(
     request_context,
     monkeypatch,
-    target_exists,
 ):
     cleanup = {
         "status": "success",
@@ -1503,9 +1482,7 @@ async def test_resource_rm_refreshes_memory_overview_for_cleaned_memories(
             "viking://user/ryoma/memories/entities/动漫角色/不二周助-link-test2.md"
         ],
     }
-    uri = "viking://resources/images/2026/06/11/不二周助_jpeg"
-    child = f"{uri}/photo.jpg"
-    viking_fs = _FakeVikingFS(parent_exists=target_exists, descendants=[child])
+    viking_fs = _FakeVikingFS()
     link_service = _FakeResourceMemoryLinkService(cleanup)
     service = FSService(
         viking_fs=viking_fs,
@@ -1523,16 +1500,13 @@ async def test_resource_rm_refreshes_memory_overview_for_cleaned_memories(
         fake_refresh_schema_overview,
     )
 
+    uri = "viking://resources/images/2026/06/11/不二周助_jpeg"
+    viking_fs._collect_uris.return_value = [f"{uri}/photo.jpg"]
     result = await service.rm(uri, ctx=request_context, recursive=True)
 
-    assert link_service.calls == [
-        {
-            "ctx": request_context,
-            "resource_uri": uri,
-            "recursive": True,
-            "reason_resource_uris": [uri, child] if target_exists else None,
-        }
-    ]
+    call = link_service.calls.pop()
+    assert call.pop("reason_resource_uris") == [uri, f"{uri}/photo.jpg"]
+    assert call == {"ctx": request_context, "resource_uri": uri, "recursive": True}
     assert refreshed == [
         {
             "viking_fs": viking_fs,

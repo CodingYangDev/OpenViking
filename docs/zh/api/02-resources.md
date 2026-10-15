@@ -225,8 +225,6 @@ Connector 要求精确的 `to` 目标，不支持 `wait=true`。`tos://` 来源�
 - token 会放在 HTTPS 请求体中传输。生产环境应保持诊断请求体 dump 关闭；显式启用该功能可能记录秘密。
 - `reason` 触发的记忆生成复用 `session.commit` 的抽取链路，只使用 `reason`、资源 URI、可用的资源名称和目录摘要，不会读取或展开完整资源正文；系统会写入 `entities`、`events`、`preferences` 等已有记忆类型，不创建独立的资源记忆目录。
 - 资源导入只等待 reason commit 持久化并受理，`wait=true` 也不等待记忆抽取完成。`memory_linking.status="accepted"` 表示任务已入队，不表示记忆已经生成；通过 `GET /api/v1/tasks/{task_id}` 查询 `memory_linking.commit_task_id` 可确认记忆抽取状态。
-- 在当前用户的 session 作用域内，同一最终资源 URI 稳定对应同一个 reason session。同一资源的 commit 按顺序执行，不同资源的 session 可以在共享 SessionCommit worker 的并发额度内并行。已有 session 和已排队的 commit 保留并继续执行，新的 reason commit 使用按资源派生的 session。
-- 删除资源时，系统先等待相关尚未结束的 reason commit，包括共享 reason session 中适用的任务，再清理本次上下文对应的 self 或 peer 记忆中的资源引用及由该 `reason` 引入的内容，并刷新相关记忆的语义索引。`memory_cleanup.status="pending"` 表示清理暂未完成，不会将这些后台 commit 标记为失败或取消它们。
 - 其他来源在 `wait=false` 时会在响应前完成来源解析、目标解析和 AGFS 写入，仅 semantic 与 embedding 队列继续异步处理。
 - `processing_mode=vectors_only` 不调用 VLM 语义理解阶段，也不会生成或刷新 `.abstract.md` / `.overview.md`。对已存在目标，它会保留旧的语义产物和旧的语义向量；仍会更新资源树，在 `build_index=true` 时向量化当前非隐藏文件，并清理由本次刷新删除的文件 detail 向量。
 - `processing_mode` 只属于 `add_resource`。管理员维护已有数据时，`reindex` API/CLI 仍使用 `mode`（`vectors_only`、`semantic_and_vectors`）。
