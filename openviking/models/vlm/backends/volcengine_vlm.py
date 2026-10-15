@@ -245,8 +245,10 @@ class VolcEngineVLM(OpenAIVLM):
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> Union[str, VLMResponse]:
-        """Get text completion; per-call reasoning effort applies only with thinking enabled."""
+        """Get text completion; explicit effort overrides configured effort when thinking is enabled."""
         effective_thinking = self.thinking if thinking is None else thinking
+        if reasoning_effort is None:
+            reasoning_effort = self.reasoning_effort
         effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         kwargs_messages = sanitize_openai_messages(
             messages or [{"role": "user", "content": prompt}]

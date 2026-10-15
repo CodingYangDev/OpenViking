@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 from vikingbot.providers.vlm_adapter import VLMProviderAdapter
 
+from openviking.models.model_error import ModelError, ModelErrorKind
 from openviking.models.vlm import FailoverVLM, MultiCredentialVLM, OpenAIVLM, VolcEngineVLM
 
 
@@ -112,13 +113,16 @@ async def test_vlm_adapter_streams_openai_content_deltas():
 
 @pytest.mark.asyncio
 async def test_vlm_adapter_streams_with_credential_failover_before_first_delta():
-    primary_completions = FakeCompletions(error=RuntimeError("status 429: rate limit"))
+    primary_completions = FakeCompletions(
+        error=ModelError(ModelErrorKind.RATE_LIMIT_ERROR, "Rate limit exceeded")
+    )
     backup_completions = FakeCompletions(chunks=[stream_chunk("backup", finish_reason="stop")])
     primary = VolcEngineVLM(
         {
             "provider": "volcengine",
             "model": "primary-model",
             "api_key": "primary-key",
+            "max_retries": 0,
         }
     )
     backup = VolcEngineVLM(
@@ -126,6 +130,8 @@ async def test_vlm_adapter_streams_with_credential_failover_before_first_delta()
             "provider": "volcengine",
             "model": "backup-model",
             "api_key": "backup-key",
+            "thinking": True,
+            "reasoning_effort": "low",
         }
     )
     attach_client(primary, primary_completions)
@@ -149,6 +155,7 @@ async def test_vlm_adapter_streams_with_credential_failover_before_first_delta()
     assert events[-1].response.content == "backup"
     assert len(primary_completions.calls) == 1
     assert backup_completions.calls[0]["model"] == "backup-model"
+    assert backup_completions.calls[0]["reasoning_effort"] == "low"
     assert credentials.active_credential_id == "backup"
 
 
@@ -178,7 +185,10 @@ async def test_vlm_adapter_streams_with_legacy_primary_backup_failover():
 @pytest.mark.asyncio
 async def test_credential_stream_does_not_replay_after_a_visible_delta():
     primary_completions = FakeCompletions(
-        chunks=[stream_chunk("partial"), RuntimeError("status 429: rate limit")]
+        chunks=[
+            stream_chunk("partial"),
+            ModelError(ModelErrorKind.RATE_LIMIT_ERROR, "Rate limit exceeded"),
+        ]
     )
     backup_completions = FakeCompletions(chunks=[stream_chunk("duplicate", finish_reason="stop")])
     primary = OpenAIVLM({"provider": "openai", "model": "primary-model", "api_key": "primary-key"})
@@ -202,4 +212,5 @@ async def test_credential_stream_does_not_replay_after_a_visible_delta():
     assert events[0].content == "partial"
     assert events[-1].type == "response"
     assert events[-1].response.finish_reason == "error"
+    assert len(primary_completions.calls) == 1
     assert backup_completions.calls == []
