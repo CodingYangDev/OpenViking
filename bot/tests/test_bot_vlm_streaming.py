@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from vikingbot.providers.vlm_adapter import VLMProviderAdapter
@@ -24,7 +25,9 @@ class FakeCompletions:
                     raise chunk
                 yield chunk
 
-        return generate()
+        response = MagicMock()
+        response.__aenter__.return_value = generate()
+        return response
 
 
 def stream_chunk(

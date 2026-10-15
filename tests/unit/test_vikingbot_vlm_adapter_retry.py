@@ -1,3 +1,4 @@
+import json
 from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -11,8 +12,8 @@ from vikingbot.providers.vlm_adapter import VLMProviderAdapter
 from volcenginesdkarkruntime._exceptions import (
     ArkAPITimeoutError,
     ArkBadRequestError,
-    ArkRateLimitError,
 )
+from volcenginesdkarkruntime._streaming import AsyncStream
 
 from openviking.models.model_error import ModelError, ModelErrorKind, model_error_kind
 from openviking.models.vlm.backends.openai_vlm import OpenAIVLM
@@ -49,18 +50,6 @@ class _FakeVolcEngineFailoverVLM(_FakeVLM):
     thinking = False
 
 
-class _AsyncChunks:
-    def __init__(self, chunks):
-        self._chunks = chunks
-
-    def __aiter__(self):
-        return self._iter()
-
-    async def _iter(self):
-        for chunk in self._chunks:
-            yield chunk
-
-
 class _FakeStreamingCompletions:
     def __init__(self, failures: list[Exception], chunks):
         self.failures = list(failures)
@@ -73,7 +62,9 @@ class _FakeStreamingCompletions:
         self.kwargs.append(kwargs)
         if self.failures:
             raise self.failures.pop(0)
-        return _AsyncChunks(self.chunks)
+        response = AsyncMock()
+        response.__aenter__.return_value.__aiter__.return_value = self.chunks
+        return response
 
 
 class _FakeStreamingVLM:
@@ -254,20 +245,27 @@ async def test_chat_stream_retries_rate_limit_until_success(monkeypatch):
 )
 async def test_chat_stream_obeys_retry_policy(monkeypatch, code, expected_calls, kind):
     monkeypatch.setattr("openviking.utils.model_retry.asyncio.sleep", AsyncMock())
-    error = ArkRateLimitError(
-        "request limited",
-        response=httpx.Response(429, request=httpx.Request("POST", "https://example.test")),
-        body={"code": code},
-        request_id="request-123",
-    )
-    completions = _FakeStreamingCompletions([error] * 4, [])
-    adapter = VLMProviderAdapter(
-        _FakeStreamingVLM(completions), "test-model", langfuse_client=_DisabledLangfuse()
-    )
-
-    events = [event async for event in adapter.chat_stream(messages=[])]
-
-    assert completions.calls == expected_calls
+    vlm = VolcEngineVLM({"model": "test-model", "api_key": "test-key", "max_retries": 2})
+    payload = (
+        "data: " + json.dumps({"error": {"code": code, "message": "limited"}}) + "\n\n"
+    ).encode()
+    responses = [
+        httpx.Response(
+            200,
+            stream=httpx.ByteStream(payload),
+            request=httpx.Request("POST", "https://example.test"),
+        )
+        for _ in range(expected_calls)
+    ]
+    async with vlm.get_async_client() as client:
+        create = AsyncMock(
+            side_effect=[AsyncStream(cast_to=dict, response=r, client=client) for r in responses]
+        )
+        monkeypatch.setattr(client.chat.completions, "create", create)
+        adapter = VLMProviderAdapter(vlm, "test-model", langfuse_client=_DisabledLangfuse())
+        events = [event async for event in adapter.chat_stream(messages=[])]
+    assert create.await_count == expected_calls
+    assert all(response.is_closed for response in responses)
     assert events[-1].response.finish_reason == "error"
     assert events[-1].response.error_kind is kind
 

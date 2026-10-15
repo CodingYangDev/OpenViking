@@ -474,6 +474,7 @@ class VLMProviderAdapter(LLMProvider):
         max_tokens: int | None,
         temperature: float,
     ) -> AsyncIterator[LLMStreamEvent]:
+        """Release the HTTP response after normal or failed SDK iteration."""
         kwargs = self._build_stream_kwargs(
             vlm,
             messages=messages,
@@ -491,39 +492,40 @@ class VLMProviderAdapter(LLMProvider):
 
         client = vlm.get_async_client()
         response = await client.chat.completions.create(**kwargs)
-        async for chunk in response:
-            chunk_usage = self._parse_usage(getattr(chunk, "usage", None))
-            if chunk_usage:
-                usage = chunk_usage
+        async with response as stream:
+            async for chunk in stream:
+                chunk_usage = self._parse_usage(getattr(chunk, "usage", None))
+                if chunk_usage:
+                    usage = chunk_usage
 
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            choice = choices[0]
-            if getattr(choice, "finish_reason", None):
-                finish_reason = choice.finish_reason or finish_reason
-            delta = getattr(choice, "delta", None)
-            if delta is None:
-                continue
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason or finish_reason
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
 
-            reasoning_delta = stream_delta_value(delta, "reasoning_content")
-            if reasoning_delta:
-                reasoning_parts.append(reasoning_delta)
-                yield LLMStreamEvent(type="reasoning_delta", content=reasoning_delta)
+                reasoning_delta = stream_delta_value(delta, "reasoning_content")
+                if reasoning_delta:
+                    reasoning_parts.append(reasoning_delta)
+                    yield LLMStreamEvent(type="reasoning_delta", content=reasoning_delta)
 
-            content_delta = stream_delta_value(delta, "content")
-            if content_delta:
-                content_parts.append(content_delta)
-                yield LLMStreamEvent(type="content_delta", content=content_delta)
+                content_delta = stream_delta_value(delta, "content")
+                if content_delta:
+                    content_parts.append(content_delta)
+                    yield LLMStreamEvent(type="content_delta", content=content_delta)
 
-            for fallback_index, delta_tool_call in enumerate(
-                getattr(delta, "tool_calls", None) or []
-            ):
-                merge_stream_tool_call_delta(
-                    tool_calls,
-                    delta_tool_call,
-                    fallback_index=fallback_index,
-                )
+                for fallback_index, delta_tool_call in enumerate(
+                    getattr(delta, "tool_calls", None) or []
+                ):
+                    merge_stream_tool_call_delta(
+                        tool_calls,
+                        delta_tool_call,
+                        fallback_index=fallback_index,
+                    )
 
         if usage:
             self._record_vlm_usage(vlm, usage, time.perf_counter() - start_time)
