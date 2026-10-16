@@ -60,8 +60,9 @@ SENSITIVE_FIELD_NAMES = frozenset(
 _SENSITIVE_TEXT_RE = re.compile(
     r"(?i)(openviking_api_key|root_api_key|api[_-]?key|x-api-key|authorization|"
     r"access_token|refresh_token|password|token|secret|(?:set-)?cookie)"
-    r"([\"']?\s*[:=]\s*)"
-    r"(\"[^\"\r\n]*\"|'[^'\r\n]*'|(?:(?:Bearer|Basic)\s+)?[^'\"\s,;}]+)"
+    r"((?:\\?[\"'])?\s*[:=]\s*)"
+    r"(\\\"[^\"\r\n]*\\\"|\\'[^'\r\n]*\\'|"
+    r"\"[^\"\r\n]*\"|'[^'\r\n]*'|(?:(?:Bearer|Basic)\s+)?[^'\"\s,;}]+)"
 )
 _CREDENTIAL_TOKEN_RE = re.compile(
     r"(?i)\b(Bearer\s+)[a-zA-Z0-9._~+/=-]+|"
@@ -72,7 +73,10 @@ _CREDENTIAL_TOKEN_RE = re.compile(
 def _redact_sensitive_text(text: str) -> str:
     def _replace(match: re.Match[str]) -> str:
         value = match.group(3)
-        quote = value[0] if value.startswith(("'", '"')) else ""
+        if value.startswith(('\\"', "\\'")):
+            quote = value[:2]
+        else:
+            quote = value[0] if value.startswith(('"', "'")) else ""
         return f"{match.group(1)}{match.group(2)}{quote}<redacted>{quote}"
 
     text = _SENSITIVE_TEXT_RE.sub(_replace, text)

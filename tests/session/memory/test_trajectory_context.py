@@ -73,6 +73,9 @@ def test_content_is_kept_without_heading_numbering_count_or_type_binding(content
         "trajectory_name": "server_fixed",
         "case_name": "case",
         "outcome": "failure",
+        "experience_effects": {"positive_ids": [], "negative_ids": [], "weak_ids": []},
+        "experience_effect_sources": {},
+        "evaluation_criteria": [],
     }
     assert operation.uris == [provider.target_uri]
 
@@ -164,7 +167,13 @@ async def test_system_rules_reach_model_once_through_source_steps():
     provider = AgentTrajectoryContextProvider(messages=messages, source_steps=steps)
     payload = json.loads((await provider.prefetch())[0]["content"])
 
-    assert set(payload) == {"case", "source_steps"}
+    assert set(payload) == {
+        "case",
+        "task_spec",
+        "source_steps",
+        "injected_experiences",
+        "external_evaluation",
+    }
     assert payload["source_steps"] == steps
     assert payload["source_steps"][0] == {
         "type": "user",
@@ -178,5 +187,182 @@ async def test_system_rules_reach_model_once_through_source_steps():
     assert "training metadata, not execution-time rules or actions" in prompt
     content = "Confirmation precedes cancellation.\nThe user asked to cancel."
     result = operations(content)
+    assert provider.validate_resolved_operations(result) == []
+    assert result.upsert_operations[0].memory_fields["content"] == content
+
+
+@pytest.mark.parametrize("role", ["user", "assistant"])
+@pytest.mark.parametrize("text", [None, "", "   "])
+def test_tool_transport_has_no_empty_dialogue_step(role, text):
+    from openviking.message import ToolPart
+
+    tool = ToolPart(
+        tool_id="t",
+        tool_name="done",
+        tool_input={},
+        tool_output="Error: USER_CONVERSATION_ACTIVE",
+        tool_status="error",
+    )
+    parts = [tool] if text is None else [TextPart(text=text), tool]
+    steps = trajectory_source_steps([Message(id="transport", role=role, parts=parts)])
+
+    assert len(steps) == 1
+    assert steps[0]["type"] == "tool:done"
+    evidence = json.loads(steps[0]["content"])
+    assert evidence["tool_status"] == "error"
+    assert evidence["tool_output"] == "Error: USER_CONVERSATION_ACTIVE"
+
+
+def test_mixed_tool_dialogue_empty_user_confirmations_and_stop_keep_order():
+    from openviking.message import ToolPart
+
+    texts = ["task_success: please explain this field", "The policy says: ask before cancelling."]
+    steps = trajectory_source_steps(
+        [
+            message(texts[0]),
+            message(texts[1]),
+            message("Yes, cancel A."),
+            Message(
+                id="mixed",
+                role="assistant",
+                parts=[
+                    TextPart(text="I will now cancel A."),
+                    ToolPart(
+                        tool_id="a",
+                        tool_name="cancel_reservation",
+                        tool_input={"id": "A"},
+                        tool_output="cancelled",
+                        tool_status="completed",
+                    ),
+                    ToolPart(
+                        tool_id="b",
+                        tool_name="get_booking",
+                        tool_input={"id": "B"},
+                        tool_status="running",
+                    ),
+                ],
+            ),
+            message(""),
+            message("###STOP###"),
+            message("Task Terminated"),
+        ]
+    )
+
+    assert [step["type"] for step in steps] == [
+        "user",
+        "user",
+        "user",
+        "assistant",
+        "tool:cancel_reservation",
+        "tool:get_booking",
+        "user",
+        "user",
+        "user",
+    ]
+    assert [step["content"] for step in steps[:4]] == [
+        *texts,
+        "Yes, cancel A.",
+        "I will now cancel A.",
+    ]
+    assert [step["content"] for step in steps[-3:]] == ["", "###STOP###", "Task Terminated"]
+    assert json.loads(steps[4]["content"])["tool_input"] == {"id": "A"}
+    assert json.loads(steps[5]["content"])["tool_status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_system_rules_are_context_in_single_source_input_not_output_steps():
+    rules = "system:\nObtain explicit confirmation. Exception: read-only queries need none."
+    dialogue = "The policy says confirmation is needed; please explain why."
+    provider = AgentTrajectoryContextProvider(
+        messages=[],
+        source_steps=trajectory_source_steps([message(rules), message(dialogue)]),
+        trajectory_name="t",
+        case_name="case",
+        outcome="unknown",
+    )
+    payload = json.loads((await provider.prefetch())[0]["content"])
+    assert payload["source_steps"] == [
+        {"type": "user", "content": rules},
+        {"type": "user", "content": dialogue},
+    ]
+    assert "session_context" not in payload
+    instruction = provider.instruction()
+    assert "System rules in source_steps are context, not dialogue steps" in instruction
+    assert "Genuine user policy quotations" in instruction
+    assert "rejected done call" in instruction
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_request",
+    [
+        "Choose the smallest sufficient gift card for a $59 charge.",
+        "Correct the saved passenger's date of birth.",
+    ],
+)
+async def test_tool_summary_selection_is_task_guidance_not_input_field_filtering(user_request):
+    from copy import deepcopy
+
+    from openviking.message import ToolPart
+
+    profile = {
+        "user_id": "user_a",
+        "membership": "silver",
+        "dob": "1990-01-01",
+        "address": "Example address",
+        "payment_methods": {
+            "gift_card_a": {"amount": 6.0},
+            "gift_card_b": {"amount": 113.0},
+            "gift_card_c": {"amount": 157.0},
+        },
+    }
+    messages = [
+        message(user_request),
+        Message(
+            id="tool",
+            role="assistant",
+            parts=[
+                ToolPart(
+                    tool_id="lookup",
+                    tool_name="get_user_details",
+                    tool_input={"user_id": "user_a"},
+                    tool_output=json.dumps(profile),
+                    tool_status="completed",
+                )
+            ],
+        ),
+    ]
+    original = deepcopy(messages)
+    provider = AgentTrajectoryContextProvider(
+        messages=messages,
+        source_steps=trajectory_source_steps(messages),
+    )
+    prompt = " ".join(provider.instruction().split())
+    for requirement in (
+        "this execution's concrete user request",
+        "not the Case's entire business scope",
+        "Keep the exact relevant values, not a list of field names",
+        "retain enough candidate values to check the choice",
+        "Keep evidence needed to expose an error even when the agent ignored it",
+        "do not invent values missing from the supplied tool evidence",
+    ):
+        assert requirement in prompt
+    assert "Rewrite only what happened" in prompt
+    assert "Preserve explicit confirmations, tool errors" in prompt
+
+    # Selection belongs to the extraction model, not a hard-coded field filter.
+    # This checks available evidence and instructions, not the model's semantic choices.
+    payload = json.loads((await provider.prefetch())[0]["content"])
+    assert payload["source_steps"][0]["content"] == user_request
+    tool = next(s for s in payload["source_steps"] if s["type"] == "tool:get_user_details")
+    record = json.loads(tool["content"])
+    assert json.loads(record["tool_output"]) == profile
+    assert record["tool_input"] == {"user_id": "user_a"}
+    assert record["tool_status"] == "completed"
+    assert messages == original
+
+    # The new wording does not add a semantic validator or rewrite model-produced text.
+    result = operations("1. `tool:get_user_details` observed profile facts.")
+    content = result.upsert_operations[0].memory_fields["content"]
     assert provider.validate_resolved_operations(result) == []
     assert result.upsert_operations[0].memory_fields["content"] == content

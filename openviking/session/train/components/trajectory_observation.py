@@ -6,17 +6,19 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+import yaml
+
 from openviking.core.namespace import is_session_uri
 from openviking.session.memory.dataclass import (
     MemoryFile,
     StoredLink,
 )
 from openviking.session.memory.experience.dag import clip_evidence_summary, tool_evidence_summary
-from openviking.session.train.domain import RolloutAnalysis, Trajectory
+from openviking.session.train.domain import RolloutAnalysis, RubricEvaluation, Trajectory
 
 MAX_EVIDENCE_CHARS = 64_000
 EXPERIENCE_EXECUTION_EVIDENCE_ID = "experience_execution"
-TRAJECTORY_FORMAT = "ordered_markdown_v2"
+TRAJECTORY_FORMAT = "ordered_markdown_v3"
 
 
 def execution_paths(execution: dict) -> dict:
@@ -107,81 +109,71 @@ def observation_evidence(messages, evaluation, execution: dict | None = None) ->
             }
         )
     if evaluation is not None:
-
-        def visit(value, path):
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    if isinstance(item, bool) and key in {
-                        "passed",
-                        "met",
-                        "db_match",
-                        "action_match",
-                    }:
-                        selected.append(
-                            {
-                                "id": f"evaluation:{path}.{key}",
-                                "kind": "criterion",
-                                "passed": item,
-                                "summary": json.dumps(
-                                    {
-                                        item_key: item_value
-                                        for item_key, item_value in value.items()
-                                        if item_key
-                                        not in {
-                                            "feedback",
-                                            "evidence",
-                                            "justification",
-                                        }
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                            }
-                        )
-                    elif key not in {"feedback", "evidence"}:
-                        visit(item, f"{path}.{key}")
-            elif isinstance(value, list):
-                for index, item in enumerate(value):
-                    visit(item, f"{path}[{index}]")
-
-        payload = asdict(evaluation)
-        # Keep the overall result separate; per-criterion records avoid duplicating the full payload.
+        # Preserve the supplied evaluator report as evidence. Criterion definitions and
+        # judgments belong to the Case/Trajectory LLM, not a whitelist of boolean keys.
         selected.append(
             {
-                "id": "evaluation:overall",
-                "kind": "criterion",
-                "passed": evaluation.passed,
-                "summary": json.dumps(
-                    {
-                        "passed": evaluation.passed,
-                        "score": evaluation.score,
-                    },
-                    ensure_ascii=False,
-                ),
+                "id": "evaluation:external",
+                "kind": "external_evaluation",
+                "summary": json.dumps(asdict(evaluation), ensure_ascii=False),
             }
         )
-        visit(payload.get("criterion_results", []), "criterion_results")
-        visit(payload.get("metadata", {}), "metadata")
     return selected
 
 
-def trajectory_record(trajectory: Trajectory) -> dict:
+def trajectory_evaluation_summary(evaluation: RubricEvaluation | None) -> dict | None:
+    """Keep external results and diagnostics out of the observed business dialogue."""
+    if evaluation is None:
+        return None
+    summary: dict[str, Any] = {"passed": evaluation.passed, "score": evaluation.score}
+    details = {}
+    result = evaluation.metadata.get("evaluation_result")
+    if isinstance(result, dict):
+        # Keep diagnostic facts, not another copy of actions/criteria/rewards or LLM rationales.
+        for key in ("termination_reason", "info", "error", "type", "message"):
+            value = result.get(key)
+            if key == "info" and isinstance(value, dict):
+                value = {name: item for name, item in value.items() if item is not None}
+            if value is not None and value != {}:
+                details[key] = value
+    reason = evaluation.metadata.get("termination_reason")
+    if reason is not None:
+        details["termination_reason"] = reason
+    if details:
+        summary["details"] = details
+    return summary
+
+
+def render_trajectory_content(trajectory: Trajectory) -> str:
+    """Render immutable learning evidence once, before the Trajectory is persisted.
+
+    Metadata remains authoritative for programmatic selection and gates. Only this
+    allowlisted snapshot belongs in the body; mutable update state never does.
+    """
     metadata = trajectory.metadata
     evaluation = metadata.get("evaluation")
-    return {
+    fields = {
         "trajectory_uri": trajectory.uri,
         "source_session_uri": metadata["source_session_uri"],
         "case_name": metadata["case_name"],
+        "task_spec": metadata.get("task_spec"),
         "outcome": trajectory.outcome,
         "evaluation": None
         if evaluation is None
         else {
             "passed": evaluation["passed"],
             "score": evaluation["score"],
+            **({"details": evaluation["details"]} if "details" in evaluation else {}),
         },
         "evaluation_criteria": metadata.get("evaluation_criteria", []),
         "experience_execution": metadata.get("experience_execution", {}),
-        "content": trajectory.content,
+        "experience_effects": metadata.get("experience_effects"),
+        "experience_effect_sources": metadata.get("experience_effect_sources", {}),
     }
+
+    normalized = json.loads(json.dumps(fields, ensure_ascii=False, default=str))
+    header = yaml.safe_dump(normalized, allow_unicode=True, sort_keys=False).rstrip()
+    return f"# Trajectory Record\n\n```yaml\n{header}\n```\n\n{trajectory.content}"
 
 
 def trajectory_source_session_uri(memory: MemoryFile) -> str:

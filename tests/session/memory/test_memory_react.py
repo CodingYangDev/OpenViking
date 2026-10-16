@@ -443,6 +443,7 @@ class TestExtractLoopFinalJsonRetry:
                 "field": "content",
                 "block_index": 3,
                 "search": "- Missing",
+                "replace": "- Added",
                 "reason": "not_found",
                 "match_count": 0,
                 "found_in_other_uris": [],

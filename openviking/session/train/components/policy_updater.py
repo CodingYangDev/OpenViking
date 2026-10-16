@@ -272,7 +272,13 @@ def _plan_to_resolved_operations(
                 if current is not None
                 else None,
                 memory_fields={
-                    **dict(updated.metadata),
+                    # Feedback may have advanced since this policy snapshot was read.
+                    # Let MemoryUpdater preserve it from the current locked file.
+                    **{
+                        key: value
+                        for key, value in updated.metadata.items()
+                        if key != "feedback_stats"
+                    },
                     "memory_type": item.memory_type or "experiences",
                     "experience_name": updated.name,
                     "content": updated.content,

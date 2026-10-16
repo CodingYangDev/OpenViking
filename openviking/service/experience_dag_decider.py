@@ -10,6 +10,7 @@ from typing import Any
 from openviking.models.vlm.llm import parse_json_from_response
 from openviking.session.memory.experience.dag import (
     DEFAULT_BRANCH_CHOICE,
+    AnyOfNode,
     AskUser,
     CallTool,
     Check,
@@ -211,6 +212,7 @@ def _relevance_question(instance: DagInstance) -> dict[str, Any]:
         "nodes": [
             {"type": node.slot_provider.type, "description": node.action_description()}
             for _, node in sorted(instance.dag.nodes.items())
+            if isinstance(node, GeneralNode)
         ],
     }
     return {
@@ -238,8 +240,8 @@ def _build_questions(
     index = 0
     for instance in instances:
         for _, node in sorted(instance.dag.nodes.items()):
-            if isinstance(node.slot_provider, TellAgent):
-                # TellAgent contains advice, not a question about delivery or completion.
+            if isinstance(node, AnyOfNode) or isinstance(node.slot_provider, TellAgent):
+                # Logic is computed locally; advice is not a delivery/completion question.
                 continue
             question_id = f"slot_{index}"
             index += 1

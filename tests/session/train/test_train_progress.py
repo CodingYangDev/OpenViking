@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from io import StringIO
 from types import SimpleNamespace
 
@@ -98,3 +99,124 @@ async def test_run_with_progress_finishes_on_success_and_failure(fail, clock, ca
     output = capsys.readouterr().out
     assert output.endswith("elapsed: 1m02s\n")
     assert ("1 failed" in output) == fail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("rollout failed"), asyncio.CancelledError()])
+async def test_run_with_progress_cancels_and_joins_siblings_before_raising(failure):
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    workers = []
+    called = []
+
+    async def execute(item, index):
+        workers.append(asyncio.current_task())
+        called.append(item)
+        if item == 0:
+            await started.wait()
+            raise failure
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            await finish_cleanup.wait()
+
+    batch = asyncio.create_task(
+        train_progress.run_with_progress(
+            [0, 1, 2], coroutine_factory=execute, label="train", enabled=False, concurrency=2
+        )
+    )
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        assert not batch.done(), "The caller must keep its resources open during cleanup"
+        finish_cleanup.set()
+        with pytest.raises(type(failure)) as caught:
+            await batch
+        assert caught.value is failure
+        assert called == [0, 1], "Queued work must not start after a failure"
+        assert all(worker.done() for worker in workers)
+    finally:
+        finish_cleanup.set()
+        batch.cancel()
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(batch, *workers, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_run_with_progress_external_cancel_waits_for_async_cleanup():
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    workers = []
+    cleaned = []
+
+    async def execute(item, index):
+        workers.append(asyncio.current_task())
+        if len(workers) == 2:
+            started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            if item == 1:
+                cleanup_started.set()
+                await finish_cleanup.wait()
+            cleaned.append(item)
+
+    batch = asyncio.create_task(
+        train_progress.run_with_progress(
+            [0, 1], coroutine_factory=execute, label="train", enabled=False, concurrency=2
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        batch.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not batch.done()
+        finish_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await batch
+        assert sorted(cleaned) == [0, 1]
+        assert all(worker.done() for worker in workers)
+    finally:
+        finish_cleanup.set()
+        batch.cancel()
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(batch, *workers, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_run_with_progress_preserves_order_and_concurrency():
+    second_finished = asyncio.Event()
+    running = 0
+    peak_running = 0
+    finished = []
+
+    async def execute(item, index):
+        nonlocal running, peak_running
+        running += 1
+        peak_running = max(peak_running, running)
+        try:
+            if index == 0:
+                await second_finished.wait()
+            else:
+                second_finished.set()
+            finished.append(index)
+            return item + index
+        finally:
+            running -= 1
+
+    result = await asyncio.wait_for(
+        train_progress.run_with_progress(
+            [10, 20, 30], coroutine_factory=execute, label="train", enabled=False, concurrency=2
+        ),
+        timeout=1,
+    )
+    assert result == [10, 21, 32]
+    assert finished[0] == 1
+    assert peak_running == 2
+    assert running == 0

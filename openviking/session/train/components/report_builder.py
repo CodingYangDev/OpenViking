@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,20 +32,12 @@ class PipelineReportBuilder:
         self,
         result: PipelineEvaluationResult,
     ) -> dict[str, Any]:
-        rewards = [float(analysis.evaluation.score) for analysis in result.analyses]
-        passed_count = sum(1 for analysis in result.analyses if analysis.evaluation.passed)
-        case_count = len(result.analyses)
         return {
+            **self.evaluation_summary_from_analyses(result.analyses),
             "epoch": result.epoch,
             **_eval_metadata_fields(result.metadata),
-            "case_count": case_count,
-            "accuracy": _ratio(passed_count, case_count),
-            "passed_count": passed_count,
-            "average_reward": _average(rewards),
-            "rewards": rewards,
             "snapshot_ids": list(result.policy_snapshot_ids),
             "metadata": dict(result.metadata),
-            "memory_usage": self.memory_usage_from_analyses(result.analyses),
             "cost_seconds": result.metadata.get("cost_seconds"),
         }
 
@@ -104,13 +97,27 @@ class PipelineReportBuilder:
         rewards = [float(analysis.evaluation.score) for analysis in analyses]
         passed_count = sum(1 for analysis in analyses if analysis.evaluation.passed)
         case_count = len(analyses)
+        execution_errors = []
+        for analysis in analyses:
+            rollout = analysis.metadata.get("rollout")
+            if isinstance(rollout, Rollout) and (error := rollout.metadata.get("execution_error")):
+                execution_errors.append(error)
         return {
             "case_count": case_count,
             "accuracy": _ratio(passed_count, case_count),
             "passed_count": passed_count,
             "average_reward": _average(rewards),
             "rewards": rewards,
+            "execution_error_count": len(execution_errors),
+            "execution_error_rate": _ratio(len(execution_errors), case_count),
+            "execution_error_types": dict(
+                Counter(
+                    f"{error.get('source', 'unknown')}:{error.get('type', 'unknown')}"
+                    for error in execution_errors
+                )
+            ),
             "memory_usage": self.memory_usage_from_analyses(analyses),
+            "token_usage": self.token_usage_from_analyses(analyses),
         }
 
     def analysis_trial_index(self, analysis: RolloutAnalysis) -> int:
@@ -189,6 +196,10 @@ class PipelineReportBuilder:
             "accuracy": display_eval["accuracy"],
             "passed_count": display_eval["passed_count"],
             "average_reward": display_eval["average_reward"],
+            "token_usage": display_eval.get("token_usage"),
+            "execution_error_count": train_eval["execution_error_count"],
+            "execution_error_rate": train_eval["execution_error_rate"],
+            "execution_error_types": train_eval["execution_error_types"],
             "train_rollout": rollout_report,
             "train_eval": train_eval,
             "batch_count": len(snapshot_ids),
@@ -224,6 +235,28 @@ class PipelineReportBuilder:
             **self.evaluation_summary_from_analyses(analyses),
             "reward_std": _stddev(rewards),
             "case_results": [_train_case_evaluation_result(analysis) for analysis in analyses],
+        }
+
+    def token_usage_from_analyses(self, analyses: list[RolloutAnalysis]) -> dict[str, Any]:
+        """Aggregate service-reported Agent usage per case attempt, not per model turn.
+
+        Missing totals are unknown, not zero. Cached rollouts retain their original
+        usage; this measures rollout cost, not tokens newly billed during this run.
+        """
+        totals = []
+        for analysis in analyses:
+            rollout = analysis.metadata.get("rollout")
+            if not isinstance(rollout, Rollout):
+                continue
+            usage = rollout.metadata.get("token_usage")
+            total = usage.get("total_tokens") if isinstance(usage, dict) else None
+            if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+                totals.append(total)
+        return {
+            "rollout_count": len(analyses),
+            "reported_rollout_count": len(totals),
+            "total_tokens": sum(totals) if totals else None,
+            "average_tokens_per_rollout": _average(totals),
         }
 
     def memory_usage_from_analyses(

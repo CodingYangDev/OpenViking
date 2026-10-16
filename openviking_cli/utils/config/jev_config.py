@@ -13,6 +13,10 @@ class JevConfig(BaseModel):
     api_url: str = Field(description="Full Jev /v1/systemone endpoint URL")
     api_key: str = Field(description="Bearer token for the Jev endpoint")
     model: Optional[str] = Field(default=None, description="Optional Jev model override")
+    extra_headers: dict[str, str] = Field(
+        default_factory=dict,
+        description="Additional HTTP headers; Authorization and Content-Type remain client-managed.",
+    )
     timeout: float = Field(default=30.0, gt=0, le=300)
     verify_ssl: bool = True
     max_retries: int = Field(default=3, ge=0, le=5)

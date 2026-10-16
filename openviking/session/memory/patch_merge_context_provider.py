@@ -8,8 +8,10 @@ import difflib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+
 from openviking.server.identity import RequestContext
-from openviking.session.memory.dataclass import MemoryFile, MemoryTypeSchema
+from openviking.session.memory.dataclass import MemoryFile, MemoryTypeSchema, ResolvedOperations
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.merge_policy import MEMORY_MERGE_POLICY
 from openviking.session.memory.session_extract_context_provider import (
@@ -22,6 +24,11 @@ if TYPE_CHECKING:
     from openviking.config.vlm import VLMHandle
 
 _SYSTEM_HIDDEN_FIELDS = {
+    # Relations are maintained by storage, not reconciled as model-editable fields.
+    "links",
+    "backlinks",
+    "feedback_stats",
+    "experience_effect_sources",
     "source_extraction_id",
     "source_extraction_ids",
     "last_update_trace_id",
@@ -30,26 +37,38 @@ _MAX_EXTRA_CANDIDATE_FILES = 10
 _PATCH_METADATA_KEYS = ("confidence",)
 
 
+class _CaseSources(BaseModel):
+    """Response-local patch numbers, never persisted Case fields."""
+
+    model_config = ConfigDict(extra="forbid")
+    case_id: StrictInt
+    patch_ids: list[StrictInt] = Field(min_length=1)
+
+
 @dataclass(slots=True)
 class PatchMergePatch:
-    """A before/after memory-file patch rendered as field-level line diffs."""
+    """A file proposal: absent before means create; absent after means delete."""
 
     before_file: MemoryFile | None
-    after_file: MemoryFile
+    after_file: MemoryFile | None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def target_uri(self) -> str | None:
-        return self.after_file.uri or (
+        return (self.after_file.uri if self.after_file is not None else None) or (
             self.before_file.uri if self.before_file is not None else None
         )
 
     @property
     def memory_type(self) -> str:
         return str(
-            self.after_file.memory_type
+            (self.after_file.memory_type if self.after_file is not None else "")
             or (self.before_file.memory_type if self.before_file is not None else "")
-            or self.after_file.extra_fields.get("memory_type")
+            or (
+                self.after_file.extra_fields.get("memory_type")
+                if self.after_file is not None
+                else ""
+            )
             or (
                 self.before_file.extra_fields.get("memory_type")
                 if self.before_file is not None
@@ -59,7 +78,8 @@ class PatchMergePatch:
 
     @property
     def target_name(self) -> str:
-        fields = self.after_file.extra_fields or {}
+        file = self.after_file if self.after_file is not None else self.before_file
+        fields = file.extra_fields if file is not None else {}
         memory_type = self.memory_type
         type_specific_key = f"{str(memory_type).rstrip('s')}_name"
         name = (
@@ -80,26 +100,14 @@ class PatchMergePatch:
         return "unknown"
 
 
-def _resolve_patch_output_language(patches: list[PatchMergePatch]) -> str:
-    return resolve_output_language_from_text(_patch_language_text(patches), fallback_language="en")
-
-
-def _patch_language_text(patches: list[PatchMergePatch]) -> str:
-    parts: list[str] = []
-    for patch in patches:
-        parts.extend(_memory_file_language_text(patch.after_file))
+def _patch_language_text(patches: list[PatchMergePatch], schema: MemoryTypeSchema) -> str:
+    parts = [
+        text
+        for patch in patches
+        for value in _memory_file_fields(patch.after_file or patch.before_file, schema).values()
+        for text in _string_values(value)
+    ]
     return "\n".join(part for part in parts if part)
-
-
-def _memory_file_language_text(file: MemoryFile) -> list[str]:
-    parts: list[str] = []
-    for key, value in (file.extra_fields or {}).items():
-        if key in _SYSTEM_HIDDEN_FIELDS or key in {"memory_type", "version"}:
-            continue
-        parts.extend(_string_values(value))
-    if file.content:
-        parts.append(file.content)
-    return parts
 
 
 def _string_values(value: Any) -> list[str]:
@@ -137,7 +145,101 @@ class PatchMergeContextProvider(SessionExtractContextProvider):
         self._registry = memory_registry
         self.required_file_uris = list(required_file_uris or [])
         self.patches = list(patches)
-        self._output_language = output_language or _resolve_patch_output_language(self.patches)
+        self._case_sources = {
+            index: tuple(patch.metadata.get("source_extraction_ids", ()))
+            for index, patch in enumerate(self.patches, 1)
+            if memory_type == "cases" and patch.after_file is not None
+        }
+        if not any(self._case_sources.values()):
+            self._case_sources = {}
+        if output_language:
+            self._output_language = output_language
+        else:
+            text = (
+                _patch_language_text(self.patches, self.get_memory_schemas(None)[0])
+                if self.patches
+                else ""
+            )
+            self._output_language = resolve_output_language_from_text(text, fallback_language="en")
+
+    def configure_output_context(self, context: Any) -> None:
+        if self.fixed_target and self.memory_type == "experiences":
+            context.include_link_example = False
+        if not self._case_sources:
+            return
+        patch_ids = set(self._case_sources)
+        base_model = context.operations_model
+
+        class CaseMergeOperations(base_model):
+            case_sources: list[_CaseSources] = Field(
+                default_factory=list,
+                description=(
+                    "Bind every proposed Case patch number to its final Case page_id, including "
+                    "unchanged existing Cases. A patch may contribute to multiple final Cases."
+                ),
+            )
+
+            @model_validator(mode="after")
+            def validate_case_sources(self):
+                covered: set[int] = set()
+                targets: set[int] = set()
+                for binding in self.case_sources:
+                    if binding.case_id in targets:
+                        raise ValueError("Combine source patch IDs for each final Case")
+                    targets.add(binding.case_id)
+                    if len(set(binding.patch_ids)) != len(binding.patch_ids):
+                        raise ValueError("Duplicate Case source patch ID")
+                    covered.update(binding.patch_ids)
+                if covered != patch_ids:
+                    raise ValueError(
+                        "case_sources must associate every proposed Case with its final Case; "
+                        f"missing patch IDs: {sorted(patch_ids - covered)}, "
+                        f"unknown patch IDs: {sorted(covered - patch_ids)}"
+                    )
+                writes = {item.page_id for item in self.cases}
+                if (writes | set(self.selected_case_ids)) - targets:
+                    raise ValueError("Every returned Case must have explicit source patches")
+                # Preserve associations when the chosen Case needs no content write.
+                self.selected_case_ids = list(
+                    dict.fromkeys(
+                        [
+                            *self.selected_case_ids,
+                            *(
+                                case_id
+                                for case_id in sorted(targets)
+                                if case_id not in writes
+                                or context.page_id_map.resolve(case_id)
+                                in context.read_file_contents
+                            ),
+                        ]
+                    )
+                )
+                return self
+
+            def is_empty(self):
+                return not self.case_sources and super().is_empty()
+
+        context.operations_model = CaseMergeOperations
+
+    def resolve_operation_metadata(self, raw_operations: Any, resolved: ResolvedOperations) -> None:
+        if not self._case_sources:
+            return
+        outputs = [*resolved.upsert_operations, *resolved.case_references]
+        for binding in raw_operations.case_sources:
+            matches = [op for op in outputs if op.page_id == binding.case_id]
+            if not matches or any(
+                op.memory_type != "cases" or not op.uris or op.resolution_skip for op in matches
+            ):
+                raise ValueError(f"Case source target {binding.case_id} is not an available Case")
+            sources = sorted(
+                {
+                    source
+                    for patch_id in binding.patch_ids
+                    for source in self._case_sources[patch_id]
+                }
+            )
+            for operation in matches:
+                operation.memory_fields["source_extraction_ids"] = sources
 
     def instruction(self) -> str:
         output_language = self._output_language
@@ -147,20 +249,33 @@ class PatchMergeContextProvider(SessionExtractContextProvider):
 The only target is {target.target_uri}; keep the exact name {target.target_name!r}.
 The prefetched file is the latest stored version. Proposals can be based on older
 versions: apply their intended changes to the latest file while preserving unrelated
-changes and successful paths. Return one full standalone Python DAG, or no operations
-if the proposals add no useful change. Never rename, delete, supersede, create another
-Experience, or merge another Case. Output restricted Python memory SDK code only.
+changes and successful paths. Follow the generic SDK string-editing rules: prefer edit()/drop()
+for local changes; use overwrite() only when most of the DAG needs rewriting. Copy edit/drop
+anchors verbatim from the latest source, not a stale proposal. The final content after applying
+edits must be one complete valid DAG. Return no operations if the proposals add no useful change.
+Never rename, delete, supersede, create another Experience, or merge another Case. Output restricted Python memory SDK code only.
 Keep the fixed name; write natural-language DAG descriptions in {output_language}."""
+        case_sources = (
+            "\nFor Case proposals, retain execution associations independently of content writes. "
+            "For each final Case, list the input Patch numbers that belong to it in case_sources. "
+            "Cover every proposed Case patch, even when its alias is omitted or the existing "
+            "canonical Case is unchanged. Never assign an unrelated patch to a Case.\n"
+            if self._case_sources
+            else ""
+        )
         return f"""You are a memory patch merge agent.
 
-You are given original memory files and structured memory-file field diffs. Merge them by producing final memory operations that follow the provided JSON schema.
+You are given original schema business fields and their diffs. Merge them by producing final memory operations that follow the provided JSON schema.
+Respect each field's merge rule. The server renders content_template after applying the merged fields;
+do not generate or merge a rendered document as an extra field. A schema-defined content field is
+still business data and must be merged normally.
 
 Do not call tools. Output JSON only.
 
 All memory content must be written in {output_language}.
 
-Reconcile independent extraction patch proposals. Apply this shared policy before
-choosing a canonical file or deleting any proposal:
+Resolve additions, edits, and deletion proposals together into one final plan.
+Apply this shared policy before choosing a canonical file or deleting any proposal:
 
 {MEMORY_MERGE_POLICY}
 
@@ -171,12 +286,13 @@ variants. For new segments, use singular snake_case for English and one concise
 canonical term for Chinese; e.g. book not books, 书籍 not 书/图书. If a loser URI
 is a verified duplicate existing file, put it in delete_ids with the fact-complete
 canonical replacement; if it is only a duplicate new proposal, omit it.
+{case_sources}
 """
 
     def get_tools(self) -> list[str]:
         return []
 
-    def get_memory_schemas(self, ctx: RequestContext) -> list[MemoryTypeSchema]:
+    def get_memory_schemas(self, ctx: RequestContext | None) -> list[MemoryTypeSchema]:
         del ctx
         registry = self._get_registry()
         schema = registry.get(self.memory_type)
@@ -185,6 +301,8 @@ canonical replacement; if it is only a duplicate new proposal, omit it.
         return [schema]
 
     async def prefetch(self) -> list[dict[str, Any]]:
+        schema = self.get_memory_schemas(self._ctx)[0]
+        has_content_field = any(field.name == "content" for field in schema.fields)
         messages: list[dict[str, Any]] = []
         file_uris = await self._resolve_prefetch_file_uris()
         self._allowed_memory_read_uris.update(file_uris)
@@ -195,6 +313,16 @@ canonical replacement; if it is only a duplicate new proposal, omit it.
                 for index, uri in enumerate(batch, start=1)
             )
             result = await self._eval_memory(code)
+            if not has_content_field and isinstance(result, dict):
+                # Keep the full read cache; only the model-facing copy omits rendered body text.
+                result = {
+                    name: {key: value for key, value in record.items() if key != "content"}
+                    if isinstance(record, dict)
+                    and record.get("memory_type") == self.memory_type
+                    and "error" not in record
+                    else record
+                    for name, record in result.items()
+                }
             add_tool_call_pair_to_messages(
                 messages=messages,
                 call_id=None,
@@ -206,7 +334,7 @@ canonical replacement; if it is only a duplicate new proposal, omit it.
         messages.append(
             {
                 "role": "user",
-                "content": _render_field_diff_patches(self.patches),
+                "content": _render_field_diff_patches(self.patches, schema),
             }
         )
         return messages
@@ -263,22 +391,31 @@ canonical replacement; if it is only a duplicate new proposal, omit it.
         return [render_template(schema.directory, {"user_space": user_id})]
 
 
-def _render_field_diff_patches(patches: list[PatchMergePatch]) -> str:
+def _render_field_diff_patches(patches: list[PatchMergePatch], schema: MemoryTypeSchema) -> str:
     if not patches:
         return "# Memory File Patches\n\nNo patches provided."
     rendered = [
-        _render_one_field_diff_patch(index, patch) for index, patch in enumerate(patches, start=1)
+        _render_one_field_diff_patch(index, patch, schema)
+        for index, patch in enumerate(patches, start=1)
     ]
     return "# Memory File Patches\n\n" + "\n\n".join(rendered).rstrip()
 
 
-def _render_one_field_diff_patch(index: int, patch: PatchMergePatch) -> str:
+def _render_one_field_diff_patch(
+    index: int, patch: PatchMergePatch, schema: MemoryTypeSchema
+) -> str:
     lines = [f"Patch {index}"]
+    if patch.after_file is None:
+        lines.append(f"  delete: {patch.target_uri}")
+        return "\n".join(lines)
+    if schema.memory_type == "cases" and patch.metadata.get("source_extraction_ids"):
+        # Even an unchanged proposal needs an identity for its execution association.
+        lines.append(f"  proposed_case: {_compact_value(patch.target_name)}")
     if patch.metadata:
         compact_metadata = _compact_patch_metadata(patch.metadata)
         if compact_metadata:
             lines.append(f"  meta: {_compact_value(compact_metadata)}")
-    field_diffs = _field_diffs(patch.before_file, patch.after_file)
+    field_diffs = _field_diffs(patch.before_file, patch.after_file, schema)
     if not field_diffs:
         lines.append("  (no changes)")
         return "\n".join(lines)
@@ -292,9 +429,11 @@ def _render_one_field_diff_patch(index: int, patch: PatchMergePatch) -> str:
     return "\n".join(lines)
 
 
-def _field_diffs(before_file: MemoryFile | None, after_file: MemoryFile) -> list[tuple[str, str]]:
-    before_fields = _memory_file_fields(before_file) if before_file is not None else {}
-    after_fields = _memory_file_fields(after_file)
+def _field_diffs(
+    before_file: MemoryFile | None, after_file: MemoryFile, schema: MemoryTypeSchema
+) -> list[tuple[str, str]]:
+    before_fields = _memory_file_fields(before_file, schema) if before_file is not None else {}
+    after_fields = _memory_file_fields(after_file, schema)
     diffs: list[tuple[str, str]] = []
     for field_name in sorted(set(before_fields) | set(after_fields)):
         before_value = before_fields.get(field_name)
@@ -311,18 +450,17 @@ def _field_diffs(before_file: MemoryFile | None, after_file: MemoryFile) -> list
     return diffs
 
 
-def _memory_file_fields(file: MemoryFile) -> dict[str, Any]:
-    fields = dict(file.extra_fields or {})
-    for hidden_field in _SYSTEM_HIDDEN_FIELDS:
-        fields.pop(hidden_field, None)
-    if file.memory_type is not None:
-        fields["memory_type"] = file.memory_type
-    if file.content:
+def _memory_file_fields(file: MemoryFile | None, schema: MemoryTypeSchema) -> dict[str, Any]:
+    """Project declared business fields; omit the body when it is only template output."""
+    if file is None:
+        return {}
+    fields = {
+        field.name: file.extra_fields[field.name]
+        for field in schema.fields
+        if field.name not in _SYSTEM_HIDDEN_FIELDS and field.name in file.extra_fields
+    }
+    if any(field.name == "content" for field in schema.fields):
         fields["content"] = file.content
-    if file.links:
-        fields["links"] = file.links
-    if file.backlinks:
-        fields["backlinks"] = file.backlinks
     return fields
 
 
@@ -408,7 +546,8 @@ def _build_patch_search_query(patches: list[PatchMergePatch]) -> str:
             parts.append(str(patch.target_name))
         if patch.target_uri:
             parts.append(str(patch.target_uri).rstrip("/").split("/")[-1].removesuffix(".md"))
-        content = str(patch.after_file.content or "")
+        file = patch.after_file if patch.after_file is not None else patch.before_file
+        content = str(file.content or "") if file is not None else ""
         if content:
             parts.append(_truncate_query_text(content, 1200))
     return _truncate_query_text("\n\n".join(parts), 5000)

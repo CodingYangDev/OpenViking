@@ -88,6 +88,12 @@ class InMemoryVikingFS:
             if path.startswith(prefix) and "/" not in path.removeprefix(prefix)
         ]
 
+    async def search(self, query, **kwargs):
+        return SimpleNamespace(to_dict=lambda: {"memories": []})
+
+    async def exists(self, uri, ctx=None):
+        return _canonical_user_uri(uri, ctx) in self.files
+
     async def read_file(self, uri: str, ctx=None):
         uri = _canonical_user_uri(uri, ctx)
         if uri not in self.files:
@@ -222,7 +228,7 @@ def _case_op(name: str) -> ResolvedOperation:
             "case_name": name,
             "task_signature": f"{name} signature",
             "input": '{"summary":"case input"}',
-            "rubric": '{"criteria":[{"name":"done","description":"done","required":true,"weight":1.0}]}',
+            "rubric": '[{"id":"done","description":"done"}]',
         },
     )
 
@@ -342,7 +348,7 @@ async def test_replacement_reacquires_persisted_relation_locks_before_writes(mon
             neighbor_uri: MemoryFileUtils.write(neighbor_file),
         }
     )
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -434,7 +440,7 @@ async def test_operation_to_patch_skips_failed_field_preview_update():
 @pytest.mark.asyncio
 async def test_streaming_memory_updater_submit_applies_fast_path(monkeypatch):
     fs = PathlockedInMemoryVikingFS({})
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -487,7 +493,7 @@ async def test_streaming_memory_updater_submit_applies_fast_path(monkeypatch):
 @pytest.mark.asyncio
 async def test_cached_updater_restores_vectorization_for_tool_and_skill_memories(monkeypatch):
     fs = InMemoryVikingFS({})
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -568,14 +574,14 @@ async def test_cached_updater_restores_vectorization_for_tool_and_skill_memories
 
 @pytest.mark.asyncio
 async def test_streaming_memory_updater_fast_path_filters_links(monkeypatch):
-    fs = InMemoryVikingFS(
+    fs = PathlockedInMemoryVikingFS(
         {
             "viking://user/u/memories/events/existing.md": (
                 'existing\n<!-- MEMORY_FIELDS\n{"memory_type":"events","content":"existing"}\n-->'
             )
         }
     )
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -635,8 +641,12 @@ async def test_streaming_memory_updater_fast_path_filters_links(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_streaming_memory_updater_batches_non_append_only_submits(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.merge_memory_operations",
+        AsyncMock(side_effect=lambda **kwargs: kwargs["operations"]),
+    )
     fs = InMemoryVikingFS({})
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -694,127 +704,76 @@ async def test_streaming_memory_updater_batches_non_append_only_submits(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_merge_requests_skips_patch_merge_for_same_session(monkeypatch):
-    merge_mock = AsyncMock()
+@pytest.mark.parametrize("cross_session", [False, True])
+async def test_merge_requests_decides_add_update_delete_together(monkeypatch, cross_session):
+    merge = AsyncMock(side_effect=lambda **kwargs: kwargs["operations"])
     monkeypatch.setattr(
-        "openviking.session.memory.streaming_memory_updater.merge_memory_operations",
-        merge_mock,
+        "openviking.session.memory.streaming_memory_updater.merge_memory_operations", merge
     )
     updater = StreamingMemoryUpdater(registry=_registry())
-
-    def make_request(suffix: str, extraction_id: str) -> MemoryUpdateRequest:
-        return MemoryUpdateRequest(
+    requests = [
+        MemoryUpdateRequest(
             operations=ResolvedOperations(
-                upsert_operations=[
-                    _note_op(f"add_{suffix}"),
-                    _note_update_op(f"update_{suffix}"),
-                ],
-                delete_file_contents=[_note_delete_file(f"delete_{suffix}")],
+                upsert_operations=[_note_op(f"add_{index}"), _note_update_op(f"update_{index}")],
+                delete_file_contents=[_note_delete_file(f"delete_{index}")],
                 errors=[],
             ),
             messages=[],
             ctx=_ctx(),
             metadata={
-                "session_id": "same-session",
-                "source_extraction_id": extraction_id,
+                "session_id": f"session-{index if cross_session else 0}",
+                "source_extraction_id": f"extract-{index}",
             },
         )
+        for index in range(2)
+    ]
+    merged = await updater._merge_requests(requests)
 
-    merged = await updater._merge_requests(
-        [
-            make_request("a", "extract-a"),
-            make_request("b", "extract-b"),
-        ]
-    )
-
-    merge_mock.assert_not_awaited()
+    merge.assert_awaited_once()
+    assert merge.await_args.kwargs["force_merge"] is cross_session
+    assert merge.await_args.kwargs["operations"] is merged
     assert len(merged.upsert_operations) == 4
     assert len(merged.delete_file_contents) == 2
 
 
 @pytest.mark.asyncio
-async def test_merge_requests_merges_cross_session_operation_kinds_in_parallel(monkeypatch):
-    entered: set[str] = set()
-    all_entered = asyncio.Event()
-    release = asyncio.Event()
-
-    async def fake_merge_memory_operations(**kwargs):
-        operations = kwargs["operations"]
-        if operations.delete_file_contents:
-            kind = "delete"
-            assert not operations.upsert_operations
-        elif all(op.old_memory_file_content is None for op in operations.upsert_operations):
-            kind = "add"
-        else:
-            kind = "update"
-            assert all(
-                op.old_memory_file_content is not None for op in operations.upsert_operations
-            )
-        assert kwargs["force_merge"] is True
-        entered.add(kind)
-        if len(entered) == 3:
-            all_entered.set()
-        await release.wait()
-        return operations
-
+@pytest.mark.parametrize("kind", ["update", "delete"])
+async def test_same_session_pure_updates_or_deletes_keep_fast_path(monkeypatch, kind):
+    merge = AsyncMock()
     monkeypatch.setattr(
-        "openviking.session.memory.streaming_memory_updater.merge_memory_operations",
-        fake_merge_memory_operations,
+        "openviking.session.memory.streaming_memory_updater.merge_memory_operations", merge
     )
     updater = StreamingMemoryUpdater(registry=_registry())
-
-    def make_request(suffix: str, session_id: str) -> MemoryUpdateRequest:
-        return MemoryUpdateRequest(
-            operations=ResolvedOperations(
-                upsert_operations=[
-                    _note_op(f"add_{suffix}"),
-                    _note_update_op(f"update_{suffix}"),
-                ],
-                delete_file_contents=[_note_delete_file(f"delete_{suffix}")],
-                errors=[],
-            ),
-            messages=[],
-            ctx=_ctx(),
-            metadata={"session_id": session_id},
-        )
-
-    merge_task = asyncio.create_task(
-        updater._merge_requests(
-            [
-                make_request("a", "session-a"),
-                make_request("b", "session-b"),
-            ]
-        )
+    operations = ResolvedOperations(
+        upsert_operations=[_note_update_op("existing")] if kind == "update" else [],
+        delete_file_contents=[_note_delete_file("obsolete")] if kind == "delete" else [],
+        errors=[],
     )
-    await asyncio.wait_for(all_entered.wait(), timeout=5)
-    assert not merge_task.done()
-    release.set()
-    merged = await asyncio.wait_for(merge_task, timeout=5)
-
-    assert entered == {"add", "update", "delete"}
-    assert len(merged.upsert_operations) == 4
-    assert len(merged.delete_file_contents) == 2
+    request = MemoryUpdateRequest(
+        operations=operations, messages=[], ctx=_ctx(), metadata={"session_id": "same"}
+    )
+    assert await updater._merge_requests([request]) == operations
+    merge.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_merge_requests_rejects_uri_conflicts_between_operation_kinds():
+async def test_submit_rejects_conflicting_input_before_append_only_writes(monkeypatch):
+    append = AsyncMock()
+    monkeypatch.setattr(StreamingMemoryUpdater, "_apply_append_only_request_now", append)
     updater = StreamingMemoryUpdater(registry=_registry())
     request = MemoryUpdateRequest(
         operations=ResolvedOperations(
-            upsert_operations=[_note_op("conflict")],
+            upsert_operations=[_case_op("append_only"), _note_op("conflict")],
             delete_file_contents=[_note_delete_file("conflict")],
             errors=[],
         ),
         messages=[],
         ctx=_ctx(),
-        metadata={"session_id": "session-a"},
     )
-
-    merged = await updater._merge_requests([request])
-
-    assert merged.upsert_operations == []
-    assert merged.delete_file_contents == []
-    assert "Conflicting add/update/delete results" in merged.errors[0]
+    with pytest.raises(ConflictError, match="same plan"):
+        await updater.submit(request)
+    append.assert_not_awaited()
+    assert not updater._group_batchers
 
 
 def test_scope_memory_update_result_to_submitter_filters_shared_batch_by_source():
@@ -1052,7 +1011,7 @@ def test_enforce_merge_group_peer_enabled_false_keeps_self_scope():
             "case_name": "case_note",
             "task_signature": "case signature",
             "input": "{}",
-            "rubric": "{}",
+            "rubric": "[]",
             "peer_id": "conv-42",
         },
         memory_type="cases",
@@ -1278,7 +1237,7 @@ async def test_template_snapshot_conflicts_check_merged_targets_before_writes(mo
             )
         )
 
-    async def retarget_merge(batch):
+    async def retarget_merge(batch, *, known_file_uris=None):
         merged = batch[0].operations.model_copy(deep=True)
         merged.upsert_operations[0].uris = [f"viking://user/u/memories/notes/{target}.md"]
         return merged
@@ -1344,8 +1303,12 @@ async def test_streaming_memory_updater_separates_template_snapshots(monkeypatch
 
 @pytest.mark.asyncio
 async def test_streaming_memory_updater_batches_per_merge_group(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.merge_memory_operations",
+        AsyncMock(side_effect=lambda **kwargs: kwargs["operations"]),
+    )
     fs = InMemoryVikingFS({})
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -1422,7 +1385,7 @@ async def test_streaming_memory_updater_batches_per_merge_group(monkeypatch):
 @pytest.mark.asyncio
 async def test_streaming_memory_updater_submit_waits_for_all_merge_groups(monkeypatch):
     fs = InMemoryVikingFS({})
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -1466,7 +1429,7 @@ async def test_streaming_memory_updater_submit_waits_for_all_merge_groups(monkey
 @pytest.mark.asyncio
 async def test_streaming_memory_updater_applies_cross_group_links_after_all_groups(monkeypatch):
     fs = PathlockedInMemoryVikingFS({})
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -1595,7 +1558,7 @@ async def test_streaming_memory_updater_persists_source_extraction_id_trace_id_a
     monkeypatch,
 ):
     fs = InMemoryVikingFS({})
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -1708,7 +1671,7 @@ async def test_cross_extraction_merge_preserves_existing_uri_without_explicit_de
         fake_run,
     )
     fs = InMemoryVikingFS({existing_uri: "old"})
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -1756,7 +1719,7 @@ async def test_force_merge_sends_delete_only_group_through_patch_merge(monkeypat
         fake_run,
     )
     fs = InMemoryVikingFS({delete_file.uri: delete_file.content})
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -1844,7 +1807,7 @@ async def test_patch_merge_uses_original_messages_for_output_language(monkeypatc
         fake_run,
     )
     fs = InMemoryVikingFS({existing_uri: "old"})
-    fs.search = AsyncMock(return_value=[])
+    fs.search = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"memories": []}))
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.get_viking_fs",
         lambda: fs,
@@ -1864,3 +1827,250 @@ async def test_patch_merge_uses_original_messages_for_output_language(monkeypatc
     )
 
     assert captured_languages == ["zh-CN"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflicting_output", [False, True])
+async def test_case_replacement_plan_uses_only_joint_merge_decision(
+    monkeypatch, conflicting_output
+):
+    """Regression: reject workflow splits without later deleting the selected domain Case."""
+    _patch_language_config(monkeypatch)
+    registry = _registry()
+    registry.get("cases").operation_mode = "upsert"
+    original = _case_op("domain")
+    old_file = MemoryFile(
+        uri=original.uris[0],
+        memory_type="cases",
+        content="Existing domain Case",
+        extra_fields=original.memory_fields,
+    )
+    selected = original.model_copy(update={"old_memory_file_content": old_file})
+    fs = PathlockedInMemoryVikingFS({old_file.uri: MemoryFileUtils.write(old_file)})
+    before = dict(fs.files)
+    for module in ("streaming_memory_updater", "memory_updater"):
+        monkeypatch.setattr(f"openviking.session.memory.{module}.get_viking_fs", lambda: fs)
+
+    async def merge(self):
+        patches = self.context_provider.patches
+        assert len(patches) == 4
+        assert sum(patch.before_file is None for patch in patches) == 3
+        assert patches[-1].before_file.uri == old_file.uri
+        assert patches[-1].after_file is None
+        return ResolvedOperations(
+            case_references=[selected],
+            upsert_operations=[_case_op("must_not_write")] if conflicting_output else [],
+            delete_file_contents=[old_file] if conflicting_output else [],
+            errors=[],
+        ), None
+
+    merge_mock = AsyncMock(side_effect=merge)
+
+    # Preserve descriptor binding so the mock sees the real PatchMergeContextProvider.
+    async def run(self):
+        return await merge_mock(self)
+
+    monkeypatch.setattr("openviking.session.memory.streaming_memory_updater.ExtractLoop.run", run)
+    updater = StreamingMemoryUpdater(
+        registry=registry,
+        vlm_resolver=_TestVLMResolver(),
+        config=StreamingMemoryUpdaterConfig(max_operations_per_update=1),
+    )
+    proposed = [_case_op(name) for name in ("booking", "modify", "cancel")]
+    request = MemoryUpdateRequest(
+        operations=ResolvedOperations(
+            upsert_operations=proposed,
+            delete_file_contents=[old_file],
+            errors=[],
+            delete_replacements={old_file.uri: proposed[0].uris[0]},
+        ),
+        messages=[],
+        ctx=_ctx(),
+        metadata={"session_id": "source-session"},
+    )
+    try:
+        if conflicting_output:
+            with pytest.raises(ConflictError, match="same plan"):
+                await updater.submit(request)
+        else:
+            result = await updater.submit(request)
+            assert [ref.uris for ref in result.operations.case_references] == [selected.uris]
+            assert result.operations.upsert_operations == []
+            assert result.operations.delete_file_contents == []
+            assert result.operations.delete_replacements == {}
+            assert result.apply_result.deleted_uris == []
+            assert not result.apply_result.errors
+    finally:
+        await updater.close()
+    merge_mock.assert_awaited_once()
+    assert fs.files == before
+    assert fs.writes == []
+    assert not any(event[0] in {"write", "rm"} for event in fs.events)
+
+
+@pytest.mark.asyncio
+async def test_mixed_update_delete_reaches_lower_level_merge(monkeypatch):
+    _patch_language_config(monkeypatch)
+    update = _note_update_op("kept")
+    deleted = _note_delete_file("obsolete")
+    fs = InMemoryVikingFS(
+        {
+            update.uris[0]: MemoryFileUtils.write(update.old_memory_file_content),
+            deleted.uri: MemoryFileUtils.write(deleted),
+        }
+    )
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.get_viking_fs", lambda: fs
+    )
+
+    async def run(self):
+        patches = self.context_provider.patches
+        assert len(patches) == 2
+        assert patches[0].before_file.uri == update.uris[0]
+        assert patches[1].before_file.uri == deleted.uri
+        assert patches[1].after_file is None
+        return ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[]), None
+
+    merge = AsyncMock(side_effect=run)
+
+    async def run_mock(self):
+        return await merge(self)
+
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.ExtractLoop.run", run_mock
+    )
+    result = await merge_one_memory_type_operations(
+        memory_type="notes",
+        operations=[update],
+        delete_files=[deleted],
+        messages=[],
+        ctx=_ctx(),
+        registry=_registry(),
+        vlm_resolver=_TestVLMResolver(),
+    )
+    merge.assert_awaited_once()
+    assert result.upsert_operations == []
+    assert result.delete_file_contents == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delete_only", [False, True])
+async def test_failed_merge_never_falls_back_to_original_deletes(monkeypatch, delete_only):
+    error = RuntimeError("semantic merge failed")
+    merge = AsyncMock(side_effect=error)
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.merge_one_memory_type_operations", merge
+    )
+    operations = ResolvedOperations(
+        upsert_operations=[] if delete_only else [_note_update_op("kept")],
+        delete_file_contents=[_note_delete_file("obsolete")],
+        errors=[],
+    )
+    with pytest.raises(RuntimeError, match="semantic merge failed") as raised:
+        await merge_memory_operations(
+            operations=operations,
+            messages=[],
+            ctx=_ctx(),
+            registry=_registry(),
+            force_merge=True,
+            strict_extract_errors=False,
+        )
+    assert raised.value is error
+    merge.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_readonly_case_selection_stays_with_mutations_in_its_merge_group(monkeypatch):
+    """A different request cannot delete a selected Case unnoticed by the batch guard."""
+    registry = _registry()
+    registry.get("cases").operation_mode = "upsert"
+    selection = _case_op("selected")
+    changed = _case_op("changed")
+    request = MemoryUpdateRequest(
+        operations=ResolvedOperations(
+            upsert_operations=[changed, _note_update_op("other_type")],
+            case_references=[selection],
+            delete_file_contents=[],
+            errors=[],
+        ),
+        messages=[],
+        ctx=_ctx(),
+    )
+    updater = StreamingMemoryUpdater(registry=registry)
+    _, merge_request = updater._split_append_only_request(request)
+    groups = dict(split_request_by_merge_group(merge_request))
+    assert groups[MemoryMergeGroupKey(None, "cases")].operations.case_references == [selection]
+    assert groups[MemoryMergeGroupKey(None, "notes")].operations.case_references == []
+
+    # The second request selects the same type but asks to delete this first request's Case.
+    deleting = MemoryUpdateRequest(
+        operations=ResolvedOperations(
+            upsert_operations=[],
+            case_references=[],
+            delete_file_contents=[MemoryFile(uri=selection.uris[0], memory_type="cases")],
+            errors=[],
+        ),
+        messages=[],
+        ctx=_ctx(),
+    )
+    apply = AsyncMock()
+    monkeypatch.setattr(StreamingMemoryUpdater, "_apply_operations", apply)
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.merge_memory_operations",
+        AsyncMock(side_effect=lambda **kwargs: kwargs["operations"]),
+    )
+    with pytest.raises(ConflictError, match="same plan"):
+        await updater._process_batch(
+            MemoryMergeGroupKey(None, "cases"),
+            [groups[MemoryMergeGroupKey(None, "cases")], deleting],
+            "count",
+        )
+    apply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleting", [False, True])
+async def test_template_batches_validate_selected_case_against_all_final_deletes(
+    monkeypatch, deleting
+):
+    selected = _case_op("canonical")
+    requests = []
+    for index in range(2):
+        registry = _registry()
+        registry.get("cases").description = f"Template {index}"
+        requests.append(
+            MemoryUpdateRequest(
+                operations=ResolvedOperations(
+                    upsert_operations=[_case_op(f"proposed_{index}")],
+                    delete_file_contents=[],
+                    errors=[],
+                ),
+                messages=[],
+                ctx=_ctx(),
+                memory_registry=registry,
+            )
+        )
+    selection = ResolvedOperations(
+        case_references=[selected], upsert_operations=[], delete_file_contents=[], errors=[]
+    )
+    deletion = ResolvedOperations(
+        upsert_operations=[],
+        delete_file_contents=[MemoryFile(uri=selected.uris[0], memory_type="cases")],
+        errors=[],
+    )
+    merge = AsyncMock(side_effect=[selection, deletion if deleting else selection])
+    apply = AsyncMock(return_value=MemoryUpdateResult())
+    monkeypatch.setattr(StreamingMemoryUpdater, "_merge_requests", merge)
+    monkeypatch.setattr(StreamingMemoryUpdater, "_apply_operations", apply)
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.get_viking_fs", lambda: None
+    )
+    updater = StreamingMemoryUpdater(registry=_registry())
+    if deleting:
+        with pytest.raises(ConflictError, match="same plan"):
+            await updater._process_batch(MemoryMergeGroupKey(None, "cases"), requests, "count")
+        apply.assert_not_awaited()
+    else:
+        await updater._process_batch(MemoryMergeGroupKey(None, "cases"), requests, "count")
+        assert apply.await_count == 2  # Read-only selections are not conflicting writes.
+    assert merge.await_count == 2

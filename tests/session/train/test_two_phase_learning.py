@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -97,7 +98,7 @@ async def test_server_progress_counts_terminal_cases_not_trajectories(cases):
         await finish.wait()
         if kwargs["case_name"] == "case_0":
             raise ValueError("bad Case")
-        return noop_result(kwargs)
+        return await noop_result(cases, **kwargs)
 
     async def progress(snapshot):
         snapshots.append(snapshot)
@@ -421,9 +422,7 @@ async def test_commit_summary_aggregates_batches_and_does_not_use_last_batch_cou
 async def test_progress_is_terminal_only_after_state_writes(cases, monkeypatch):
     from test_external_case_learning import states
 
-    cases.compressor._learn_one_trajectory_case = AsyncMock(
-        side_effect=lambda **kw: noop_result(kw)
-    )
+    cases.compressor._learn_one_trajectory_case = AsyncMock(side_effect=partial(noop_result, cases))
     snapshots = []
 
     async def progress(p):

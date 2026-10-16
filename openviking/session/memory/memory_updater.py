@@ -44,7 +44,7 @@ from openviking.session.memory.utils.resource_refs import (
 )
 from openviking.session.memory.utils.template_utils import TemplateUtils
 from openviking.session.memory.utils.uri import render_template
-from openviking.session.memory.validation.content import get_content_gate
+from openviking.session.memory.validation.content import get_field_gates
 from openviking.session.memory.validation.create import validate_create_operations
 from openviking.storage.abstract_overview import freshness_metadata, render_abstract_overview
 from openviking.storage.viking_fs import get_viking_fs
@@ -53,7 +53,7 @@ from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.telemetry.tracer import get_trace_id
 from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.time_utils import parse_iso_datetime
-from openviking_cli.exceptions import NotFoundError
+from openviking_cli.exceptions import ConflictError, NotFoundError
 from openviking_cli.utils import VikingURI, get_logger
 
 logger = get_logger(__name__)
@@ -755,14 +755,32 @@ class MemoryUpdateResult:
 
 
 def _same_batch_delete_conflict_key(uri: str) -> str:
-    """Return a conservative key for detecting same-batch upsert/delete URI conflicts.
-
-    Some local filesystems are case-insensitive.  Treat case-only URI variants as
-    conflicting inside one apply batch so a loser delete cannot remove a winner
-    upsert before vectorization.
-    """
+    """Match retained/deleted targets conservatively for case-insensitive storage."""
 
     return str(uri or "").rstrip("/").casefold()
+
+
+def validate_operation_targets(operations: ResolvedOperations) -> None:
+    """Reject contradictory final targets before any memory or link changes."""
+    retained = {
+        _same_batch_delete_conflict_key(uri)
+        for op in [*operations.upsert_operations, *operations.case_references]
+        for uri in op.uris
+        if uri
+    }
+    conflicts = sorted(
+        {
+            file.uri
+            for file in operations.delete_file_contents
+            if file.uri and _same_batch_delete_conflict_key(file.uri) in retained
+        }
+    )
+    if conflicts:
+        raise ConflictError(
+            "Memory targets cannot be written or selected and deleted in the same plan: "
+            + ", ".join(conflicts),
+            resource=conflicts[0],
+        )
 
 
 async def prepare_memory_fields(
@@ -771,13 +789,14 @@ async def prepare_memory_fields(
     previous: Optional[MemoryFile],
     *,
     uri: Optional[str],
+    observed: Optional[MemoryFile],
 ) -> Dict[str, Any]:
-    """Merge schema fields, then invoke the registered type-owned content gate.
+    """Merge schema fields, then invoke the registered type-owned field gates.
 
     Ungated types retain their existing lenient merge behavior. Gated content may
     not hide a failed patch behind the old value and report it as a valid update.
     """
-    gate = get_content_gate(schema.memory_type)
+    gates = get_field_gates(schema.memory_type)
     metadata = dict(updates)
     for field in schema.fields:
         current = (
@@ -790,18 +809,30 @@ async def prepare_memory_fields(
             )
         )
         if field.name not in updates:
-            if gate is not None and previous is not None:
+            if gates and previous is not None:
                 metadata[field.name] = current
             continue
         merge_op = MergeOpFactory.from_field(field)
         try:
-            metadata[field.name] = await (
-                merge_op.apply_exact(current, updates[field.name])
-                if gate is not None and isinstance(merge_op, PatchOp)
-                else merge_op.apply(current, updates[field.name])
-            )
+            if gates and isinstance(merge_op, PatchOp):
+                observed_value = (
+                    None
+                    if observed is None
+                    else (
+                        observed.plain_content()
+                        if field.name == "content"
+                        else observed.extra_fields.get(field.name)
+                    )
+                )
+                metadata[field.name] = await merge_op.apply_checked(
+                    current,
+                    updates[field.name],
+                    require_exact=observed is not None and observed_value != current,
+                )
+            else:
+                metadata[field.name] = await merge_op.apply(current, updates[field.name])
         except Exception as exc:
-            if gate is not None:
+            if gates:
                 raise
             tracer.info(
                 "[memory_updater] Skipping field update after merge_op failure: "
@@ -811,8 +842,9 @@ async def prepare_memory_fields(
                 metadata.pop(field.name, None)
             else:
                 metadata[field.name] = current
-    if gate is not None:
-        metadata["content"] = gate(metadata.get("content"))
+    if gates:
+        for field_name, gate in gates.items():
+            metadata[field_name] = gate(metadata.get(field_name))
     return metadata
 
 
@@ -924,11 +956,12 @@ class MemoryUpdater:
         isolation_handler: MemoryIsolationHandler = None,
         search_tags_by_uri: Dict[str, List[str]] = None,
     ) -> MemoryUpdateResult:
+        validate_operation_targets(operations)
         viking_fs = self._get_viking_fs()
         lease = self._transaction_handle
         owns_lease = False
         if lease is None and any(
-            op.uris and (op.create_only or get_content_gate(op.memory_type) is not None)
+            op.uris and (op.create_only or get_field_gates(op.memory_type))
             for op in operations.upsert_operations
         ):
             # Reuse the same complete write-set lock as the streaming entrypoint.
@@ -996,8 +1029,7 @@ class MemoryUpdater:
             error_target = f"{resolved_op.memory_type}(page_id={resolved_op.page_id})"
             resolution_skip = getattr(resolved_op, "resolution_skip", None)
             if resolution_skip is not None:
-                # Reporting-only: the operation remains unresolved, preserving
-                # the legacy delete-suppression behavior for direct mixed batches.
+                # Reporting-only: an unresolved replacement must still block deletes.
                 skipped = SkippedMemoryOperation(
                     memory_type=resolved_op.memory_type,
                     page_id=resolved_op.page_id,
@@ -1036,7 +1068,7 @@ class MemoryUpdater:
         staged: Dict[str, MemoryFile] = {}
         gate_failed = False
         for index, resolved_op in enumerate(applicable_upserts):
-            if get_content_gate(resolved_op.memory_type) is None:
+            if not get_field_gates(resolved_op.memory_type):
                 continue
             try:
                 if lease_ref is None:
@@ -1087,12 +1119,7 @@ class MemoryUpdater:
             lease_ref=lease_ref,
         )
 
-        # Apply delete operations (delete_file_contents is List[MemoryFile])
-        # Skip deletes whose URI was just written in the same batch — this happens when the
-        # LLM issues a Replace with the same experience_name (delete old + create same-name new),
-        # which is semantically an Update. Executing the delete would remove the just-written file.
-        upserted_uris = set(result.written_uris + result.edited_uris)
-        upserted_uri_keys = {_same_batch_delete_conflict_key(uri) for uri in upserted_uris}
+        # Apply only the final plan's deletes; contradictory targets were rejected up front.
         for file_content in operations.delete_file_contents:
             delete_uri = file_content.uri
             if has_unresolved_upserts:
@@ -1101,18 +1128,6 @@ class MemoryUpdater:
                 )
                 result.add_error(delete_uri, delete_error)
                 tracer.error(f"Skipping delete for {delete_uri}: {delete_error}")
-                continue
-            if delete_uri in upserted_uris:
-                tracer.info(
-                    f"[apply_operations] skipping delete for {delete_uri}: "
-                    "URI was upserted in the same batch (Replace-with-same-name treated as Update)"
-                )
-                continue
-            if _same_batch_delete_conflict_key(delete_uri) in upserted_uri_keys:
-                tracer.info(
-                    f"[apply_operations] skipping delete for {delete_uri}: "
-                    "URI case-conflicts with an upserted URI in the same batch"
-                )
                 continue
             try:
                 await self._apply_delete(delete_uri, ctx, lease_ref=lease_ref)
@@ -1218,7 +1233,7 @@ class MemoryUpdater:
         lease_ref: Any = None,
         prepared_contents: Optional[List[Tuple[str, str]]] = None,
     ):
-        if get_content_gate(resolved_op.memory_type) is not None and lease_ref is None:
+        if get_field_gates(resolved_op.memory_type) and lease_ref is None:
             raise RuntimeError("Validated content writes require a write-set pathlock")
         if prepared_contents is not None:
             for uri, content in prepared_contents:
@@ -1247,20 +1262,20 @@ class MemoryUpdater:
         schema = self._registry.get(memory_type)
         # Process each URI independently
         for uri in resolved_op.uris:
-            gate = get_content_gate(memory_type)
+            gates = get_field_gates(memory_type)
             old_content: Optional[MemoryFile] = None
             if staged is not None and uri in staged:
                 old_content = staged[uri]
             else:
                 try:
                     content = await viking_fs.read_file(uri, ctx=ctx)
-                    if content or gate is not None:
+                    if content or gates:
                         old_content = MemoryFileUtils.read(content or "", uri=uri)
                 except Exception as exc:
-                    if gate is not None and not is_storage_not_found(exc):
+                    if gates and not is_storage_not_found(exc):
                         raise
                 if old_content is None and not resolved_op.create_only:
-                    if gate is None:
+                    if not gates:
                         old_content = resolved_op.old_memory_file_content
                     elif resolved_op.old_memory_file_content is not None:
                         raise ValueError(f"Memory disappeared before content validation: {uri}")
@@ -1274,7 +1289,13 @@ class MemoryUpdater:
             source_trace_id = _operation_trace_id(resolved_op)
             if source_trace_id:
                 metadata["last_update_trace_id"] = source_trace_id
-            metadata = await prepare_memory_fields(schema, metadata, old_content, uri=uri)
+            metadata = await prepare_memory_fields(
+                schema,
+                metadata,
+                old_content,
+                uri=uri,
+                observed=resolved_op.old_memory_file_content,
+            )
 
             # Preserve system-managed metadata from the old file that is not
             # covered by the schema. These fields are written by the system,

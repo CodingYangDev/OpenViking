@@ -17,6 +17,7 @@ from openviking.session.memory.experience.compiler import compile_dag
 from openviking.session.memory.experience.dag import (
     MAX_EVIDENCE_SUMMARY_CHARS,
     Dag,
+    GeneralNode,
     TellAgent,
     clip_evidence_summary,
     tool_evidence_summary,
@@ -79,7 +80,6 @@ class ExperienceGradientEstimator:
             target_uri="",
             source_session_uri=session_uri,
             evaluation=analysis.evaluation,
-            dag_execution=analysis.metadata.get("experience_execution"),
             trajectories=analysis.trajectories,
             current_trajectory_uris=set(
                 analysis.metadata.get("current_trajectory_uris")
@@ -280,7 +280,7 @@ def _session_identifier_leaks(
     reminder_text = "\n".join(
         node.slot_provider.instruction
         for node in compiled.nodes.values()
-        if isinstance(node.slot_provider, TellAgent)
+        if isinstance(node, GeneralNode) and isinstance(node.slot_provider, TellAgent)
     ).casefold()
     if not reminder_text:
         return []
@@ -290,6 +290,7 @@ def _session_identifier_leaks(
         "trajectories": [
             {
                 "content": trajectory.content,
+                "task_spec": trajectory.metadata.get("task_spec"),
                 "evaluation_criteria": trajectory.metadata.get("evaluation_criteria", []),
             }
             for trajectory in analysis.trajectories

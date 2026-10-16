@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -15,7 +16,9 @@ from openviking.server.identity import RequestContext, Role
 from openviking.session import create_session_compressor
 from openviking.session.compressor_v3 import (
     SessionCompressorV3,
+    _canonical_cases_from_update_result,
     _commit_experience_snapshot,
+    _contexts_from_update_result,
     _experience_gate_skipped_operations,
     _experience_root_uri,
     _experience_session_map,
@@ -33,7 +36,7 @@ from openviking.session.memory.dataclass import (
     SkippedMemoryOperation,
     StoredLink,
 )
-from openviking.session.memory.memory_updater import MemoryUpdater, MemoryUpdateResult
+from openviking.session.memory.memory_updater import MemoryUpdateResult
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.train import (
     Case,
@@ -101,7 +104,7 @@ def _case_operation() -> ResolvedOperation:
             "case_name": "重复预订处理",
             "task_signature": "处理重复预订并只取消确认重复的订单",
             "input": '{"summary":"用户要求处理重复预订","preconditions":["存在两个相似预订"]}',
-            "rubric": '{"name":"重复预订处理Rubric","description":"成功且高效处理重复预订","criteria":[{"name":"先验证重复","description":"取消前必须确认哪一单是重复订单","required":true,"weight":0.6},{"name":"只取消重复项","description":"不得影响有效订单","required":true,"weight":0.4}]}',
+            "rubric": '[{"id":"verify_duplicate","description":"取消前必须确认哪一单是重复订单"},{"id":"scope","description":"不得影响有效订单"}]',
             "evidence": "助手根据读取结果确认重复项并完成取消。",
         },
     )
@@ -925,7 +928,19 @@ async def test_v3_extract_uses_patch_merge_without_directory_lock(monkeypatch):
 
     monkeypatch.setattr(
         "openviking.session.compressor_v3.get_viking_fs",
-        lambda: SimpleNamespace(write_file=AsyncMock()),
+        lambda: SimpleNamespace(
+            write_file=AsyncMock(),
+            read_file=AsyncMock(
+                return_value=MemoryFileUtils.write(
+                    MemoryFile(
+                        uri=_case_operation().uris[0],
+                        memory_type="cases",
+                        content="",
+                        extra_fields=_case_operation().memory_fields,
+                    )
+                )
+            ),
+        ),
     )
     monkeypatch.setattr(
         "openviking.session.compressor_v3.get_default_registry",
@@ -958,9 +973,8 @@ async def test_v3_extract_trains_only_canonical_case_after_patch_merge(monkeypat
         "task_signature": "Handle duplicate bookings safely.",
         "input": '{"summary":"cancel only the confirmed duplicate booking"}',
         "rubric": (
-            '{"name":"duplicate_booking_rubric","description":"Verify duplicate handling",'
-            '"criteria":[{"name":"verify_duplicate","description":"The assistant verifies '
-            'which booking is duplicate before cancellation.","required":true,"weight":1.0}]}'
+            '[{"id":"verify_duplicate","description":"The assistant verifies '
+            'which booking is duplicate before cancellation."}]'
         ),
         "evidence": "Canonical merged case evidence.",
     }
@@ -1081,195 +1095,6 @@ def _training_case() -> Case:
     )
 
 
-@pytest.fixture
-def training_case_lock_fs(monkeypatch):
-    guard = asyncio.Lock()
-    events = []
-    contents = {"viking://user/u/memories/cases/duplicate_booking.md": "before"}
-    waiting = asyncio.Event()
-    active_lease = None
-
-    async def acquire(paths, timeout_secs):
-        nonlocal active_lease
-        if guard.locked():
-            waiting.set()
-        await guard.acquire()
-        active_lease = {"lease_ref": f"lease-{len(events)}"}
-        events.append(("acquire", paths, timeout_secs, active_lease))
-        return active_lease
-
-    async def release(lease):
-        nonlocal active_lease
-        assert lease is active_lease
-        events.append(("release", lease))
-        active_lease = None
-        guard.release()
-
-    async def read(uri, ctx=None):
-        events.append(("read", uri))
-        return contents.get(uri, "")
-
-    fs = SimpleNamespace(
-        _async_agfs=SimpleNamespace(
-            pathlock_acquire_exact_batch=AsyncMock(side_effect=acquire),
-            pathlock_release=AsyncMock(side_effect=release),
-        ),
-        _uri_to_path=lambda uri, ctx=None: uri.replace("viking://", "/local/default/", 1),
-        read_file=AsyncMock(side_effect=read),
-        contents=contents,
-        events=events,
-        guard=guard,
-        waiting=waiting,
-    )
-    monkeypatch.setattr("openviking.session.compressor_v3.get_viking_fs", lambda: fs)
-    return fs
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("existing_case", [False, True])
-async def test_training_case_write_locks_read_apply_and_diff(
-    monkeypatch, training_case_lock_fs, existing_case
-):
-    fs = training_case_lock_fs
-    if not existing_case:
-        fs.contents.clear()
-    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
-    ctx = _ctx()
-    archive_uri = "viking://user/u/sessions/s1/history/archive_001"
-
-    async def apply(updater, operations, applied_ctx, **kwargs):
-        assert applied_ctx is ctx
-        assert updater._transaction_handle is fs.events[0][3]
-        assert fs.guard.locked()
-        op = operations.upsert_operations[0]
-        assert op.is_edit() is existing_case
-        assert (op.old_memory_file_content.content if op.is_edit() else None) == (
-            "before" if existing_case else None
-        )
-        assert op.source.archive_uri == archive_uri
-        assert op.source.extraction_id == "archive_001"
-        fs.events.append(("apply",))
-        return MemoryUpdateResult()
-
-    async def build_diff(**kwargs):
-        assert fs.guard.locked()
-        fs.events.append(("diff",))
-        return {"adds": [], "updates": [], "deletes": []}
-
-    monkeypatch.setattr(MemoryUpdater, "apply_operations", apply)
-    compressor._build_memory_diff = AsyncMock(side_effect=build_diff)
-
-    result = await compressor._write_training_case_memory(
-        case=_training_case(), ctx=ctx, archive_uri=archive_uri
-    )
-
-    uri = result.operations.upsert_operations[0].uris[0]
-    fs._async_agfs.pathlock_acquire_exact_batch.assert_awaited_once_with(
-        sorted([fs._uri_to_path(uri), fs._uri_to_path(uri.rsplit("/", 1)[0] + "/.overview.md")]),
-        timeout_secs=300.0,
-    )
-    assert [event[0] for event in fs.events] == ["acquire", "read", "apply", "diff", "release"]
-    fs._async_agfs.pathlock_release.assert_awaited_once_with(fs.events[0][3])
-    assert not fs.guard.locked()
-    assert result.memory_diff == {"adds": [], "updates": [], "deletes": []}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure_stage", ["acquire", "apply", "diff"])
-@pytest.mark.parametrize("exception_type", [RuntimeError, asyncio.CancelledError])
-async def test_training_case_write_releases_lease_on_failure(
-    monkeypatch, training_case_lock_fs, failure_stage, exception_type
-):
-    fs = training_case_lock_fs
-    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
-    apply = AsyncMock(return_value=MemoryUpdateResult())
-    monkeypatch.setattr(MemoryUpdater, "apply_operations", apply)
-    compressor._build_memory_diff = AsyncMock(return_value={})
-    error = exception_type("interrupted")
-    target = {
-        "acquire": fs._async_agfs.pathlock_acquire_exact_batch,
-        "apply": apply,
-        "diff": compressor._build_memory_diff,
-    }[failure_stage]
-    target.side_effect = error
-
-    with pytest.raises(exception_type) as raised:
-        await compressor._write_training_case_memory(
-            case=_training_case(),
-            ctx=_ctx(),
-            archive_uri="viking://user/u/sessions/s1/history/archive_001",
-        )
-
-    assert raised.value is error
-    assert not fs.guard.locked()
-    if failure_stage == "acquire":
-        fs._async_agfs.pathlock_release.assert_not_awaited()
-        fs.read_file.assert_not_awaited()
-        apply.assert_not_awaited()
-    else:
-        fs._async_agfs.pathlock_release.assert_awaited_once_with(fs.events[0][3])
-    if failure_stage != "diff":
-        compressor._build_memory_diff.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("same_case", [False, True])
-async def test_training_case_writes_wait_before_reading_shared_state(
-    monkeypatch, training_case_lock_fs, same_case
-):
-    fs = training_case_lock_fs
-    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
-    started = asyncio.Event()
-    finish_first = asyncio.Event()
-    seen_old_content = []
-
-    async def apply(updater, operations, ctx, **kwargs):
-        assert fs.guard.locked()
-        assert updater._transaction_handle is not None
-        op = operations.upsert_operations[0]
-        seen_old_content.append(op.old_memory_file_content.content if op.is_edit() else None)
-        if len(seen_old_content) == 1:
-            started.set()
-            await finish_first.wait()
-        fs.contents[op.uris[0]] = f"after-{len(seen_old_content)}"
-        return MemoryUpdateResult()
-
-    monkeypatch.setattr(MemoryUpdater, "apply_operations", apply)
-    first = asyncio.create_task(
-        compressor._write_training_case_memory(case=_training_case(), ctx=_ctx(), archive_uri="")
-    )
-    tasks = [first]
-    try:
-        await asyncio.wait_for(started.wait(), timeout=1.0)
-        second_case = _training_case()
-        if not same_case:
-            second_case.name = "another_case"
-        tasks.append(
-            asyncio.create_task(
-                compressor._write_training_case_memory(case=second_case, ctx=_ctx(), archive_uri="")
-            )
-        )
-        await asyncio.wait_for(fs.waiting.wait(), timeout=1.0)
-        assert fs.read_file.await_count == 1
-        assert seen_old_content == ["before"]
-        finish_first.set()
-        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1.0)
-    finally:
-        finish_first.set()
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    assert seen_old_content == ["before", "after-1" if same_case else None]
-    assert fs._async_agfs.pathlock_release.await_count == 2
-    assert not fs.guard.locked()
-    paths = [call.args[0] for call in fs._async_agfs.pathlock_acquire_exact_batch.await_args_list]
-    assert set(paths[0]) & set(paths[1]) == (
-        set(paths[0]) if same_case else {"/local/default/user/u/memories/cases/.overview.md"}
-    )
-
-
 def _case_spec_message(case: Case | None = None) -> Message:
     rollout = Rollout(
         case=case or _training_case(),
@@ -1285,44 +1110,47 @@ def _case_spec_message(case: Case | None = None) -> Message:
 
 
 @pytest.mark.asyncio
-async def test_v3_training_case_spec_fast_path_skips_user_memory_extraction_and_strips_control_message():
-    case_spec = _case_spec_message()
-    rollout_messages = _messages()
-    written = []
-    trained = []
-
+async def test_training_task_uses_shared_case_extraction_and_keeps_concrete_spec():
     compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
-
-    async def fail_extract_user_memories(**kwargs):
-        raise AssertionError("fast path must not run LLM user-memory extraction")
-
-    async def fake_write_training_case_memory(**kwargs):
-        written.append(kwargs["case"])
-        result = MemoryUpdateResult()
-        result.add_written("viking://user/u/memories/cases/duplicate_booking.md")
-        return result
-
-    async def fake_train_from_extracted_cases(**kwargs):
-        trained.append(kwargs)
-        return {"case_count": len(kwargs["cases"]), "submitted": len(kwargs["cases"])}
-
-    compressor._extract_user_memories = fail_extract_user_memories
-    compressor._write_training_case_memory = fake_write_training_case_memory
-    compressor.train_from_extracted_cases = fake_train_from_extracted_cases
+    case = _training_case()
+    case.name = "shared_booking_scenario"
+    case_uri = f"viking://user/u/memories/cases/{case.name}.md"
+    result = MemoryUpdateResult()
+    result.add_written(case_uri)
+    compressor._extract_user_memories = AsyncMock(
+        return_value=SimpleNamespace(
+            contexts=_contexts_from_update_result(result),
+            cases=[case],
+            case_uri_by_name={case.name: case_uri},
+            memory_diff=None,
+        )
+    )
+    compressor.train_from_extracted_cases = AsyncMock(return_value={"submitted": 1})
     compressor._write_final_memory_diff = AsyncMock()
-
+    evaluation = Message(
+        id="eval", role="system", parts=[TextPart(text="# OpenViking OutcomeEvaluation\n{}")]
+    )
+    messages = [_case_spec_message(), *_messages(), evaluation]
     contexts = await compressor.extract_long_term_memories(
-        messages=[case_spec, *rollout_messages],
+        messages=messages,
         ctx=_ctx(),
-        session_id="s1",
-        archive_uri="viking://user/u/sessions/s1/history/archive_001",
         allowed_memory_types={"cases", "trajectories"},
     )
-
-    assert [case.name for case in written] == ["duplicate_booking"]
-    assert [case.name for case in trained[0]["cases"]] == ["duplicate_booking"]
-    assert trained[0]["messages"] == rollout_messages
-    assert contexts[0].uri == "viking://user/u/memories/cases/duplicate_booking.md"
+    assert contexts[0].uri == case_uri
+    assert compressor._extract_user_memories.await_args.kwargs["messages"] == messages[1:-1]
+    evidence = compressor._extract_user_memories.await_args.kwargs["case_rubric_evidence"]
+    assert len(evidence) == 1  # The empty OutcomeEvaluation has no report to expose.
+    payload = json.loads(evidence[0])
+    assert payload["rubric"]["description"] == _training_case().rubric.description
+    assert "case" not in payload and "name" not in payload["rubric"]
+    assert "duplicate_booking" not in evidence[0]
+    assert "task-1" not in evidence[0]
+    trained = compressor.train_from_extracted_cases.await_args.kwargs
+    assert trained["cases"] == [case]
+    assert trained["task"].name == "duplicate_booking"
+    assert trained["task"].input["task_id"] == "task-1"
+    assert trained["task"].name != trained["cases"][0].name
+    assert trained["messages"] == messages
 
 
 @pytest.mark.asyncio
@@ -1336,7 +1164,6 @@ async def test_v3_training_case_spec_does_not_write_case_when_evolution_disabled
             case_uri_by_name={},
         )
     )
-    compressor._write_training_case_memory = AsyncMock()
     compressor.train_from_extracted_cases = AsyncMock()
     compressor._write_final_memory_diff = AsyncMock()
 
@@ -1350,13 +1177,13 @@ async def test_v3_training_case_spec_does_not_write_case_when_evolution_disabled
     )
 
     assert contexts == []
-    compressor._write_training_case_memory.assert_not_awaited()
     compressor.train_from_extracted_cases.assert_not_awaited()
     assert compressor._extract_user_memories.await_args.kwargs["allowed_memory_types"] == set()
+    assert compressor._extract_user_memories.await_args.kwargs["case_rubric_evidence"] == []
 
 
 @pytest.mark.asyncio
-async def test_v3_training_case_spec_fast_path_not_used_with_user_memory_policy():
+async def test_v3_training_case_spec_respects_user_memory_policy():
     extracted = False
     trained = []
 
@@ -1386,7 +1213,7 @@ async def test_v3_training_case_spec_fast_path_not_used_with_user_memory_policy(
 
 
 @pytest.mark.asyncio
-async def test_v3_training_case_spec_fast_path_rejects_invalid_protocol():
+async def test_v3_training_case_spec_rejects_invalid_protocol():
     message = _case_spec_message()
     assert isinstance(message.parts[0], TextPart)
     message.parts[0].text = message.parts[0].text.replace(
@@ -1403,7 +1230,7 @@ async def test_v3_training_case_spec_fast_path_rejects_invalid_protocol():
         )
 
 
-def test_training_case_spec_message_uses_fast_path_protocol():
+def test_training_case_spec_message_preserves_transport_protocol():
     message = _case_spec_message()
     part = message.parts[0]
     assert isinstance(part, TextPart)
@@ -1523,7 +1350,7 @@ def test_training_outcome_evaluation_round_trips_to_server_rollout():
 
 
 @pytest.mark.asyncio
-async def test_v3_fast_path_writes_final_memory_diff_with_case_and_exp(monkeypatch):
+async def test_v3_shared_case_path_writes_final_memory_diff_with_case_and_exp(monkeypatch):
     archive_uri = "viking://user/u/sessions/s1/history/archive_001"
     writes: dict[str, str] = {}
 
@@ -1542,11 +1369,13 @@ async def test_v3_fast_path_writes_final_memory_diff_with_case_and_exp(monkeypat
 
     compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
 
-    async def fake_write_training_case_memory(**kwargs):
+    async def fake_extract_user_memories(**kwargs):
         result = MemoryUpdateResult()
         result.add_written("viking://user/u/memories/cases/duplicate_booking.md")
         return SimpleNamespace(
-            result=result,
+            contexts=_contexts_from_update_result(result),
+            cases=[_training_case()],
+            case_uri_by_name={},
             memory_diff={
                 "archive_uri": archive_uri,
                 "trace_id": None,
@@ -1603,7 +1432,7 @@ async def test_v3_fast_path_writes_final_memory_diff_with_case_and_exp(monkeypat
             },
         }
 
-    compressor._write_training_case_memory = fake_write_training_case_memory
+    compressor._extract_user_memories = fake_extract_user_memories
     compressor.train_from_extracted_cases = fake_train_from_extracted_cases
     monkeypatch.setattr("openviking.session.compressor_v3.get_viking_fs", lambda: FakeFS())
 
@@ -2085,7 +1914,7 @@ def test_same_session_multiple_cases_do_not_cross_link():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("strict", [False, True])
-@pytest.mark.parametrize("path", ["ordinary", "training", "fast_path"])
+@pytest.mark.parametrize("path", ["ordinary", "training"])
 async def test_extraction_failures_follow_strict_mode(monkeypatch, strict, path):
     from openviking.session.compressor_v3 import ExperienceTrainingError
     from openviking.telemetry import tracer
@@ -2103,12 +1932,6 @@ async def test_extraction_failures_follow_strict_mode(monkeypatch, strict, path)
         ),
     )
     compressor.train_from_extracted_cases = AsyncMock(side_effect=error)
-    compressor._commit_training_case_fast_path = AsyncMock(side_effect=error)
-    if path == "fast_path":
-        monkeypatch.setattr(
-            "openviking.session.compressor_v3._training_case_from_first_message",
-            lambda *args: _training_case(),
-        )
     trace_error = Mock()
     monkeypatch.setattr(tracer, "error", trace_error)
     call = compressor.extract_long_term_memories(
@@ -2228,3 +2051,55 @@ async def test_lenient_extraction_does_not_swallow_cancellation():
     compressor._extract_user_memories = AsyncMock(side_effect=asyncio.CancelledError())
     with pytest.raises(asyncio.CancelledError):
         await compressor.extract_long_term_memories(messages=_messages(), ctx=_ctx())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", [None, "deleted", "filtered", "failed"])
+async def test_known_case_noop_contributes_without_accepting_failed_or_filtered_targets(blocked):
+    op = _case_operation()
+    uri = op.uris[0]
+    raw = MemoryFileUtils.write(
+        MemoryFile(uri=uri, memory_type="cases", content="", extra_fields=op.memory_fields)
+    )
+    fs = SimpleNamespace(read_file=AsyncMock(return_value=raw))
+    result = MemoryUpdateResult()
+    if blocked == "deleted":
+        result.deleted_uris.append(uri)
+    elif blocked == "filtered":
+        result.skipped_operations.append(
+            SkippedMemoryOperation(
+                memory_type="cases",
+                uri=uri,
+                reason_code=MemoryOperationSkipCode.MEMORY_TYPE_FILTERED,
+                reason="filtered",
+            )
+        )
+    elif blocked == "failed":
+        result.errors.append((uri, "failed"))
+    cases = await _canonical_cases_from_update_result(
+        operations=ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[]),
+        requested_operations=ResolvedOperations(
+            upsert_operations=[op], delete_file_contents=[], errors=[]
+        ),
+        result=result,
+        viking_fs=fs,
+        ctx=_ctx(),
+    )
+    assert [case.name for case in cases] == ([] if blocked else [op.memory_fields["case_name"]])
+    if blocked:
+        fs.read_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_case_association_does_not_treat_storage_failure_as_absence():
+    op = _case_operation()
+    with pytest.raises(PermissionError, match="denied"):
+        await _canonical_cases_from_update_result(
+            operations=ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[]),
+            requested_operations=ResolvedOperations(
+                upsert_operations=[op], delete_file_contents=[], errors=[]
+            ),
+            result=MemoryUpdateResult(),
+            viking_fs=SimpleNamespace(read_file=AsyncMock(side_effect=PermissionError("denied"))),
+            ctx=_ctx(),
+        )

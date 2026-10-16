@@ -280,3 +280,63 @@ intent.default(other)""",
     else:
         assert "intent" not in result.experiences[0].slot_values
     assert env[1].files == before
+
+
+@pytest.mark.asyncio
+async def test_any_of_search_is_local_recomputed_and_reports_only_its_witness(env, runtime):
+    store(
+        env,
+        """dag = workflow("Either current situation")
+a = check("Situation A holds")
+b = check("Situation B holds")
+either = any_of(a, b)
+r = tell("Apply the scoped correction")
+either.then(r)""",
+    )
+    before = dict(env[1].files)
+    model = env[2]
+    for values, witness in [
+        ({"a": True, "b": False}, "A"),
+        ({"a": True, "b": True}, "A"),
+        ({"a": False, "b": False}, None),
+        ({}, None),
+        ({"a": True}, "A"),
+        ({"a": False, "b": True}, "B"),
+    ]:
+        fill(env, runtime, **values)
+        model.get_completion_async.reset_mock()
+        result = await search(env, runtime)
+        assert result.errors == []
+        assert [item.slot_name for item in result.instructions] == (["r"] if witness else [])
+        if witness:
+            assert [c.description for c in result.instructions[0].conditions] == [
+                f"Situation {witness} holds"
+            ]
+        facts = result.experiences[0]
+        assert "either" not in facts.slot_values
+        assert "r" not in facts.slot_values
+        assert 3 not in facts.executed_nodes
+        assert all(node.slot_name in {"a", "b"} for node in facts.completed_nodes)
+        model.get_completion_async.assert_awaited_once()
+        payload = json.loads(model.get_completion_async.await_args.kwargs["messages"][1]["content"])
+        assert set(payload["questions"]) == {"slot_0", "slot_1", "experience_0_relevance"}
+    assert env[1].files == before
+
+
+@pytest.mark.asyncio
+async def test_decider_cannot_supply_a_true_any_of_slot(env):
+    store(
+        env,
+        """dag = workflow("Either current situation")
+a = check("A")
+b = check("B")
+either = any_of(a, b)
+r = tell("Act")
+either.then(r)""",
+    )
+    decider = SimpleNamespace(decide=AsyncMock(return_value={EXPERIENCE: {"either": True}}))
+    runtime = ExperienceRuntime(env[1], env[3], dag_decider=decider)
+    result = await search(env, runtime)
+    assert result.errors == []
+    assert result.instructions == []
+    assert result.experiences[0].slot_values == {}

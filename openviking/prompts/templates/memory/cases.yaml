@@ -1,15 +1,29 @@
 memory_type: cases
 description: |
-  Language policy: generated natural-language text must use {{ language }}. If the source is multilingual, use the current task user's primary language as {{ language }}; if unclear, use the latest user message language. Preserve stable identifiers, code-like tokens, tool/API names, enum values, exact IDs, paths, dates, amounts, and other structured literals unchanged. When updating an existing case, prefer its existing name and language style to avoid translated duplicates.
+  A Case represents a business domain, NOT an individual task, workflow or execution.
+  Extract from a real user task with observable execution or outcome; skip chit-chat and
+  fragments. Infer the business domain from the current service/task context. Group tasks
+  within the same domain into one Case, and keep distinct business domains separate.
+  Do not split a domain by workflow, rule check, eligibility condition, parameter, user,
+  task ID or outcome. Those distinctions belong in the linked Experience's conditional branches.
 
-  A trainable/evaluable case extracted from a real session commit.
+  Search for an existing domain-level Case and reuse its canonical name and domain context. A narrower
+  workflow Case is not the domain identity; do not rename, delete or consolidate legacy Cases here.
+  Maintain its rubric from supplied rules, task requirements and feedback. Reuse stable rubric IDs;
+  add genuinely new domain-wide criteria, edit changed criteria, and remove obsolete ones only with
+  supporting evidence. A failed run does not justify weakening a rule. Do not promote one task
+  answer, evaluator literal, entity ID or local failure into a domain-wide requirement.
+  When the rubric is unchanged, explicitly select each matching existing Case: in Python use
+  sdk.commit(cases=[loaded_case]); in JSON return its page_id in selected_case_ids.
+  Update a changed rubric on the loaded Case using the normal edit/drop/overwrite field operations.
+  Select only matched Cases, not all search results. No content change is required for a new
+  execution to contribute a Trajectory. Newly created Cases are associated through creation.
+  Use sdk.create_cases only for a new domain target, never for an existing one.
+  Concrete task inputs, expected values, execution facts and scores belong to each Trajectory,
+  not this memory. The Case describes the business scope; its Experience describes how to handle it.
 
-  Extract ONLY when the conversation contains a concrete user task plus enough assistant execution,
-  tool-use evidence, or final result to define what a good future rollout should do.
-  Skip pure chit-chat, simple factual Q&A, or fragments with no observable task outcome.
-
-  The case is not an experience instruction. It defines the scenario and rubric used by the
-  training pipeline to learn better experience memories from this commit rollout.
+  Write natural-language text in {{ language }}. Keep canonical domain identifiers unchanged;
+  do not create translated duplicates. Preserve tool/API names, policy conditions and thresholds.
 
 directory: "viking://user/{{ user_space }}/memories/cases"
 filename_template: "{{ case_name }}.md"
@@ -18,17 +32,16 @@ peer_enabled: false
 content_template: |
   # {{ case_name }}
 
-  ## Task Signature
+  ## Business Domain
   {{ task_signature }}
 
-  ## Input
+  ## Domain Context
   {{ input }}
 
   ## Rubric
+  ```json
   {{ rubric }}
-
-  ## Evidence
-  {{ evidence }}
+  ```
 
   ## Linked Experiences
   {%- for link in links or [] %}
@@ -55,45 +68,39 @@ fields:
   - name: case_name
     type: string
     description: |
-      Short stable case name for this concrete training/evaluation sample.
-      Must be written in {{ language }}.
-      {% if language == 'en' %}Use lowercase snake_case, max 5 words.{% else %}Use a concise noun phrase, max 15 characters.{% endif %}
-      Name the task boundary, not the whole conversation.
+      Stable business-domain identifier. For new domains use lowercase English snake_case,
+      regardless of conversation language. Derive the name from the actual domain.
+      Examples only, not prescribed identifiers or a fixed domain list: airline_customer_service,
+      software_maintenance.
+      Reuse an existing domain-level identifier. Never name a Case after a workflow, condition,
+      processing result, task number or entity ID.
     merge_op: immutable
 
   - name: task_signature
     type: string
     description: |
-      Semantic task signature for retrieval and grouping.
-      Write generated natural-language text in {{ language }}.
-      Describe the reusable task intent, object/effect boundary, and success condition in one sentence.
-      Generalize private identifiers, exact IDs, names, amounts, dates, and paths.
+      One sentence describing the business domain and its service scope, not one task's intent.
+      Include the domain's range of services rather than a particular action or result.
+      No dataset signatures or instance-specific identifiers, names, amounts, dates or paths.
     merge_op: immutable
 
   - name: input
     type: string
     description: |
-      Compact JSON object string describing the executable case input.
-      JSON keys must remain stable English identifiers; generated string values should use {{ language }} while preserving exact source literals needed for task matching.
-      Include the user request summary and any stable preconditions needed to reproduce/evaluate the task.
-      Example: {"summary":"用户要求处理重复预订并保留有效订单","preconditions":["存在两个相似订单候选"]}
+      Plain-text domain context: stable background and information needed to handle requests.
+      Use concise prose or Markdown bullets, not JSON. Do not repeat task_signature or include
+      task-specific identifiers, dates, amounts, membership tiers or other instance values.
     merge_op: immutable
 
   - name: rubric
     type: string
+    init_value: "[]"
     description: |
-      Compact JSON object string defining what good means and how to check it.
-      JSON keys must remain stable English identifiers; generated string values should use {{ language }} while preserving exact tool names, required literals, and observable evaluation labels.
-      Required shape:
-      {"name":"...","description":"...","criteria":[{"name":"...","description":"observable success condition","required":true,"weight":1.0}]}
-      Criteria must be observable from rollout messages/tool results; include both success rate and execution efficiency when relevant.
-      Use 1-5 criteria. Weight values should be positive.
-    merge_op: immutable
-
-  - name: evidence
-    type: string
-    description: |
-      Brief generalized evidence from the commit conversation explaining why this case is useful.
-      Write generated natural-language text in {{ language }}.
-      Do not include private raw identifiers, exact IDs, personal contact values, or full tool payloads.
-    merge_op: immutable
+      JSON list of domain-wide evaluation criteria, each with exactly id and description strings.
+      Use stable, unique IDs and clear criteria grounded in supplied rules, task requirements and
+      feedback. Describe when a criterion applies and what counts as satisfying it. Include no
+      task-specific expected answers, identifiers or scores. Update this list as supported rules
+      evolve; retain IDs for unchanged criteria. An empty list means no criteria are established.
+      Example shape only: [{"id":"respect_scope","description":"Only perform changes the user authorized."}]
+      Each Trajectory evaluates these criteria and stores its own definition/result snapshot.
+    merge_op: patch

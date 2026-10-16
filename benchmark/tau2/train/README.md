@@ -398,3 +398,25 @@ Reload the Tau2 rollout service for the rollback to take effect. Existing runnin
 processes and cached rollouts are not modified. For a comparison run, pass
 `--no-reuse-train-rollout-cache --force-baseline-recompute` to avoid reusing results
 produced by the experimental user provider.
+
+
+### Agent token usage
+
+The rollout service returns per-attempt Agent model usage in
+`rollout.metadata.token_usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`).
+VikingBot already collects this in its agent loop; the native backend sums only assistant
+message usage. User-simulator usage is excluded. External advice/DAG judge, grading, and
+training/extraction model calls are not included in this Agent-loop metric.
+
+The train pipeline aggregates this field in `report.token_usage` and displays
+`avg_tokens` alongside rollout accuracy, including epoch summaries. The same reports
+are written to `events.jsonl` and the final report JSON. `average_tokens_per_rollout` means
+one problem's complete attempt (all Agent model turns), averaged across attempts; it is not
+an average per conversation turn or a sum over all problems sharing a trial index. Each
+`trials[]` report also contains its own usage summary.
+
+`reported_rollout_count / rollout_count` records usage coverage. Missing or invalid totals
+are excluded from the mean and shown as `n/a` when none are available, not filled with zero;
+an explicitly reported zero is valid. Cached rollouts retain the original attempt's usage,
+so these are comparable rollout-cost metrics, **not newly billed tokens for this run**.
+Old cache records without usage remain unknown; no history is rewritten or recomputed.

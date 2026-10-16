@@ -11,6 +11,7 @@ from functools import wraps
 from typing import Any
 from uuid import uuid4
 
+from openviking.session.train.components.dataset_service import redact_sensitive
 from openviking.telemetry import tracer
 from openviking.utils.model_retry import is_retryable_rate_limit_error, rate_limit_retry_delay
 from openviking_cli.utils import get_logger
@@ -18,7 +19,30 @@ from openviking_cli.utils import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_TAU2_USER_LLM = "openai/doubao-seed-2-0-code-preview-260215"
-_TAU2_REASONING_ONLY_MAX_ATTEMPTS = 3
+_TAU2_OUTPUT_MAX_ATTEMPTS = 3
+_TAU2_USER_OUTPUT_RULE = (
+    "Output either ordinary customer text without control markers, or exactly one of "
+    "###STOP###, ###TRANSFER###, ###OUT-OF-SCOPE###. Never combine a marker with text "
+    "or tool calls. Authorizing a pending action is not completion: reply normally "
+    "without STOP, and wait for the agent to report the result."
+)
+_TAU2_USER_OUTPUT_CORRECTION = (
+    "Your previous output mixed a control marker with text or tool calls. "
+    "Regenerate this user reply following the output rule."
+)
+
+
+class Tau2UserSimulatorFormatError(ValueError):
+    """The user simulator exhausted its current-turn output-format budget."""
+
+
+_GYM_INITIAL_OBSERVATION_TIMEOUT_SECONDS = 120.0
+_GYM_INITIAL_OBSERVATION_POLL_SECONDS = 0.01
+_TAU2_DONE_RULE = (
+    "Finish only after the user conversation has ended. After completing operations, "
+    "report the results via communicate_with_user and handle the user's follow-up requests. "
+    "Do not call done while the user conversation is still active."
+)
 
 _TAU2_GENERATE_REFERENCE_MODULES = (
     "tau2.agent.llm_agent",
@@ -72,8 +96,19 @@ def _wrap_tau2_generate_with_rate_limit_retry(generate: Callable[..., Any]) -> C
 
     @wraps(generate)
     def generate_with_rate_limit_retry(*args: Any, **kwargs: Any) -> Any:
+        user_call = kwargs.get("call_name") == "user_simulator_response"
+        if user_call:
+            from tau2.data_model.message import SystemMessage
+
+            # This is a per-call copy: retries must not append to UserState history.
+            user_messages = [
+                *kwargs["messages"],
+                SystemMessage(role="system", content=_TAU2_USER_OUTPUT_RULE),
+            ]
+            kwargs = {**kwargs, "messages": user_messages}
         attempt = 1
-        reasoning_only_attempts = 0
+        invalid_outputs = 0
+        last_format_error = None
         while True:
             try:
                 response = generate(*args, **kwargs)
@@ -91,32 +126,75 @@ def _wrap_tau2_generate_with_rate_limit_retry(generate: Callable[..., Any]) -> C
                 attempt += 1
                 continue
 
-            # Retry only the LLM call, before UserSimulator appends its response to history.
+            # Both output failures share one budget; nested retry loops could multiply it.
             diagnostics = _tau2_reasoning_only_diagnostics(response)
+            format_error = _tau2_user_format_diagnostics(response) if user_call else None
+            if format_error is not None:
+                last_format_error = format_error
+                diagnostics = format_error
+                kwargs = {
+                    **kwargs,
+                    "messages": [
+                        *user_messages,
+                        SystemMessage(role="system", content=_TAU2_USER_OUTPUT_CORRECTION),
+                    ],
+                }
             if diagnostics is None:
                 return response
-            reasoning_only_attempts += 1
+            invalid_outputs += 1
             detail = json.dumps(diagnostics, ensure_ascii=False)
-            tracer.info(
-                "tau2 LiteLLM reasoning-only response "
-                f"attempt={reasoning_only_attempts} diagnostics={detail}"
-            )
-            if reasoning_only_attempts >= _TAU2_REASONING_ONLY_MAX_ATTEMPTS:
-                error = ValueError(
-                    "tau2 LiteLLM returned reasoning-only responses without content or tool calls "
-                    f"after {reasoning_only_attempts} attempts; diagnostics={detail}"
-                )
+            tracer.info(f"tau2 invalid model output attempt={invalid_outputs} diagnostics={detail}")
+            if invalid_outputs >= _TAU2_OUTPUT_MAX_ATTEMPTS:
+                if last_format_error is not None:
+                    error = Tau2UserSimulatorFormatError(
+                        "tau2 user simulator returned invalid stop format "
+                        f"after {invalid_outputs} attempts; "
+                        f"diagnostics={json.dumps(last_format_error, ensure_ascii=False)}"
+                    )
+                else:
+                    error = ValueError(
+                        "tau2 LiteLLM returned reasoning-only responses without content or tool calls "
+                        f"after {invalid_outputs} attempts; diagnostics={detail}"
+                    )
                 tracer.error(str(error), e=error, console=False)
                 raise error
-            time.sleep(_tau2_rate_limit_retry_delay(reasoning_only_attempts))
+            if format_error is None:
+                time.sleep(_tau2_rate_limit_retry_delay(invalid_outputs))
 
     generate_with_rate_limit_retry._openviking_tau2_rate_limit_retry = True
     generate_with_rate_limit_retry._openviking_original_generate = generate
     return generate_with_rate_limit_retry
 
 
+def _tau2_user_format_diagnostics(response: Any) -> dict[str, Any] | None:
+    from tau2.user.user_simulator import OUT_OF_SCOPE, STOP, TRANSFER
+
+    text = response.content or ""
+    markers = [marker for marker in (STOP, TRANSFER, OUT_OF_SCOPE) if marker in text]
+    if not markers or (text.strip() in markers and response.tool_calls is None):
+        return None
+    preview = redact_sensitive(text)
+    return {
+        "content": preview[:2000],
+        "content_chars": len(text),
+        "truncated": len(preview) > 2000,
+        "markers": markers,
+        "tool_call_count": len(response.tool_calls or []),
+    }
+
+
+def _tau2_user_is_stop(cls: Any, message: Any) -> bool:
+    from tau2.user.user_simulator import OUT_OF_SCOPE, STOP, TRANSFER
+
+    return not message.is_tool_call() and (message.content or "").strip() in (
+        STOP,
+        TRANSFER,
+        OUT_OF_SCOPE,
+    )
+
+
 def _install_tau2_litellm_rate_limit_retry() -> None:
-    """Retry rate limits and bounded reasoning-only replies in Tau2's sync generate path.
+    """Retry rate limits and invalid outputs in Tau2's sync generate path.
 
     AgentGymEnv's user simulator and orchestrator call tau2.utils.llm_utils.generate
     through synchronous module globals imported with ``from ... import generate``.
@@ -154,6 +232,8 @@ def _install_tau2_litellm_rate_limit_retry() -> None:
             or getattr(module_generate, "_openviking_tau2_rate_limit_retry", False)
         ):
             module.generate = wrapped
+        if module_name == "tau2.user.user_simulator":
+            module.UserSimulator.is_stop = classmethod(_tau2_user_is_stop)
 
 
 def _install_tau2_litellm_unknown_cost_suppression() -> None:
@@ -331,11 +411,21 @@ class _GymTau2BenchEnv:
 
     def reset(self):
         user_query, info_dict = self.env.reset()
+        try:
+            user_query = _wait_for_gym_initial_observation(self.env, user_query)
+        except RuntimeError as exc:
+            details = json.dumps(_gym_initial_observation_diagnostics(self.env), ensure_ascii=False)
+            if (self.execution_error or {}).get("type") == Tau2UserSimulatorFormatError.__name__:
+                raise Tau2UserSimulatorFormatError(f"{exc}; diagnostics={details}") from exc
+            raise RuntimeError(f"{exc}; diagnostics={details}") from exc
         self.user_query = user_query.lstrip("user: ")
         self.task = info_dict["task"]
         self.simulation_run = info_dict["simulation_run"]
         self.policy = info_dict["policy"]
         self.tool_schemas = [tool.openai_schema for tool in info_dict["tools"]]
+        for schema in self.tool_schemas:
+            if schema["function"]["name"] == "done":
+                schema["function"]["description"] = _TAU2_DONE_RULE
         self.tool_schemas.append(CommunicateWithUser.openai_schema())
         self.ground_truth = str(self.task.evaluation_criteria)
         self.user_scenario = self.task.user_scenario
@@ -343,6 +433,10 @@ class _GymTau2BenchEnv:
     def tool_call(self, tool_name: str, arguments: dict) -> str:
         if self.terminated:
             return "Task Terminated"
+        if tool_name == "done":
+            # Reuse Gym's terminal state; a write result is not a finished conversation.
+            # Error results keep AgentLoop running instead of triggering its stop-tool path.
+            return f"Error: USER_CONVERSATION_ACTIVE. {_TAU2_DONE_RULE}"
 
         if tool_name == CommunicateWithUser.name:
             obs, reward, terminated, truncated, info = self.env.step(arguments["content"])
@@ -351,6 +445,8 @@ class _GymTau2BenchEnv:
             obs, reward, terminated, truncated, info = self.env.step(json.dumps(action))
 
         self.terminated = terminated
+        if terminated and self.execution_error is not None:
+            return "Task Terminated"
         return _clean_obs(obs)
 
     def append_agent_message(self, content: str) -> None:
@@ -383,6 +479,81 @@ class _GymTau2BenchEnv:
             return SimulationRun.model_validate_json(simulation_run_json)
         except Exception:
             return None
+
+
+def _wait_for_gym_initial_observation(env: Any, observation: Any) -> str:
+    """Bound first-message publication after reset returns, not reset/step themselves."""
+    initial = str(observation or "")
+    if initial.strip():
+        return initial
+
+    agent = getattr(env, "_agent", None)
+    agent_lock = getattr(agent, "_lock", None)
+    format_observation = getattr(env, "_format_observation", None)
+    simulation_done = getattr(env, "_simulation_done", None)
+    if agent is None or agent_lock is None or not callable(format_observation):
+        raise RuntimeError("Tau2 AgentGymEnv returned an empty initial observation")
+
+    deadline = time.monotonic() + _GYM_INITIAL_OBSERVATION_TIMEOUT_SECONDS
+    while True:
+        if simulation_done is not None and simulation_done.is_set():
+            raise RuntimeError("Tau2 AgentGymEnv ended before publishing its initial observation")
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Tau2 AgentGymEnv timed out waiting for its initial observation")
+
+        acquired = agent_lock.acquire(timeout=remaining)
+        if not acquired:
+            raise RuntimeError("Tau2 AgentGymEnv timed out waiting for its initial observation")
+        try:
+            candidate = str(format_observation(list(agent.observation)) or "")
+        finally:
+            agent_lock.release()
+        if candidate.strip():
+            return candidate
+
+        time.sleep(min(_GYM_INITIAL_OBSERVATION_POLL_SECONDS, remaining))
+
+
+def _gym_initial_observation_diagnostics(env: Any) -> dict[str, Any]:
+    """Snapshot the user side only; never log prompts, raw responses or tool arguments."""
+    from tau2.user.user_simulator import OUT_OF_SCOPE, STOP, TRANSFER
+
+    def preview(text: str, limit: int = 2000) -> str:
+        text = redact_sensitive(text)  # Redact before clipping, including long quoted credentials.
+        return text[:limit] + ("...[truncated]" if len(text) > limit else "")
+
+    orchestrator = getattr(env, "_orchestrator", None)
+    user_state = getattr(orchestrator, "user_state", None)
+    # UserSimulator appends a reply here before validation can reject it. Such a
+    # reply never reaches the orchestrator trajectory or the final SimulationRun.
+    messages = list(getattr(user_state, "messages", ()))
+    last_user = next((message for message in reversed(messages) if message.role == "user"), None)
+    last_user_message = None
+    if last_user is not None:
+        content = last_user.content or ""
+        tool_calls = last_user.tool_calls or []
+        last_user_message = {
+            "content": preview(content) if last_user.content is not None else None,
+            "content_chars": len(content),
+            "stop_markers": [
+                marker for marker in (STOP, TRANSFER, OUT_OF_SCOPE) if marker in content
+            ],
+            "tool_calls": [preview(call.name, 100) for call in tool_calls[:10]],
+            "tool_call_count": len(tool_calls),
+        }
+
+    execution_error = getattr(orchestrator, "_openviking_execution_error", None)
+    if execution_error is not None:
+        execution_error = {**execution_error, "message": preview(execution_error["message"])}
+    return {
+        "termination_reason": getattr(orchestrator, "termination_reason", None),
+        "step_count": getattr(orchestrator, "step_count", None),
+        "num_errors": getattr(orchestrator, "num_errors", None),
+        "last_user_message": last_user_message,
+        "execution_error": execution_error,
+    }
 
 
 class _NativeTau2BenchEnv:

@@ -24,11 +24,9 @@ from openviking.session.train.components.progress import format_label, label_sty
 from openviking.session.train.components.remote import RemoteCaseLoader, RemoteRolloutExecutor
 from openviking.session.train.components.report_builder import PipelineReportBuilder
 from openviking.session.train.components.reporter import (
-    _accuracy_style,
+    _accuracy_summary_fragments,
     _style_plain,
     emit_run_summary,
-    fmt_percent,
-    fmt_percentage_point_abs,
 )
 from openviking.session.train.components.rollout_artifact_recorder import (
     RolloutArtifactEventRecorder,
@@ -38,6 +36,7 @@ from openviking.session.train.components.session_commit import SessionCommitPoli
 from openviking.session.train.components.snapshotter import ContentHashPolicySnapshotter
 from openviking.session.train.context import ExecutionContext, PipelineContext
 from openviking.session.train.domain import (
+    DEFAULT_MAX_ROLLOUT_ITERATIONS,
     Case,
     ExperienceSet,
     Rollout,
@@ -61,7 +60,7 @@ class BatchTrainEvalConfig:
     config_path: str | None = None
     output_path: str | None = None
     keep_default_tools: bool = True
-    max_iterations: int = 30
+    max_iterations: int = DEFAULT_MAX_ROLLOUT_ITERATIONS
     server_url: str | None = None
     api_key: str | None = None
     account_id: str = "default"
@@ -680,30 +679,12 @@ def _load_baseline_cache(path: Path) -> dict[str, Any] | None:
 def _print_baseline_cache_hit(report: dict[str, Any], cache_path: Path) -> None:
     """Print cached baseline info before training starts so users see it immediately."""
     label = str(report.get("rollout_stage") or "baseline_test_rollout")
-    trial_count = int(report.get("trial_count") or 1)
     cache_info = f"(from cache: {cache_path.name})"
     label_text = _style_plain(format_label(label), label_style(label))
-    if trial_count > 1:
-        accuracy_mean = report.get("accuracy_mean")
-        accuracy_std = report.get("accuracy_std")
-        cases_per_trial = report.get("case_count_per_trial") or "varies"
-        print(
-            f"{label_text} baseline_cache_hit=1 "
-            f"accuracy={_style_plain(fmt_percent(accuracy_mean), _accuracy_style(accuracy_mean))} "
-            f"± {_style_plain(fmt_percentage_point_abs(accuracy_std), 'yellow')} "
-            f"trials={trial_count} cases_per_trial={cases_per_trial} "
-            f"{cache_info}"
-        )
-        return
-    accuracy = report.get("accuracy")
-    passed = report.get("passed_count")
-    total = report.get("case_count")
-    print(
-        f"{label_text} baseline_cache_hit=1 "
-        f"accuracy={_style_plain(fmt_percent(accuracy), _accuracy_style(accuracy))} "
-        f"passed={passed}/{total} "
-        f"{cache_info}"
+    summary = "".join(
+        _style_plain(text, style) for text, style in _accuracy_summary_fragments(report)
     )
+    print(f"{label_text} baseline_cache_hit=1 {summary} {cache_info}")
 
 
 def _eval_rollout_stage(kind: str, split: str | None) -> str:

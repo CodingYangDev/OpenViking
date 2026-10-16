@@ -1383,6 +1383,7 @@ class AgentLoop:
         captured_experience_messages: list[dict[str, Any]] | None = None,
         skill_runtime: Any | None = None,
         on_initial_llm_request: Callable[[list[dict], list[dict]], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> tuple[str | None, str | None, list[dict], dict[str, int], int]:
         """
         Run the core agent loop: call LLM, execute tools, repeat until done.
@@ -1401,6 +1402,9 @@ class AgentLoop:
             disabled_tools: Tool names to hide from the model for this request
             openviking_connection: Request-scoped OpenViking identity for tools
             stop_tool_names: Tool names that terminate the loop immediately after execution
+            should_stop: Optional synchronous external termination predicate. Checked before
+                each iteration and after recording a tool batch. External termination returns
+                the recorded results without a final fallback model call or synthesized answer.
             on_plain_text: Optional async callback invoked when the model returns a non-empty
                 plain-text reply (no tool calls). It receives (messages, text, iteration) and
                 must return a PlainTextRouteResult to either deliver the text and continue the
@@ -1471,6 +1475,14 @@ class AgentLoop:
             and str(message.get("content") or "").startswith("[Experience Reminder]")
         }
         stop_tools = set(stop_tool_names or [])
+        stopped_externally = False
+
+        def external_stop_requested() -> bool:
+            nonlocal stopped_externally
+            if not stopped_externally and should_stop is not None and should_stop():
+                stopped_externally = True
+                logger.info("Agent loop stopped by external condition at iteration {}", iteration)
+            return stopped_externally
 
         async def inject_experience_context(proposed_message: dict | None = None) -> bool:
             inserted = False
@@ -1523,6 +1535,8 @@ class AgentLoop:
                 )
 
         while iteration < self.max_iterations:
+            if external_stop_requested():
+                break
             iteration += 1
 
             if context_compact_budget is not None:
@@ -1872,6 +1886,8 @@ class AgentLoop:
                         }
                     )
 
+                if external_stop_requested():
+                    break
                 if any(
                     tool_call.name in stop_tools and _is_stop_tool_result_success(_outcome.result)
                     for _idx, tool_call, _outcome, _duration in results
@@ -1954,7 +1970,17 @@ class AgentLoop:
                     continue
                 break
 
-        if final_content == "" and tools_used and tools_used[-1].get("tool_name") in stop_tools:
+        # Also covers a terminal reply delivered through the plain-text router or
+        # termination on the final allowed iteration. Neither should trigger fallback.
+        if external_stop_requested():
+            return None, None, tools_used, token_usage, iteration
+
+        if (
+            final_content == ""
+            and tools_used
+            and tools_used[-1].get("tool_name") in stop_tools
+            and tools_used[-1].get("execute_success")
+        ):
             pass
         elif final_content is None or (
             isinstance(final_content, str) and not final_content.strip()

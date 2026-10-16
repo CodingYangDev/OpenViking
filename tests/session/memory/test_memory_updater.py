@@ -41,7 +41,7 @@ from openviking.session.memory.utils import (
     parse_memory_file_with_fields,
 )
 from openviking.storage.abstract_overview import parse_abstract_overview
-from openviking_cli.exceptions import NotFoundError
+from openviking_cli.exceptions import ConflictError, NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -867,48 +867,32 @@ class TestMemoryUpdater:
         ]
 
     @pytest.mark.asyncio
-    async def test_apply_operations_skips_case_only_delete_conflicting_with_upsert(self):
-        written_uri = "viking://user/conv-26/memories/entities/person/melanie.md"
-        deleted_uri = "viking://user/conv-26/memories/entities/person/Melanie.md"
-
-        schema = MemoryTypeSchema(
-            memory_type="entities",
-            description="entity memory",
-            directory="viking://user/{{ user_space }}/memories/entities",
-            filename_template="{{ category }}/{{ name }}.md",
-            fields=[],
-            overview_template="overview",
+    @pytest.mark.parametrize("deleted_name", ["melanie.md", "Melanie.md", "melanie.md/"])
+    @pytest.mark.parametrize("retained_kind", ["upsert_operations", "case_references"])
+    async def test_apply_operations_rejects_contradictory_targets_before_side_effects(
+        self, deleted_name, retained_kind
+    ):
+        written_uri = "viking://user/conv-26/memories/cases/melanie.md"
+        deleted_uri = f"viking://user/conv-26/memories/cases/{deleted_name}"
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock()
+        updater._apply_operations = AsyncMock()
+        retained = ResolvedOperation(
+            memory_fields={"case_name": "melanie"}, memory_type="cases", uris=[written_uri]
         )
-        registry = MagicMock()
-        registry.get.return_value = schema
-
-        updater = MemoryUpdater(registry=registry)
-        updater._get_viking_fs = MagicMock(return_value=MagicMock())
-        updater._apply_upsert = AsyncMock(return_value=None)
-        updater._apply_delete = AsyncMock()
-        updater._vectorize_memories = AsyncMock()
-        updater.generate_overview = AsyncMock()
-
         resolved = ResolvedOperations(
-            upsert_operations=[
-                ResolvedOperation(
-                    memory_fields={"category": "person", "name": "melanie"},
-                    memory_type="entities",
-                    uris=[written_uri],
-                )
-            ],
-            delete_file_contents=[
-                MemoryFile(uri=deleted_uri, extra_fields={"memory_type": "entities"})
-            ],
+            upsert_operations=[],
+            delete_file_contents=[MemoryFile(uri=deleted_uri, memory_type="cases")],
             errors=[],
         )
+        setattr(resolved, retained_kind, [retained])
         ctx = RequestContext(user=UserIdentifier("acme", "conv-26"), role=Role.USER)
 
-        result = await updater.apply_operations(operations=resolved, ctx=ctx)
+        with pytest.raises(ConflictError, match="same plan"):
+            await updater.apply_operations(operations=resolved, ctx=ctx)
 
-        assert result.written_uris == [written_uri]
-        assert result.deleted_uris == []
-        updater._apply_delete.assert_not_awaited()
+        updater._get_viking_fs.assert_not_called()
+        updater._apply_operations.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_apply_operations_remaps_deleted_links_to_replacement(self):

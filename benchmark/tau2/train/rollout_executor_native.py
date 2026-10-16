@@ -9,14 +9,18 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from benchmark.tau2.common.tau2_env.tau2_environment import (
+    Tau2UserSimulatorFormatError,
+    _install_tau2_litellm_rate_limit_retry,
+)
 from benchmark.tau2.train._rollout_helpers import (
     _as_tool_input,
     _case_trial,
     _communicate_text_from_tool_input,
+    _failed_tau2_simulator_rollout,
     _is_communicate_with_user,
     _message,
     _metadata_message,
-    _stringify,
     _to_jsonable,
 )
 from benchmark.tau2.train._rollout_helpers import (
@@ -156,6 +160,9 @@ class NativeTau2RolloutExecutor:
                     rollout = await asyncio.to_thread(self._execute_one_sync, case, context, index)
                     progress.complete_one()
                     return rollout
+                except Tau2UserSimulatorFormatError as exc:
+                    progress.fail_one()
+                    return _failed_tau2_simulator_rollout(case, context, exc)
                 except Exception:
                     progress.fail_one()
                     raise
@@ -192,6 +199,7 @@ class NativeTau2RolloutExecutor:
         seed = _case_seed(self.seed, case_index=case_index, eval_trial=trial)
 
         _ensure_tau2_llm_api_bases()
+        _install_tau2_litellm_rate_limit_retry()
 
         from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation
         from tau2.registry import registry
@@ -235,17 +243,17 @@ class NativeTau2RolloutExecutor:
             simulation.reward_info = reward_info
         reward = _to_jsonable(getattr(reward_info, "reward", 0.0))
         evaluation_result = _to_jsonable(reward_info)
-        messages = _build_rollout_messages_from_simulation(
-            simulation=simulation,
-            reward=reward,
-            evaluation_result=evaluation_result,
-        )
+        messages = _build_rollout_messages_from_simulation(simulation=simulation)
+        evaluation = _tau2_evaluation(reward=reward, evaluation_result=evaluation_result)
+        termination_reason = _to_jsonable(getattr(simulation, "termination_reason", None))
+        if termination_reason is not None:
+            evaluation.metadata["termination_reason"] = termination_reason
         memory_context = _memory_context_from_simulation(simulation)
         rollout = Rollout(
             case=case,
             messages=messages,
             policy_snapshot_id=context.policy_snapshot_id,
-            evaluation=_tau2_evaluation(reward=reward, evaluation_result=evaluation_result),
+            evaluation=evaluation,
             metadata={
                 "rollout_backend": "native",
                 "domain": domain,
@@ -263,6 +271,7 @@ class NativeTau2RolloutExecutor:
                 "termination_reason": getattr(simulation, "termination_reason", None),
                 "duration": getattr(simulation, "duration", None),
                 "agent_cost": getattr(simulation, "agent_cost", None),
+                "token_usage": _agent_token_usage_from_simulation(simulation),
                 "user_cost": getattr(simulation, "user_cost", None),
                 "tools_used": _tool_usage_from_simulation(simulation),
                 "memory": memory_context,
@@ -460,9 +469,7 @@ def _register_native_memory_agent(executor: NativeTau2RolloutExecutor) -> str:
                     uri = getattr(match, "uri", "")
                     text, read_error = _read_memory_text(client, match)
                     clean_text = text.strip()
-                    block_text = (
-                        f"Memory {index} ({uri}):\n{clean_text}" if clean_text else ""
-                    )
+                    block_text = f"Memory {index} ({uri}):\n{clean_text}" if clean_text else ""
                     block_chars = len(block_text)
                     budget_used_before = injected_chars_used
                     budget_dropped = False
@@ -595,9 +602,7 @@ def _register_native_memory_agent(executor: NativeTau2RolloutExecutor) -> str:
                     # so it becomes part of the conversation history (visible in messages.json)
                     reminder_prefix = (
                         "[Experience Reminder]\n"
-                        "## Relevant Agent Experience\n\n"
-                        + block
-                        + "\n\n---\n\n"
+                        "## Relevant Agent Experience\n\n" + block + "\n\n---\n\n"
                     )
                     message.content = reminder_prefix + str(message.content or "")
                     self._openviking_memory_contexts.append(block)
@@ -626,14 +631,11 @@ def _register_native_memory_agent(executor: NativeTau2RolloutExecutor) -> str:
                         self._openviking_memory_contexts.append(block)
                         reminder_content = (
                             "[Experience Reminder]\n"
-                            "## Relevant Agent Experience (before write action)\n\n"
-                            + block
+                            "## Relevant Agent Experience (before write action)\n\n" + block
                         )
                         # Inject as a user message so it's part of the conversation history
                         state.messages.append(UserMessage(role="user", content=reminder_content))
-                        assistant_message = self._generate(
-                            state.system_messages + state.messages
-                        )
+                        assistant_message = self._generate(state.system_messages + state.messages)
             contexts = list(getattr(self, "_openviking_memory_contexts", []) or [])
             if contexts:
                 raw_data = dict(getattr(assistant_message, "raw_data", None) or {})
@@ -756,8 +758,6 @@ def _case_seed(base_seed: int, *, case_index: int, eval_trial: Any) -> int:
 def _build_rollout_messages_from_simulation(
     *,
     simulation: Any,
-    reward: Any,
-    evaluation_result: Any,
 ) -> list[Message]:
     messages: list[Message] = []
     pending_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -783,17 +783,7 @@ def _build_rollout_messages_from_simulation(
                 ],
             )
         )
-    reward_jsonable = _to_jsonable(reward)
-    evaluation_jsonable = _to_jsonable(evaluation_result)
-    success = reward_jsonable == 1 or reward_jsonable == 1.0
-    messages.append(
-        _message(
-            "tau2-reward",
-            "user",
-            f"task_success: {success}\ntask_reward: {reward_jsonable}\n"
-            f"evaluation report: {_stringify(evaluation_jsonable)}",
-        )
-    )
+    # Do not append evaluator output as if the user had said it.
     return messages
 
 
@@ -898,6 +888,29 @@ def _simulation_message_to_rollout_messages(
         ]
     content = str(getattr(message, "content", "") or "")
     return [_message(f"tau2-message-{index}", "assistant", content)]
+
+
+def _agent_token_usage_from_simulation(simulation: Any) -> dict[str, int] | None:
+    """Return Agent-only usage; simulator/user and tool messages are never counted."""
+    messages = [
+        message
+        for message in simulation.messages
+        if _role_value(getattr(message, "role", "")) == "assistant"
+    ]
+    if not messages:
+        return None
+    totals = {"prompt_tokens": 0, "completion_tokens": 0}
+    for message in messages:
+        usage = getattr(message, "usage", None)
+        if not isinstance(usage, dict):
+            return None
+        for key in totals:
+            value = usage.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                return None  # A partial trajectory must not masquerade as a complete total.
+            totals[key] += value
+    totals["total_tokens"] = totals["prompt_tokens"] + totals["completion_tokens"]
+    return totals
 
 
 def _tool_usage_from_simulation(simulation: Any) -> list[dict[str, Any]]:

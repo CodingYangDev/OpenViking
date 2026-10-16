@@ -20,6 +20,7 @@ from openviking.session.memory.patch_merge_context_provider import (
     PatchMergeContextProvider,
     PatchMergePatch,
 )
+from openviking.session.memory.streaming_memory_updater import render_operation_after_file
 from openviking.session.train.domain import (
     Policy,
     PolicyPlanItem,
@@ -198,6 +199,17 @@ class PatchMergePolicyOptimizer:
             thinking=self.memory_type == "experiences",
         )
         operations, _ = await orchestrator.run()
+        if self.memory_type == "experiences" and operations is not None:
+            # Plans store complete candidates, not serialized patches. Materialize against
+            # the prefetched source using the same content gate as extraction and writing.
+            schema = provider.get_memory_schemas(context.request_context)[0]
+            for operation in operations.upsert_operations:
+                if operation.memory_type != "experiences":
+                    continue
+                after_file = await render_operation_after_file(
+                    operation, schema=schema, extract_context=extract_context
+                )
+                operation.memory_fields = {**operation.memory_fields, "content": after_file.content}
         return operations
 
 

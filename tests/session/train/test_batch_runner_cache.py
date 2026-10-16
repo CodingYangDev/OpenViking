@@ -353,8 +353,11 @@ def test_print_baseline_cache_hit_formats_as_stage_label(capsys, tmp_path: Path)
         {
             "rollout_stage": "baseline_test_rollout",
             "trial_count": 8,
+            "accuracy": 0.55,
             "accuracy_mean": 0.55,
             "accuracy_std": 0.05,
+            "passed_count": 88,
+            "case_count": 160,
             "case_count_per_trial": 20,
         },
         tmp_path / "airline_test_index-all_trials-8_523a9bffb6c24543.json",
@@ -363,11 +366,13 @@ def test_print_baseline_cache_hit_formats_as_stage_label(capsys, tmp_path: Path)
     output = capsys.readouterr().out
     assert "[BASELINE_TEST_ROLLOUT]" in output
     assert "baseline_cache_hit=1" in output
-    assert "accuracy=" in output
+    assert "accuracy: " in output
     assert "55.00%" in output
-    assert "± " in output
-    assert "5.00pp" in output
-    assert "trials=8 cases_per_trial=20" in output
+    assert "(88/160)" in output
+    assert "±" not in output
+    assert "5.00pp" not in output
+    assert "trials=" not in output
+    assert "cases_per_trial=" not in output
     assert "(from cache: airline_test_index-all_trials-8_523a9bffb6c24543.json)" in output
 
 

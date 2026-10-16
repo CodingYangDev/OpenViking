@@ -166,8 +166,6 @@ def test_tau2_rollout_messages_use_completed_structured_tool_parts():
             }
         ],
         final_content="done",
-        evaluation_result=None,
-        reward=1.0,
     )
 
     assert isinstance(rollout_messages[0].parts[0], TextPart)
@@ -206,8 +204,6 @@ def test_tau2_communicate_with_user_renders_as_dialogue():
             }
         ],
         final_content=None,
-        evaluation_result=None,
-        reward=1.0,
     )
 
     assert rollout_messages[2].role == "assistant"
@@ -231,12 +227,12 @@ def test_tau2_rollout_messages_omit_empty_final_after_done():
         user_prompt="user request",
         tools_used=[{"tool_name": "done", "args": "{}", "result": "Task Terminated"}],
         final_content=None,
-        evaluation_result=None,
-        reward=1.0,
     )
 
     assert "tau2-final" not in {message.id for message in rollout_messages}
-    assert rollout_messages[-1].id == "tau2-reward"
+    assert rollout_messages[-1].parts[0].tool_name == "done"
+    assert rollout_messages[-1].parts[0].tool_output == "Task Terminated"
+    assert "tau2-reward" not in {message.id for message in rollout_messages}
 
 
 def test_tau2_task_terminated_reply_stops_plain_text_loop():
@@ -293,7 +289,7 @@ async def test_tau2_plain_text_router_records_delivered_assistant_message():
     assert user_messages == [("user reply", "visible answer")]
 
 
-def test_tau2_reward_info_is_json_safe_in_rollout_messages_and_evaluation():
+def test_tau2_reward_info_stays_json_safe_in_evaluation_not_dialogue():
     import json
 
     from tau2.data_model.simulation import RewardInfo, RewardType
@@ -311,14 +307,16 @@ def test_tau2_reward_info_is_json_safe_in_rollout_messages_and_evaluation():
         user_prompt="user request",
         tools_used=[],
         final_content="done",
-        evaluation_result=reward_info,
-        reward=1.0,
     )
     evaluation = _tau2_evaluation(reward=1.0, evaluation_result=reward_info)
 
-    reward_message = rollout_messages[-1].content
-    assert "'reward': 1.0" not in reward_message
-    assert '"reward": 1.0' in reward_message
+    assert rollout_messages[-1].id == "tau2-final"
+    assert [message.id for message in rollout_messages] == [
+        "tau2-system",
+        "tau2-user",
+        "tau2-final",
+    ]
+    assert '"reward": 1.0' in evaluation.feedback[0]
     assert '"reward_basis": ["DB"]' in evaluation.feedback[0]
     json.dumps(evaluation.metadata, sort_keys=True)
 
@@ -340,6 +338,7 @@ def test_tau2_litellm_generate_rate_limit_retry_patch(monkeypatch):
 
     class FakeUserSimulator:
         generate = staticmethod(fake_generate)
+        UserSimulator = type("UserSimulator", (), {})
 
     modules = {
         "tau2.utils.llm_utils": FakeLLMUtils,
@@ -871,9 +870,11 @@ async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(
 
     event_loop_thread = threading.get_ident()
     calls = []
+    environments = []
 
     class FakeEnv:
         execution_error = None
+        terminated = False
 
         def _get_reward(self):
             calls.append(("reward", threading.get_ident()))
@@ -894,6 +895,7 @@ async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(
             self.task_id = task_id
             self.data_root = data_root
             self.env = FakeEnv()
+            environments.append(self.env)
             self.policy = "policy"
             self.user_query = "user query"
 
@@ -910,6 +912,9 @@ async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(
     async def fake_run_agent(**kwargs):
         calls.append(("run_agent", threading.get_ident()))
         calls.append(("case_lookup", kwargs.get("case_lookup")))
+        assert kwargs["should_stop"]() is False
+        environments[-1].terminated = True
+        assert kwargs["should_stop"]() is True
         kwargs["initial_llm_request"].update(
             {"messages": [{"role": "user", "content": "initial"}], "tools": []}
         )
@@ -1172,3 +1177,222 @@ async def test_tau2_batch_returns_failed_model_rollout_without_aborting_others(m
     assert results[1].evaluation.passed is True
     assert results[1].metadata["execution_error"] is None
     assert rewards == ["good"]
+
+
+@pytest.fixture
+def initial_observation_env(monkeypatch):
+    from tau2.gym.gym_agent import GymAgent
+
+    from benchmark.tau2.common.tau2_env import tau2_environment as module
+
+    # Use the real observation property, without starting a simulator or model call.
+    agent = GymAgent.__new__(GymAgent)
+    agent._lock = threading.Lock()
+    agent._observation = []
+    clock = SimpleNamespace(now=0.0)
+
+    def sleep(seconds):
+        clock.now += seconds
+
+    def format_observation(messages):
+        assert agent._lock.locked()
+        assert messages is not agent._observation  # Read a snapshot while holding the lock.
+        return "\n".join(messages)
+
+    env = SimpleNamespace(
+        _agent=agent,
+        _simulation_done=threading.Event(),
+        _format_observation=Mock(side_effect=format_observation),
+    )
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep))
+    monkeypatch.setattr(module, "_GYM_INITIAL_OBSERVATION_TIMEOUT_SECONDS", 0.03, raising=False)
+    monkeypatch.setattr(module, "_GYM_INITIAL_OBSERVATION_POLL_SECONDS", 0.01, raising=False)
+    return module, env, clock
+
+
+def test_tau2_initial_observation_default_wait_matches_ported_branch():
+    from benchmark.tau2.common.tau2_env import tau2_environment as module
+
+    assert module._GYM_INITIAL_OBSERVATION_TIMEOUT_SECONDS == 120.0
+
+
+def test_tau2_initial_observation_preserves_nonempty_reply(initial_observation_env):
+    module, env, clock = initial_observation_env
+    assert (
+        module._wait_for_gym_initial_observation(env, "user: already ready")
+        == "user: already ready"
+    )
+    env._format_observation.assert_not_called()
+    assert clock.now == 0.0
+
+
+@pytest.mark.parametrize("initial", ["", "  \n", None])
+def test_tau2_initial_observation_waits_for_publication(initial_observation_env, initial):
+    module, env, clock = initial_observation_env
+
+    def publish(seconds):
+        clock.now += seconds
+        with env._agent._lock:
+            env._agent._observation = ["user: published after reset"]
+
+    module.time.sleep = publish
+    assert module._wait_for_gym_initial_observation(env, initial) == "user: published after reset"
+    assert clock.now == 0.01
+    assert not env._agent._lock.locked()
+
+
+def test_tau2_initial_observation_missing_reply_times_out(initial_observation_env):
+    module, env, clock = initial_observation_env
+    with pytest.raises(RuntimeError, match="timed out waiting for its initial observation"):
+        module._wait_for_gym_initial_observation(env, "")
+    assert clock.now == pytest.approx(0.03)
+    assert not env._agent._lock.locked()
+
+
+def test_tau2_initial_observation_lock_acquisition_is_bounded(initial_observation_env):
+    module, env, _ = initial_observation_env
+    lock = SimpleNamespace(acquire=Mock(return_value=False), release=Mock())
+    env._agent._lock = lock
+    with pytest.raises(RuntimeError, match="timed out waiting"):
+        module._wait_for_gym_initial_observation(env, "")
+    lock.acquire.assert_called_once_with(timeout=0.03)
+    lock.release.assert_not_called()
+    env._format_observation.assert_not_called()
+
+
+def test_tau2_initial_observation_releases_lock_on_formatter_error(initial_observation_env):
+    module, env, _ = initial_observation_env
+    error = ValueError("cannot format observation")
+    env._format_observation.side_effect = error
+    with pytest.raises(ValueError) as raised:
+        module._wait_for_gym_initial_observation(env, "")
+    assert raised.value is error
+    assert not env._agent._lock.locked()
+
+
+def test_tau2_initial_observation_stops_when_simulation_ends(initial_observation_env):
+    module, env, clock = initial_observation_env
+    env._simulation_done.set()
+    with pytest.raises(RuntimeError, match="ended before publishing"):
+        module._wait_for_gym_initial_observation(env, "")
+    env._format_observation.assert_not_called()
+    assert clock.now == 0.0
+
+
+@pytest.mark.parametrize("missing", ["agent", "lock", "formatter"])
+def test_tau2_initial_observation_requires_gym_interface(initial_observation_env, missing):
+    module, env, clock = initial_observation_env
+    if missing == "agent":
+        env._agent = None
+    elif missing == "lock":
+        env._agent._lock = None
+    else:
+        env._format_observation = None
+    with pytest.raises(RuntimeError, match="returned an empty initial observation"):
+        module._wait_for_gym_initial_observation(env, "")
+    assert clock.now == 0.0
+
+
+def test_tau2_gym_reset_uses_late_published_first_message(initial_observation_env, monkeypatch):
+    module, gym, clock = initial_observation_env
+    task = SimpleNamespace(evaluation_criteria=[], user_scenario="scenario")
+    gym._orchestrator = None
+    gym._get_orchestrator = Mock(return_value=SimpleNamespace(run=lambda: None))
+    gym.reset = Mock(
+        return_value=("", {"task": task, "simulation_run": "{}", "policy": "policy", "tools": []})
+    )
+    monkeypatch.setattr(module, "AgentGymEnv", lambda **kwargs: gym)
+    monkeypatch.setattr(module, "_install_tau2_litellm_rate_limit_retry", lambda: None)
+    monkeypatch.setattr(module, "_install_tau2_litellm_unknown_cost_suppression", lambda: None)
+
+    def publish(seconds):
+        clock.now += seconds
+        with gym._agent._lock:
+            gym._agent._observation = ["user: hello"]
+
+    module.time.sleep = publish
+    env = module.Tau2BenchEnv("airline", "offline-case")
+    env.reset()
+    assert env.user_query == "hello"
+    assert env.task is task and env.policy == "policy"
+    assert env.execution_error is None
+    gym.reset.assert_called_once_with()
+
+
+@pytest.mark.parametrize("backend", ["vikingbot", "native"])
+def test_tau2_message_builders_preserve_real_reward_text_policy_and_stop(backend):
+    from benchmark.tau2.train.rollout_executor_native import _build_rollout_messages_from_simulation
+    from benchmark.tau2.train.rollout_executor_vikingbot import _build_rollout_messages
+
+    user_text = "task_success: what does this mean? The policy says to confirm first."
+    if backend == "vikingbot":
+        messages = _build_rollout_messages(
+            system_prompt="Obtain confirmation before cancellation.",
+            user_prompt=user_text,
+            tools_used=[
+                {
+                    "tool_name": "communicate_with_user",
+                    "args": {"content": "That is an evaluation field; do you confirm?"},
+                    "result": "###STOP###",
+                }
+            ],
+            final_content=None,
+        )
+    else:
+        messages = _build_rollout_messages_from_simulation(
+            simulation=SimpleNamespace(
+                messages=[
+                    SimpleNamespace(
+                        role="system", content="Obtain confirmation before cancellation."
+                    ),
+                    SimpleNamespace(role="user", content=user_text),
+                    SimpleNamespace(
+                        role="assistant", content="That is an evaluation field; do you confirm?"
+                    ),
+                    SimpleNamespace(role="user", content="###STOP###"),
+                ]
+            )
+        )
+    assert [m.role for m in messages] == ["user", "user", "assistant", "user"]
+    assert messages[0].content == "system:\nObtain confirmation before cancellation."
+    assert messages[1].content == user_text
+    assert messages[-1].content == "###STOP###"
+    assert "tau2-reward" not in {m.id for m in messages}
+
+
+def test_native_executor_keeps_termination_in_structured_evaluation(monkeypatch):
+    import tau2.run
+    from tau2.registry import registry
+
+    from benchmark.tau2.train import rollout_executor_native as native
+    from openviking.session.train.components.trajectory_observation import (
+        trajectory_evaluation_summary,
+    )
+
+    simulation = SimpleNamespace(
+        reward_info=SimpleNamespace(reward=0.0, info={"note": "Simulation stopped at step budget"}),
+        termination_reason="max_steps",
+        messages=[SimpleNamespace(role="user", content="Please update my booking")],
+    )
+    monkeypatch.setattr(native, "_ensure_tau2_llm_api_bases", lambda: None)
+    monkeypatch.setattr(native, "_install_tau2_litellm_rate_limit_retry", lambda: None)
+    monkeypatch.setattr(native, "_resolve_llm_runtime_config", lambda _: ("test", {}, "test", {}))
+    monkeypatch.setattr(registry, "get_tasks_loader", lambda _: lambda: [SimpleNamespace(id="1")])
+    monkeypatch.setattr(tau2.run, "run_task", lambda **kwargs: simulation)
+    case = Case(
+        "case",
+        "update",
+        {"domain": "airline", "task_id": "1", "task_no": 0, "data_split": "train"},
+        Rubric("r", "", []),
+    )
+    rollout = native.NativeTau2RolloutExecutor(memory_enabled=False)._execute_one_sync(
+        case,
+        ExecutionContext("snapshot"),
+        0,
+    )
+    assert [m.content for m in rollout.messages] == ["Please update my booking"]
+    assert rollout.evaluation.metadata["termination_reason"] == "max_steps"
+    assert trajectory_evaluation_summary(rollout.evaluation)["details"] == {
+        "termination_reason": "max_steps",
+        "info": {"note": "Simulation stopped at step budget"},
+    }

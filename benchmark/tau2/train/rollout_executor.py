@@ -21,6 +21,7 @@ from benchmark.tau2.train.rollout_executor_vikingbot import (  # re-export vikin
     _build_rollout_messages,
     _configure_tools,
 )
+from openviking.session.train.domain import DEFAULT_MAX_ROLLOUT_ITERATIONS
 
 Tau2RolloutBackend = Literal["native", "vikingbot"]
 DEFAULT_TAU2_ROLLOUT_BACKEND: Tau2RolloutBackend = "native"
@@ -50,7 +51,7 @@ def make_tau2_rollout_executor(
             config_path=opts.get("config_path") or config_path,
             concurrency=concurrency,
             keep_default_tools=_bool_option(opts.get("keep_default_tools"), default=True),
-            max_iterations=int(opts.get("max_iterations") or 30),
+            max_iterations=int(opts.get("max_iterations") or DEFAULT_MAX_ROLLOUT_ITERATIONS),
             rollout_language=str(opts.get("rollout_language") or rollout_language),
         )
     return NativeTau2RolloutExecutor(

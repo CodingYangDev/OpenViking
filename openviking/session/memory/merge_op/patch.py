@@ -106,13 +106,18 @@ class PatchOp(MergeOpBase):
             return current_value
         return patch_value
 
-    async def apply_exact(self, current_value: Any, patch_value: Any) -> Any:
-        """Apply a patch with the same exact/unique anchors required by extraction.
+    async def apply_checked(
+        self, current_value: Any, patch_value: Any, *, require_exact: bool = False
+    ) -> Any:
+        """Use the shared matcher, but never silently keep only successful blocks.
 
-        Used at validated-content boundaries so fuzzy matching cannot silently rebase
-        an edit onto different data after a concurrent update.
+        A changed read snapshot requires exact anchors to prevent fuzzy rebasing over
+        concurrent edits. Otherwise matching is identical to ordinary JSON patches.
         """
-        from openviking.session.memory.merge_op.patch_handler import unescape_markers
+        from openviking.session.memory.merge_op.patch_handler import (
+            PatchParseError,
+            unescape_markers,
+        )
 
         if self._field_type != FieldType.STRING:
             return await self.apply(current_value, patch_value)
@@ -123,15 +128,27 @@ class PatchOp(MergeOpBase):
         working = current_value
         for index, block in enumerate(patch_value.blocks, start=1):
             search = unescape_markers(block.search)
-            if not search or working.count(search) != 1:
+            match_count = working.count(search) if search else 0
+            details = f"match_count={match_count}, search={search!r}, replace={block.replace!r}"
+            if not search:
+                raise ValueError(f"Patch block {index} requires a non-empty search; {details}")
+            if require_exact and match_count != 1:
                 raise ValueError(
-                    f"Patch block {index} must match exactly once in the current content"
+                    f"Patch block {index} must match exactly once because the field "
+                    f"changed since it was read; {details}"
                 )
             if block.search == block.replace:
                 continue
-            updated = await self.apply(working, StrPatch(blocks=[block]))
+            try:
+                updated = await self.apply(working, StrPatch(blocks=[block]))
+            except PatchParseError as exc:
+                raise ValueError(
+                    f"Patch block {index} failed shared exact/fuzzy matching; {details}"
+                ) from exc
             if updated == working:
-                raise ValueError(f"Patch block {index} did not apply to the current content")
+                raise ValueError(
+                    f"Patch block {index} did not apply to the current content; {details}"
+                )
             working = updated
         return working
 

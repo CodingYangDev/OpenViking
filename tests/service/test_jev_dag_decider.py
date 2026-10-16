@@ -228,6 +228,67 @@ async def test_generic_jev_client_sends_system_one_payload():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra_headers",
+    [
+        {},
+        {"ark-beta-systemone-api": "true", "X-Test-Trace": "decision"},
+        {
+            "ark-beta-systemone-api": "true",
+            "authorization": "Bearer unexpected",
+            "CONTENT-TYPE": "text/plain",
+        },
+    ],
+)
+async def test_generic_jev_client_sends_extra_headers_on_retries(monkeypatch, extra_headers):
+    requests = []
+    clients = []
+    real_async_client = httpx.AsyncClient
+
+    def handle(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(529, json={"error": "busy"})
+        return httpx.Response(200, json={"answers": {"q": {"type": "noul", "noul": 0.9}}})
+
+    def create_client(**kwargs):
+        client = real_async_client(transport=httpx.MockTransport(handle), **kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("openviking.models.jev.httpx.AsyncClient", create_client)
+    config = JevConfig(
+        api_url="https://example.com/api/v1/systemone",
+        api_key="configured-key",
+        model="decision-model",
+        extra_headers=extra_headers,
+        max_retries=1,
+        retry_backoff_seconds=0,
+    )
+    state = [{"role": "user", "content": "Confirmed"}]
+    questions = {"q": {"type": "noul", "instructions": "Has the user confirmed?"}}
+
+    answers = await JevClient(config).evaluate(state=state, questions=questions)
+
+    assert answers == {"q": {"type": "noul", "noul": 0.9}}
+    assert len(requests) == 2
+    for request in requests:
+        assert request.headers.get_list("authorization") == ["Bearer configured-key"]
+        assert request.headers.get_list("content-type") == ["application/json"]
+        for name, value in extra_headers.items():
+            if name.lower() not in {"authorization", "content-type"}:
+                assert request.headers[name] == value
+        assert json.loads(request.content) == {
+            "state": state,
+            "questions": questions,
+            "model": "decision-model",
+        }
+    assert len(clients) == 1
+    assert clients[0].is_closed
+    assert config.extra_headers == extra_headers
+
+
+@pytest.mark.asyncio
 async def test_generic_jev_client_rejects_missing_answers():
     client = JevClient(
         JevConfig(api_url="https://example.com/v1/systemone", api_key="secret"),
@@ -483,3 +544,48 @@ async def test_decider_rechecks_previously_true_and_selected_conditions():
     payload = evaluator.evaluate.await_args.kwargs
     assert len(payload["questions"]) == 3
     assert "previous_slot_values" not in payload["state"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["vlm", "jev"])
+async def test_any_of_is_not_a_model_question_or_external_fact(provider):
+    instance = DagInstance(
+        experience_uri="experience:or",
+        dag=Dag.from_content(
+            compile_dag("""dag = workflow("Alternative conditions")
+a = check("A")
+b = check("B")
+either = any_of(a, b)
+r = tell("Act")
+either.then(r)""")
+        ),
+    )
+    answers = {
+        "slot_0": {"type": "noul", "noul": 1.0},
+        "slot_1": {"type": "noul", "noul": 0.0},
+        "experience_0_relevance": {"type": "score", "score": 4.0},
+    }
+    if provider == "vlm":
+        model = SimpleNamespace(
+            get_completion_async=AsyncMock(return_value=json.dumps({"answers": answers}))
+        )
+        evaluator = LlmDagDecisionEvaluator(model)
+    else:
+        transport = FakeAsyncClient(FakeResponse({"answers": answers}))
+        evaluator = JevClient(
+            JevConfig(api_url="https://example.com/v1/systemone", api_key="offline"),
+            client=transport,
+        )
+    result = await ExperienceDagDecider(
+        config=DagDeciderConfig(provider=provider), evaluator=evaluator
+    ).decide([instance], state=[], select_limit=1)
+    assert result == {"experience:or": {"a": True}}
+    if provider == "vlm":
+        model.get_completion_async.assert_awaited_once()
+        payload = json.loads(model.get_completion_async.await_args.kwargs["messages"][1]["content"])
+    else:
+        assert len(transport.calls) == 1
+        payload = transport.calls[0][1]
+    assert set(payload["questions"]) == {"slot_0", "slot_1", "experience_0_relevance"}
+    instance.merge_slot_values(result["experience:or"])
+    assert [action.slot_name for action in instance.advance()[0]] == ["r"]

@@ -10,7 +10,7 @@ definitions, with discriminator support for polymorphic fields.
 import re
 from typing import Annotated, Any, Dict, List, Optional, Tuple, Type, Union
 
-from pydantic import BaseModel, Field, WithJsonSchema, create_model
+from pydantic import BaseModel, Field, StrictInt, WithJsonSchema, create_model
 from pydantic.config import ConfigDict
 
 from openviking.session.memory.dataclass import (
@@ -262,6 +262,20 @@ class SchemaModelGenerator:
                 ),
             )
 
+        if "cases" in memory_type_fields:
+            field_definitions["selected_case_ids"] = (
+                List[StrictInt],
+                Field(
+                    default_factory=list,
+                    description=(
+                        "Existing Case page_ids explicitly matched to this execution. "
+                        "Read-only selection: no Case content update is required. "
+                        "Choose only relevant loaded Cases, not all search results. "
+                        "Newly created Cases are already associated through their creation."
+                    ),
+                ),
+            )
+
         # Only expose delete_ids when at least one schema supports deletion.
         # add_only schemas (e.g. trajectories) never delete existing records,
         # so excluding this field prevents the LLM from hallucinating fake deletes.
@@ -316,7 +330,9 @@ class SchemaModelGenerator:
                     else:
                         # Single value (not None)
                         return False
-            return len(getattr(self, "delete_ids", [])) == 0
+            return not getattr(self, "delete_ids", []) and not getattr(
+                self, "selected_case_ids", []
+            )
 
         def to_legacy_operations(self) -> Dict[str, Any]:
             """Convert new per-type structure to legacy write_uris/edit_uris format."""

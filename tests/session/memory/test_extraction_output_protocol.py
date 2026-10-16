@@ -23,13 +23,16 @@ from openviking.session.memory.extraction_output_protocol import (
     ExtractionOutputContext,
     create_extraction_output_protocol,
 )
-from openviking.session.memory.extraction_output_protocol.python_protocol import _identifier_alias
+from openviking.session.memory.extraction_output_protocol.python_protocol import (
+    _NESTED_STRING_GUIDANCE,
+    _identifier_alias,
+)
 from openviking.session.memory.memory_isolation_handler import RoleScope
 from openviking.session.memory.memory_type_registry import (
     MemoryTypeRegistry,
     resolve_memory_templates_dir,
 )
-from openviking.session.memory.merge_op import FieldType, MergeOp
+from openviking.session.memory.merge_op import FieldType, MergeOp, PatchOp
 from openviking.session.memory.merge_policy import MEMORY_MERGE_POLICY
 from openviking.session.memory.page_id_map import PageIdMap
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
@@ -280,8 +283,11 @@ def test_python_contract_and_bindings_expose_only_selected_schema_fields():
     assert _bind(protocol, context) == bindings
 
 
-def test_python_contract_includes_link_rules_when_enabled():
+@pytest.mark.parametrize("include_link_example", [True, False])
+def test_python_contract_includes_link_rules_when_enabled(include_link_example):
     context = _context([_preference_schema()], link_enabled=True)
+    assert context.include_link_example is True
+    context.include_link_example = include_link_example
     protocol = create_extraction_output_protocol("python")
 
     contract = protocol.render_contract(context)
@@ -289,7 +295,7 @@ def test_python_contract_includes_link_rules_when_enabled():
     assert "## Link Rules" in contract
     assert "obj.link(target" in contract
     assert "match_text" in contract
-    assert "obj_a.link(" in contract
+    assert ("obj_a.link(" in contract) is include_link_example
     assert "assign the create/set call to a variable first" in contract
 
 
@@ -765,16 +771,23 @@ def test_python_create_uses_fixed_case_experience_schema():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case_name", ["case_a", '案例_"fixed"'])
 @pytest.mark.parametrize(
-    ("existing", "template_index"), [(False, 0), (True, 1), (False, 2), (True, 2)]
+    ("existing", "method"),
+    [(False, "create"), (True, "edit"), (True, "overwrite"), (False, "noop"), (True, "noop")],
 )
 async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
-    case_name, existing, template_index
+    case_name, existing, method
 ):
     from openviking.session.memory.experience.compiler import compile_dag
     from openviking.session.memory.experience.experience_context import (
+        _EXPERIENCE_DAG_EXAMPLE,
         AgentExperienceContextProvider,
+        _trajectory_model_content,
     )
     from openviking.session.train import Case, Rubric, Trajectory
+    from openviking.session.train.components.trajectory_observation import (
+        TRAJECTORY_FORMAT,
+        render_trajectory_content,
+    )
 
     registry = MemoryTypeRegistry(load_schemas=False)
     registry.load_from_yaml(str(resolve_memory_templates_dir() / "experiences.yaml"))
@@ -783,7 +796,7 @@ async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
     old = MemoryFile(
         uri=uri,
         memory_type="experiences",
-        content='dag = workflow("old")\nremind = tell("old reminder")',
+        content=_EXPERIENCE_DAG_EXAMPLE,
         extra_fields={"experience_name": case_name},
     )
     context = _context(
@@ -811,6 +824,9 @@ async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
             )
         ],
     )
+    for trajectory in provider.trajectories:
+        trajectory.metadata["trajectory_format"] = TRAJECTORY_FORMAT
+        trajectory.content = render_trajectory_content(trajectory)
     provider._eval_memory = AsyncMock(
         return_value={
             "experience": (
@@ -838,9 +854,35 @@ async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
         if message["content"].startswith("# Existing Experience")
     )
     assert (old.content if existing else "File not found:") in experience_message
+    assert messages[0]["content"].startswith("# Case and Trajectory Batch\n")
+    assert messages[1] == {"role": "user", "content": experience_message}
+    assert messages[2] == {
+        "role": "user",
+        "content": _trajectory_model_content(provider.trajectories[0].content),
+    }
+    assert messages[3]["content"].startswith("Use exactly one SDK template")
+    assert len(messages) == 4
+    # Only edit/overwrite are full SDK examples. The simple DAG is explicitly read-only
+    # input, and create supplies that source through the compact inline call form.
+    sources = re.findall(r"```text\n(.*?)\n```", instruction, re.DOTALL)
+    assert sources == [_EXPERIENCE_DAG_EXAMPLE]
+    assert instruction.count(_EXPERIENCE_DAG_EXAMPLE) == 1
+    assert "read-only context, not the SDK reply" in instruction
     examples = re.findall(r"```python\n(.*?)\n```", instruction, re.DOTALL)
-    assert len(examples) == 3
-    program = examples[template_index]
+    assert len(examples) == 2
+    create_form = re.search(r"`(sdk\.create_experiences\([^\n]+\))`", instruction).group(1)
+    assert "content='''<complete DAG source>'''" in create_form
+    assert "search='''" in examples[0] and "replace='''" in examples[0]
+    assert "experience.content.overwrite('''" in examples[1]
+    assert sources[0].startswith('dag = workflow("""')
+    assert "For no change, return only `sdk.commit()`." in instruction
+    programs = {
+        "create": create_form.replace("<complete DAG source>", sources[0]) + "\nsdk.commit()",
+        "edit": examples[0],
+        "overwrite": examples[1],
+        "noop": "sdk.commit()",
+    }
+    program = programs[method]
     outer = ast.parse(program)
     assert all(isinstance(statement, ast.Expr) for statement in outer.body)
     assert ast.unparse(outer.body[-1].value) == "sdk.commit()"
@@ -850,28 +892,53 @@ async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
     assert error is None
     assert operations is not None
     changes = operations.model_dump()["experiences"]
-    if template_index == 2:
+    if method == "noop":
         assert changes == []
     else:
         assert len(changes) == 1
         assert changes[0]["experience_name"] == case_name
-        dag_source = changes[0]["content"]
+        dag_source = await PatchOp(FieldType.STRING).apply_checked(
+            old.content if existing else None, changes[0]["content"]
+        )
         assert dag_source.startswith("dag = workflow(")
-        assert "total_requested.then(remind_total_scope)" in dag_source
-        assert "reservations_known.then(remind_total_scope)" not in dag_source
-        assert len(json.loads(compile_dag(dag_source))["nodes"]) == 2
-        assert "re-check which reservations" in dag_source
-        assert "before or after proposed changes" in dag_source
-        assert "current rules and evidence before deciding" in dag_source
+        compiled = json.loads(compile_dag(dag_source))
+        if method == "create":
+            assert "total_requested.then(remind_total_scope)" in dag_source
+            assert "reservations_known.then(remind_total_scope)" not in dag_source
+            assert len(compiled["nodes"]) == 2
+            assert "re-check which reservations" in dag_source
+            assert "before or after proposed changes" in dag_source
+            assert "current rules and evidence before deciding" in dag_source
+        elif method == "edit":
+            assert dag_source == old.content.replace(
+                "whether the available records cover that scope.",
+                "whether the available records cover that scope, and which records are missing.",
+            )
+        else:
+            assert len(compiled["nodes"]) == 6
+            calls = {
+                node.func.id
+                for node in ast.walk(ast.parse(dag_source))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            }
+            assert calls == {"workflow", "check", "ask", "call", "choose", "tell"}
+            assert 'call("get_record_details"' in dag_source
+            assert 'classify_state.case("already_matches", review_existing_state)' in dag_source
+            assert 'classify_state.case("needs_change", review_change_scope)' in dag_source
         assert "Before any mutation, retrieve every reservation" not in dag_source
         assert "include reservations that the user also plans to modify" not in dag_source
     assert (
         "Ground information requests, tool-step suggestions and reminders in that evidence"
         in instruction
     )
-    assert "using check/ask/call/choose/tell nodes" in instruction
+    assert "using check/ask/call/choose/tell/any_of nodes" in instruction
+    assert "Either graph shape can be used for creation or updates" in instruction
+    assert "Do not add node types just to match an example" in instruction
+    assert "Do not repeat questions or tool calls already satisfied" not in instruction
+    assert "do not pack a multi-step procedure" not in instruction
+    assert "hypothetical Session" in instruction
     assert "as separate check -> tell subgraphs" not in instruction
-    assert "workflow/check/ask/call/choose/tell" in instruction
+    assert "workflow/check/ask/call/choose/tell/any_of" in instruction
     assert "Do not assign its result to" in instruction
     assert "even when it is an error" in instruction
     assert "permission, network or other read error" in instruction
@@ -892,18 +959,21 @@ def test_experience_schema_allows_focused_node_types_and_tell_successors():
     assert (
         next(field for field in schema.fields if field.name == "content").merge_op == MergeOp.PATCH
     )
-    assert "SDK content editing rules" in contract
+    # SDK rules still come from the common protocol, not a second copy in the schema.
+    assert "SDK content editing rules" not in contract
     assert "Full-replacement SDK syntax is mandatory" not in contract
-    assert "Never call or assign `sdk.existing(...)` yourself" in contract
-    assert "Copy its exact left-hand variable name" in contract
+    assert "Only the system may emit sdk.existing() or sdk.error()." in contract
+    assert "Never overwrite an existing binding." in contract
     assert "existing_experience" not in contract
-    assert "`.content.edit(search=..., replace=...)` or `.content.drop(text=...)`" in contract
-    assert "ensure it matches uniquely" in contract
+    assert "obj.content.edit(search=..., replace=...)" in contract
+    assert "obj.content.drop(text=...)" in contract
+    assert "must occur exactly once" in contract
+    assert "The final SDK program is write-only." in contract
     assert "the stored result must still be a complete valid DAG" in contract
     assert "Do not map every Case requirement or every observed tool call into a node" in contract
-    assert 'ask("one specific question for information needed from the user")' in contract
-    assert 'call("tool_name", "guidance for arguments using the current context")' in contract
-    assert 'choose("one classification question about the current context")' in contract
+    assert 'ask("""one specific question for information needed from the user""")' in contract
+    assert 'call("tool_name", """guidance for arguments using the current context""")' in contract
+    assert 'choose("""one classification question about the current context""")' in contract
     assert "Generated Experiences must not use `choose(...)`" not in contract
     assert 'selector.case("label", target)' in contract
     assert "selector.default(target)" in contract
@@ -914,6 +984,10 @@ def test_experience_schema_allows_focused_node_types_and_tell_successors():
     assert "do not turn that action into a DAG step" not in contract
     assert "replace obsolete action nodes" not in contract
     assert "Preserve supported `ask(...)` and `call(...)` nodes" in contract
+    assert "A simple check -> tell graph is sufficient" in contract
+    assert "Missing user information belongs in ask" in contract
+    assert "Do not repeat questions or tool calls already satisfied" in contract
+    assert "do not pack a multi-step procedure" in contract
     assert "Every root-to-leaf path must end in a `tell(...)` reminder" in contract
     assert "A `tell(...)` may have successors" in contract
     assert "without waiting for the advice to be followed" in contract
@@ -929,7 +1003,7 @@ def test_experience_schema_allows_focused_node_types_and_tell_successors():
 
 
 @pytest.mark.parametrize("phase", ["synthesis", "merge"])
-def test_experience_rule_review_contract_is_shared_by_synthesis_and_merge(phase):
+def test_experience_evidence_rules_are_shared_by_synthesis_and_merge(phase):
     from openviking.session.memory.experience.experience_context import (
         AgentExperienceContextProvider,
     )
@@ -967,30 +1041,99 @@ def test_experience_rule_review_contract_is_shared_by_synthesis_and_merge(phase)
             ],
             memory_registry=registry,
         )
-    context = _context(provider.get_memory_schemas(None), template_context={"language": "en"})
+    context = _context(
+        provider.get_memory_schemas(None), link_enabled=True, template_context={"language": "en"}
+    )
+    provider.configure_output_context(context)
 
     contract = create_extraction_output_protocol("python").render_contract(context)
 
-    assert "focuses attention on concrete rules, facts, or decision distinctions" in contract
-    assert "rather than prescribing the final action" in contract
-    assert "applicability conditions, exceptions, scope, or timing to review" in contract
-    assert "Current authoritative policy and current user/tool evidence" in contract
-    assert "review aid, not a new business rule" in contract
-    assert "Leave the final choice to the agent after review" in contract
+    assert context.link_enabled is True
+    assert "## Link Rules" in contract
+    assert "obj.link(target" in contract
+    assert "Example — linking" not in contract
+    assert "obj_a.link(" not in contract
+    assert _NESTED_STRING_GUIDANCE in contract
+
+    instruction = provider.instruction()
+    assert "prefer edit()/drop()" in instruction
+    assert "overwrite() only when most of the DAG needs rewriting" in instruction
+    assert "one complete valid DAG" in instruction
+    assert "Replace the whole content field" not in instruction
+    assert "not a snippet patch" not in instruction
+    assert "Return one full standalone Python DAG" not in instruction
+    assert "must occur exactly once" in contract
+    assert "SDK content editing rules" not in contract
+    assert "Only the system may emit sdk.existing() or sdk.error()." in contract
+    assert "Never overwrite an existing binding." in contract
+    assert "The final SDK program is write-only." in contract
+    assert "prefer the smallest unique edit()/drop()" in contract
+    assert "Keep all still-valid existing constraints." in contract
+    assert "Missing user information belongs in ask" in contract
+    assert "Do not repeat questions or tool calls already satisfied" in contract
+    assert "do not pack a multi-step procedure" in contract
+    assert "Never copy concrete user, reservation, payment, flight" in contract
+    assert "even if the same ID appears in every Trajectory" in contract
+    assert "Refer to the entity by its role in the current request" in contract
+    assert "preserve unaffected rules, node names, and relationships" in contract
+    assert contract.count("AND semantics") == 1
+    assert (
+        "multiple `.then(reminder)` edges require all their predecessors, not just one" in contract
+    )
+    assert "Split independent conditions into separate check nodes" in contract
+    assert "any_of(node_a, node_b, ...)" in contract
+    assert "either = any_of(a, b)" in contract
+    assert "(a OR b) AND confirmed" in contract
+    assert "without a model call" in contract
+    assert "it does not add an alternative trigger" in contract
+    for duplicated_rule in (
+        "Missing user information belongs in ask",
+        "Do not repeat questions or tool calls already satisfied",
+        "do not pack a multi-step procedure",
+        "Never copy a concrete user",
+        "Preserve unaffected node",
+        "with unaffected paths preserved",
+    ):
+        assert duplicated_rule not in instruction
+    rule_text = " ".join(contract.split())
+    for rule in (
+        "External evaluation is authoritative for outcome and requirement compliance",
+        "Do not reinterpret an evaluated failure as success",
+        "evaluator-backed successful comparison behavior takes precedence over the failed "
+        "trajectory's interpretation",
+        "Derive a narrow runtime-observable correction or exception from differing inputs and actions",
+        "A failed trajectory need not independently prove the successful comparison action",
+        "delivered before the relevant decision boundary",
+        "the corresponding failure still occurred",
+        "require a concrete decision-rule or action delta",
+        "Reject paraphrases, stronger wording or extra checklists that preserve the same decision logic",
+        "preserve nearby correct cases",
+        "Do not invent hidden causes, unsupported policy rules or tool capabilities",
+        "A successful comparison alone does not authorize overriding an explicit source rule",
+    ):
+        assert rule_text.count(rule) == 1
+        assert rule not in " ".join(instruction.split())
+    for obsolete in (
+        "rather than prescribing the final action",
+        "Current authoritative policy and current user/tool evidence determine the decision",
+        "Leave the final choice to the agent after review",
+        "Apply this review-oriented wording",
+        "retain the conflict rather than inventing a rule to output a grader literal",
+        "the decision belongs to the agent using current policy and facts",
+    ):
+        assert obsolete not in " ".join((contract + instruction).split())
+    assert "one evidence-backed, actionable correction or verification" in contract
+    assert "applicability conditions, exceptions, scope and timing" in contract
     assert "Do not expand a restriction on one operation to the whole goal" in contract
     assert "check the restriction's scope and other allowed approaches" in contract
     assert "task requirements and constraints" in contract
-    assert "do not decide the plan for it" in contract
     assert 'not just "be careful" or "review the policy"' in contract
     assert "Do not request a full policy recap, lengthy reasoning" in contract
-    assert "when creating or updating reminders" in contract
-    assert "not a previous reminder's unexamined action prescription" in contract
-    assert "Make the reminder actionable and testable" not in contract
-    assert 'ask("one specific question for information needed from the user")' in contract
-    assert 'call("tool_name", "guidance for arguments using the current context")' in contract
+    assert 'ask("""one specific question for information needed from the user""")' in contract
+    assert 'call("tool_name", """guidance for arguments using the current context""")' in contract
     assert "A `tell(...)` may have successors" in contract
     assert "without waiting for the advice to be followed" in contract
-    assert 'choose("one classification question about the current context")' in contract
+    assert 'choose("""one classification question about the current context""")' in contract
     assert "Generated Experiences must not use `choose(...)`" not in contract
     assert 'selector.case("label", target)' in contract
     assert "selector.default(target)" in contract
@@ -1020,7 +1163,7 @@ def test_python_create_populates_hidden_trajectory_fields_from_schema_defaults()
     assert "trajectory_format: str" not in contract
     assert "experience_execution: str" not in contract
     assert "experience_update: str" not in contract
-    assert operations.model_dump()["trajectories"][0]["trajectory_format"] == "ordered_markdown_v2"
+    assert operations.model_dump()["trajectories"][0]["trajectory_format"] == "ordered_markdown_v3"
     assert operations.model_dump()["trajectories"][0]["experience_execution"] == "{}"
     assert operations.model_dump()["trajectories"][0]["experience_update"] == "{}"
 
@@ -1636,13 +1779,13 @@ def test_python_reserved_existing_retry_explains_new_replacement_binding():
     assert "duplicate_1.delete(replacement=canonical)" in retry
 
 
-def test_python_string_literal_retry_pushes_triple_quotes():
+def test_python_string_literal_retry_pushes_outer_triple_single_quotes():
     protocol = create_extraction_output_protocol("python")
 
     retry = protocol.render_format_retry("Line 33: invalid syntax. Perhaps you forgot a comma?")
 
     assert "offending line is shown above" in retry
-    assert 'triple-quoted string ("""...""")' in retry
+    assert "triple-single-quoted string ('''...''')" in retry
 
 
 def test_python_non_string_syntax_error_omits_quote_guidance():
@@ -1672,6 +1815,7 @@ def test_resolution_repair_matches_protocol_output_shape():
     assert "sdk.create_events" in python_repair
     assert "Output only Python code." in python_repair
     assert "JSON object" not in python_repair
+    assert "triple-single-quoted strings ('''...''')" in python_repair
 
 
 def _kebab_schema() -> MemoryTypeSchema:
@@ -2450,7 +2594,8 @@ def test_python_field_edit_and_drop_are_standalone_statements(operation: str):
     assert "must be standalone statements" in error
 
 
-def test_python_delete_replacement_and_links_compile_with_page_id_remapping():
+@pytest.mark.parametrize("include_link_example", [True, False])
+def test_python_delete_replacement_and_links_compile_with_page_id_remapping(include_link_example):
     duplicate = _existing_preference(
         "viking://user/alice/memories/preferences/duplicate.md",
         "duplicate",
@@ -2467,6 +2612,7 @@ def test_python_delete_replacement_and_links_compile_with_page_id_remapping():
         files=[duplicate, project],
         link_enabled=True,
     )
+    context.include_link_example = include_link_example
     protocol = create_extraction_output_protocol("python")
     _bind(protocol, context)
 
@@ -3168,22 +3314,32 @@ def test_python_nested_quote_guidance_example_preserves_inner_code(repair):
         else protocol.render_contract(context)
     )
 
-    assert r'encode each embedded literal """ as \"\"\"' in instruction
+    assert "Inside an outer '''...''' SDK string" in instruction
+    assert 'inner """ delimiters need no escaping' in instruction
+    assert r"Escape each literal ''' as \'\'\'" in instruction
     assert r"each literal backslash as \\" in instruction
+    assert "Escape trailing single quotes" in instruction
     assert "not the enclosing opening and closing delimiters" in instruction
     assert "decoded once" in instruction
+    assert "Never reformat existing source or copied search/drop anchors" in instruction
     if repair:
         assert "rather than deleting or rewriting valid content" in instruction
     else:
-        assert 'ALWAYS use a triple-quoted string ("""...""")' in instruction
+        assert "Use a triple-single-quoted string ('''...''')" in instruction
+        assert "use f'''...''' only when interpolation is needed" in instruction
+        assert "not a restriction on other valid Python quote styles" in instruction
     examples = re.findall(r"```python\n(.*?)\n```", instruction, re.DOTALL)
     example = next(code for code in examples if code.startswith("obj.content.overwrite("))
+    assert example.startswith("obj.content.overwrite('''")
+    assert '\\"' not in example
     outer = ast.parse(example)
     inner = ast.literal_eval(outer.body[0].value.args[0])
     assert inner == 'note = """first line\nsecond line"""'
     ast.parse(inner)
 
 
+@pytest.mark.parametrize("delimiter", ["'''", '"""'])
+@pytest.mark.parametrize("prefix", ["", "f"])
 @pytest.mark.parametrize(
     "content",
     [
@@ -3192,16 +3348,23 @@ def test_python_nested_quote_guidance_example_preserves_inner_code(repair):
         r'note = """C:\\temp\\notes and a literal \\n"""',
         "note = '''first line\nsecond line'''",
         "A trailing literal backslash: " + "\\",
+        "A trailing single quote: '",
+        'A trailing double quote: "',
+        "A run of five quotes: '''''",
+        'A run of five quotes: """""',
     ],
 )
-def test_python_escaped_triple_quoted_content_round_trips(content):
+def test_python_escaped_triple_quoted_content_round_trips(content, delimiter, prefix):
     protocol = create_extraction_output_protocol("python")
     context = _context([_preference_schema()])
-    # Apply the documented encoding to the contents only, once at the outer layer.
-    encoded = content.replace("\\", "\\\\").replace('"""', r"\"\"\"")
+    # Escape only inside the outer string, including quotes touching its closing delimiter.
+    # Other valid delimiters remain accepted, not just the preferred triple-single quotes.
+    encoded = content.replace("\\", "\\\\").replace(delimiter[0], "\\" + delimiter[0])
+    if prefix:
+        encoded = encoded.replace("{", "{{").replace("}", "}}")
     program = (
-        'sdk.create_preferences(topic="""nested""", '
-        f'content="""{encoded}""", score=1)\nsdk.commit()'
+        "sdk.create_preferences(topic='nested', "
+        f"content={prefix}{delimiter}{encoded}{delimiter}, score=1)\nsdk.commit()"
     )
 
     operations, error = protocol.parse(program, context)
@@ -3226,11 +3389,97 @@ def test_python_unescaped_nested_quotes_stay_invalid_and_receive_escape_guidance
     instruction = protocol.render_format_retry(error)
     assert error in instruction
     assert "quote delimiter closed the surrounding string early" in instruction
-    assert r'encode each embedded literal """ as \"\"\"' in instruction
+    assert "Inside an outer '''...''' SDK string" in instruction
+    assert "different valid outer delimiter, escape that delimiter instead" in instruction
     # Rendering guidance must not weaken parsing or silently rewrite an invalid program.
     again, repeated_error = protocol.parse(program, context)
     assert again is None
     assert repeated_error == error
+
+
+def test_outer_triple_single_f_string_interpolates_without_changing_inner_quotes():
+    program = '''label = "确认"
+sdk.create_preferences(topic="nested", score=1,
+    content=f\'\'\'note = """{label}: 用户说了 "yes"。保留 {{braces}}。"""\'\'\')
+sdk.commit()'''
+    operations, error = create_extraction_output_protocol("python").parse(
+        program, _context([_preference_schema()])
+    )
+
+    assert error is None
+    assert operations.model_dump()["preferences"][0]["content"] == (
+        'note = """确认: 用户说了 "yes"。保留 {braces}。"""'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["edit", "drop"])
+async def test_outer_quote_convention_preserves_old_source_in_search_and_drop(method):
+    old_source = "note = '''用户说了 \"yes\"。'''"
+    content = f"# keep this comment\n{old_source}\n# and this one"
+    memory = _existing_preference(
+        "viking://user/alice/memories/preferences/quotes.md", "quotes", content
+    )
+    context = _context([_preference_schema()], files=[memory])
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    # Only escape the transport delimiter; the original single-quoted source is the anchor.
+    anchor = old_source.replace("'''", r"\'\'\'")
+    replacement = 'note = """用户已经明确确认。"""' if method == "edit" else ""
+    args = (
+        f"search='''{anchor}''', replace='''{replacement}'''"
+        if method == "edit"
+        else f"text='''{anchor}'''"
+    )
+    program = f"preferences_1.content.{method}({args})\nsdk.commit()"
+
+    operations, error = protocol.parse(program, context)
+
+    assert error is None
+    patch = operations.model_dump()["preferences"][0]["content"]
+    key = "search" if method == "edit" else "delete"
+    assert patch["blocks"][0][key] == old_source
+    # The shared matcher removes a dropped whole line including its newline.
+    expected = (
+        content.replace(old_source, replacement)
+        if method == "edit"
+        else content.replace(old_source + "\n", "")
+    )
+    assert await PatchOp(FieldType.STRING).apply_checked(content, patch) == expected
+    assert memory.content == content
+
+
+def test_trajectory_prompt_template_uses_outer_triple_single_quotes():
+    from openviking.session.memory.experience.trajectory_context import (
+        AgentTrajectoryContextProvider,
+    )
+
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_yaml(str(resolve_memory_templates_dir() / "trajectories.yaml"))
+    provider = AgentTrajectoryContextProvider(
+        messages=[], source_steps=[], memory_registry=registry
+    )
+    instruction = provider.instruction()
+    program = instruction.split("Use:\n", 1)[1].split("\nthen sdk.commit().", 1)[0]
+    for field, value in [
+        ("trajectory_name", "trial"),
+        ("case_name", "case"),
+        ("outcome", "failure"),
+    ]:
+        program = program.replace(f"{field}=...", f"{field}={value!r}")
+    program = program.replace("<JSON list>", "[]").replace("<JSON object>", "{}")
+    assert "content='''# Session Context" in program
+    operations, error = create_extraction_output_protocol("python").parse(
+        program + "\nsdk.commit()",
+        _context([registry.get("trajectories")], template_context={"language": "en"}),
+    )
+
+    assert error is None
+    assert operations.model_dump()["trajectories"][0]["content"] == (
+        "# Session Context\n<relevant verbatim rules, or empty>\n\n"
+        "# Trajectory\n1. `user` factual step\n..."
+    )
+    assert "triple-single-quoted string ('''...''')" in provider.render_operation_repair([])
 
 
 @pytest.mark.asyncio
@@ -3498,3 +3747,324 @@ async def test_parallel_eval_calls_share_only_the_previous_turn_snapshot(output_
         used,
     )
     assert used[-1]["result"] == {"second": {"content": "trusted"}}
+
+
+def test_known_case_can_be_selected_without_any_memory_write():
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_yaml(str(resolve_memory_templates_dir() / "cases.yaml"))
+    schema = registry.get("cases")
+    fields = {
+        "case_name": "payment_selection",
+        "task_signature": "Choose an eligible payment method",
+        "input": '{"preconditions":["a booking change is requested"]}',
+        "rubric": "[]",
+    }
+    uri = "viking://user/u/memories/cases/payment_selection.md"
+    context = _context(
+        [schema],
+        files=[MemoryFile(uri=uri, memory_type="cases", content="", extra_fields=fields)],
+        template_context={"language": "en"},
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    operations, error = protocol.parse("sdk.commit(cases=[cases_1])", context)
+    assert error is None
+    assert operations is not None
+    entries = operations.model_dump()["cases"]
+    assert entries == []
+    assert operations.selected_case_ids == [context.page_id_map.get_page_id(uri)]
+    assert not operations.is_empty()
+    assert not context.create_page_ids
+
+
+@pytest.mark.parametrize(
+    "branch, reminder",
+    [("already_matches", "review_existing_state"), ("needs_change", "review_change_scope")],
+)
+def test_staged_experience_example_routes_without_repeating_satisfied_steps(branch, reminder):
+    from openviking.session.memory.experience.compiler import compile_dag
+    from openviking.session.memory.experience.dag import Dag, DagInstance
+    from openviking.session.memory.experience.experience_context import (
+        _EXPERIENCE_STAGED_DAG_EXAMPLE,
+    )
+
+    graph = Dag.model_validate_json(compile_dag(_EXPERIENCE_STAGED_DAG_EXAMPLE))
+    run = DagInstance(experience_uri="viking://user/u/memories/experiences/example.md", dag=graph)
+    assert run.advance()[0] == []  # No evidence yet: do not ask or call anything.
+    run.merge_slot_values({"change_requested": True})
+    assert [action.slot_name for action in run.advance()[0]] == ["identify_target"]
+    run.merge_slot_values({"identify_target": True})
+    assert [action.slot_name for action in run.advance()[0]] == ["inspect_record"]
+    run.merge_slot_values({"inspect_record": True})
+    assert [action.slot_name for action in run.advance()[0]] == ["classify_state"]
+    run.merge_slot_values({"classify_state": branch})
+    assert [action.slot_name for action in run.advance()[0]] == [reminder]
+
+    # Matching answers/results already in context skip the question and tool suggestion.
+    satisfied = DagInstance(experience_uri=run.experience_uri, dag=graph)
+    satisfied.merge_slot_values(
+        {
+            "change_requested": True,
+            "identify_target": True,
+            "inspect_record": True,
+            "classify_state": branch,
+        }
+    )
+    assert [action.slot_name for action in satisfied.advance()[0]] == [reminder]
+    assert all(
+        graph.nodes[node_id].slot_provider.type == "TellAgent"
+        for node_id in graph.nodes
+        if not graph.successors(node_id)
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        True,
+        17,
+        1.25,
+        '用户回复 "yes"。\n路径 C:\\tmp\\file；代码包含 """引号"""。',
+        [True, False, None, {"中文": '引号"和反斜杠\\'}],
+        {"items": [], "details": {"value": None}},
+    ],
+)
+def test_sdk_json_dumps_returns_a_json_string_without_changing_field_types(value):
+    context = _context([_profile_schema()])
+    program = f"payload = sdk.json_dumps({value!r})\nsdk.set_profile(content=payload)"
+    operations, error = create_extraction_output_protocol("python").parse(program, context)
+    assert error is None
+    content = operations.model_dump()["profile"][0]["content"]
+    assert isinstance(content, str)
+    assert json.loads(content) == value
+    assert context.schemas[0].fields[0].field_type == FieldType.STRING
+
+
+def test_sdk_json_dumps_handles_rubric_quotes_with_only_python_string_escaping():
+    from openviking.session.memory.experience.rubric import snapshot_rubric_results
+
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_yaml(str(resolve_memory_templates_dir() / "trajectories.yaml"))
+    schema = registry.get("trajectories")
+    context = _context([schema], template_context={"language": "en"})
+    program = r'''sdk.create_trajectories(
+        trajectory_name="trial", case_name="case", outcome="failure", content="""Observed steps""",
+        evaluation_criteria=sdk.json_dumps([
+            {"id": "confirmation", "passed": True,
+             "evidence": """用户先说了 "yes"。
+然后执行操作；路径 C:\\tmp\\file。"""},
+            {"id": "eligibility", "passed": None, "evidence": """No result was observed."""}
+        ]),
+        experience_effects=sdk.json_dumps({"positive_ids": [], "negative_ids": [], "weak_ids": []})
+)
+sdk.commit()'''
+    operations, error = create_extraction_output_protocol("python").parse(program, context)
+    assert error is None
+    result = operations.model_dump()["trajectories"][0]
+    assert isinstance(result["evaluation_criteria"], str)
+    definitions = [
+        {"id": "confirmation", "description": "Obtain confirmation before the action."},
+        {"id": "eligibility", "description": "Check eligibility."},
+    ]
+    snapshot = snapshot_rubric_results(result["evaluation_criteria"], definitions)
+    assert len(snapshot) == 2
+    assert snapshot[0] == {
+        **definitions[0],
+        "passed": True,
+        "evidence": '用户先说了 "yes"。\n然后执行操作；路径 C:\\tmp\\file。',
+    }
+    assert snapshot[1]["passed"] is None
+    assert json.loads(result["experience_effects"]) == {
+        "positive_ids": [],
+        "negative_ids": [],
+        "weak_ids": [],
+    }
+    assert (
+        next(f for f in schema.fields if f.name == "evaluation_criteria").field_type
+        == FieldType.STRING
+    )
+
+
+def test_sdk_json_dumps_can_overwrite_an_existing_json_string_field():
+    uri = "viking://user/u/memories/preferences/options.md"
+    context = _context(
+        [_preference_schema()],
+        files=[_existing_preference(uri, "options", '{"old": true}')],
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    operations, error = protocol.parse(
+        'preferences_1.content.overwrite(sdk.json_dumps({"new": True, "quote": """Say "yes"."""}))',
+        context,
+    )
+    assert error is None
+    content = operations.model_dump()["preferences"][0]["content"]
+    assert json.loads(content) == {"new": True, "quote": 'Say "yes".'}
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "sdk.json_dumps()",
+        "sdk.json_dumps([], {})",
+        "sdk.json_dumps(value=[])",
+        "sdk.json_dumps([], ensure_ascii=False)",
+        "sdk.json_dumps([], default=str)",
+        "sdk.json_dumps([], **{})",
+    ],
+)
+def test_sdk_json_dumps_does_not_expose_encoder_options_or_callbacks(expression):
+    operations, error = create_extraction_output_protocol("python").parse(
+        f"sdk.set_profile(content={expression})", _context([_profile_schema()])
+    )
+    assert operations is None
+    assert error
+
+
+@pytest.mark.parametrize("value", ['float("nan")', 'float("inf")', "-1e309", 'b"bytes"'])
+def test_sdk_json_dumps_rejects_values_that_cannot_form_strict_json(value):
+    operations, error = create_extraction_output_protocol("python").parse(
+        f"sdk.set_profile(content=sdk.json_dumps({value}))", _context([_profile_schema()])
+    )
+    assert operations is None
+    assert "sdk.json_dumps" in error
+
+
+@pytest.mark.parametrize(
+    "value", ["preferences_1", "preferences_1.content", '{"memory": preferences_1}']
+)
+def test_sdk_json_dumps_cannot_serialize_memory_objects_or_write_handles(value):
+    uri = "viking://user/u/memories/preferences/options.md"
+    context = _context(
+        [_preference_schema()], files=[_existing_preference(uri, "options", "original")]
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    operations, error = protocol.parse(f"data = sdk.json_dumps({value})\nsdk.commit()", context)
+    assert operations is None
+    assert "sdk.json_dumps" in error
+    assert context.read_file_contents[uri].content == "original"
+
+
+@pytest.mark.parametrize("expression", ['"x" * 63', '"界" * 21', r'"\x00" * 12', "[None] * 20"])
+def test_sdk_json_dumps_bounds_encoded_bytes_not_just_input_length(monkeypatch, expression):
+    monkeypatch.setattr(
+        "openviking.session.memory.extraction_output_protocol.python_protocol._MAX_EXPRESSION_SIZE",
+        64,
+    )
+    operations, error = create_extraction_output_protocol("python").parse(
+        f"sdk.set_profile(content=sdk.json_dumps({expression}))", _context([_profile_schema()])
+    )
+    assert operations is None
+    assert "sdk.json_dumps" in error
+    assert "size limit" in error
+
+
+def test_sdk_json_dumps_accepts_output_at_the_existing_size_limit(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.memory.extraction_output_protocol.python_protocol._MAX_EXPRESSION_SIZE",
+        64,
+    )
+    operations, error = create_extraction_output_protocol("python").parse(
+        'sdk.set_profile(content=sdk.json_dumps("x" * 62))', _context([_profile_schema()])
+    )
+    assert error is None
+    content = operations.model_dump()["profile"][0]["content"]
+    assert len(content.encode("utf-8")) == 64
+    assert json.loads(content) == "x" * 62
+
+
+def test_sdk_json_dumps_stops_consuming_encoder_chunks_when_over_budget(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.memory.extraction_output_protocol.python_protocol._MAX_EXPRESSION_SIZE",
+        64,
+    )
+    chunks = []
+
+    def encode(self, value):
+        for chunk in ['"', "x" * 64]:
+            chunks.append(chunk)
+            yield chunk
+        raise AssertionError("must stop before encoding the rest of an oversized value")
+
+    monkeypatch.setattr(json.JSONEncoder, "iterencode", encode)
+    operations, error = create_extraction_output_protocol("python").parse(
+        'sdk.set_profile(content=sdk.json_dumps("x"))', _context([_profile_schema()])
+    )
+    assert operations is None
+    assert "size limit" in error
+    assert len(chunks) == 2
+
+
+def test_sdk_json_dumps_guidance_is_for_python_output_not_json_output():
+    context = _context([_profile_schema()])
+    python_contract = create_extraction_output_protocol("python").render_contract(context)
+    json_contract = create_extraction_output_protocol("json").render_contract(context)
+    assert "sdk.json_dumps(value)" in python_contract
+    assert "returns a JSON string" in python_contract
+    assert "True/False/None" in python_contract
+    assert "not hand-escaped JSON" in python_contract
+    assert "sdk.json_dumps" not in json_contract
+    assert context.schemas[0].fields[0].field_type == FieldType.STRING
+    examples = re.findall(r"```python\n(.*?)\n```", python_contract, re.DOTALL)
+    example = next(code for code in examples if code.startswith("json_text = sdk.json_dumps("))
+    assert "'''The user said \"yes\".'''" in example
+    operations, error = create_extraction_output_protocol("python").parse(
+        example + "\nsdk.set_profile(content=json_text)\nsdk.commit()", context
+    )
+    assert error is None
+    assert json.loads(operations.model_dump()["profile"][0]["content"]) == [
+        {"text": 'The user said "yes".', "ok": True, "missing": None}
+    ]
+
+
+def test_sdk_json_dumps_preserves_case_rubric_string_schema():
+    from openviking.session.memory.experience.rubric import parse_case_rubric
+
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_yaml(str(resolve_memory_templates_dir() / "cases.yaml"))
+    schema = registry.get("cases")
+    context = _context([schema], template_context={"language": "en"})
+    operations, error = create_extraction_output_protocol("python").parse(
+        '''sdk.create_cases(case_name="case", task_signature="Task", input="""Context""",
+            rubric=sdk.json_dumps([
+                {"id": "confirmation", "description": """Obtain an explicit "yes" before acting."""}
+            ]))''',
+        context,
+    )
+    assert error is None
+    result = operations.model_dump()["cases"][0]
+    assert isinstance(result["rubric"], str)
+    assert parse_case_rubric(result["rubric"]) == [
+        {"id": "confirmation", "description": 'Obtain an explicit "yes" before acting.'}
+    ]
+    assert next(f for f in schema.fields if f.name == "rubric").field_type == FieldType.STRING
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ['__import__("json").dumps({})', "json.dumps({})", 'open("untrusted-file")'],
+)
+def test_sdk_json_dumps_does_not_enable_imports_modules_or_io(expression):
+    operations, error = create_extraction_output_protocol("python").parse(
+        f"sdk.set_profile(content=sdk.json_dumps({expression}))", _context([_profile_schema()])
+    )
+    assert operations is None
+    assert "not allowed" in error or "unknown name" in error
+
+
+def test_sdk_json_dumps_rejects_a_lone_surrogate_instead_of_emitting_invalid_utf8():
+    operations, error = create_extraction_output_protocol("python").parse(
+        r'sdk.set_profile(content=sdk.json_dumps("\ud800"))', _context([_profile_schema()])
+    )
+    assert operations is None
+    assert "sdk.json_dumps" in error
+
+
+def test_sdk_json_dumps_is_a_value_expression_not_a_standalone_write():
+    operations, error = create_extraction_output_protocol("python").parse(
+        'sdk.json_dumps({"x": True})', _context([_profile_schema()])
+    )
+    assert operations is None
+    assert "standalone" in error

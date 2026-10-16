@@ -28,6 +28,7 @@ from benchmark.tau2.common.tau2_env.tau2_tool_provider import (
     Tau2BenchToolProvider,
     load_task_id,
 )
+from openviking.session.train.domain import DEFAULT_MAX_ROLLOUT_ITERATIONS
 
 try:
     from vikingbot.agent.loop import AgentLoop
@@ -91,8 +92,7 @@ def _build_agent(config_path: str | None) -> AgentLoop:
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.model,
-        # max_iterations=config.agents.max_tool_iterations,
-        max_iterations=30,
+        max_iterations=DEFAULT_MAX_ROLLOUT_ITERATIONS,
         memory_window=config.agents.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
         exa_api_key=None,

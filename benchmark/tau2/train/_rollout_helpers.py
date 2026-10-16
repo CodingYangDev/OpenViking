@@ -17,7 +17,14 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 from openviking.message import Message, TextPart
-from openviking.session.train import Case, CriterionResult, RubricEvaluation
+from openviking.session.train import (
+    Case,
+    CriterionResult,
+    ExecutionContext,
+    Rollout,
+    RubricEvaluation,
+)
+from openviking.session.train.components.dataset_service import redact_sensitive
 
 
 def _message(
@@ -56,7 +63,9 @@ def _case_trial(case: Case) -> Any:
     return case.input.get("eval_trial", case.input.get("train_trial"))
 
 
-def _tau2_evaluation(*, reward: Any, evaluation_result: Any, source: str = "tau2") -> RubricEvaluation:
+def _tau2_evaluation(
+    *, reward: Any, evaluation_result: Any, source: str = "tau2"
+) -> RubricEvaluation:
     score = _safe_float(reward, default=0.0)
     passed = score >= 1.0
     feedback = [] if passed else ["tau2 environment reward is below 1.0."]
@@ -72,7 +81,9 @@ def _tau2_evaluation(*, reward: Any, evaluation_result: Any, source: str = "tau2
                 passed=passed,
                 score=score,
                 feedback=feedback,
-                evidence=[_stringify(evaluation_jsonable)] if evaluation_jsonable is not None else [],
+                evidence=[_stringify(evaluation_jsonable)]
+                if evaluation_jsonable is not None
+                else [],
                 metadata={"reward": score},
             )
         ],
@@ -81,6 +92,43 @@ def _tau2_evaluation(*, reward: Any, evaluation_result: Any, source: str = "tau2
             "source": source,
             "reward": score,
             "evaluation_result": evaluation_jsonable,
+        },
+    )
+
+
+def _failed_tau2_simulator_rollout(
+    case: Case, context: ExecutionContext, error: Exception
+) -> Rollout:
+    """Keep an invalid simulation in metrics, but let execution_error exclude it from learning."""
+    details = {
+        "source": "tau2_simulator",
+        "type": type(error).__name__,
+        "message": redact_sensitive(str(error)),
+    }
+    return Rollout(
+        case=case,
+        messages=[],
+        policy_snapshot_id=context.policy_snapshot_id,
+        evaluation=_tau2_evaluation(reward=0.0, evaluation_result=details),
+        metadata={
+            **{
+                name: case.input.get(name)
+                for name in (
+                    "domain",
+                    "data_split",
+                    "task_no",
+                    "task_id",
+                    "eval_trial",
+                    "eval_trial_count",
+                    "train_trial",
+                    "train_trial_count",
+                    "original_case_name",
+                )
+            },
+            "execution_error": details,
+            "execution_metadata": dict(context.metadata),
+            "reward": 0.0,
+            "evaluation_result": details,
         },
     )
 

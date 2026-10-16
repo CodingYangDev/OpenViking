@@ -22,7 +22,7 @@ from openviking.session.memory.extraction_output_protocol import (
     create_extraction_output_protocol,
 )
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
-from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
+from openviking.session.memory.memory_type_registry import MemoryTypeRegistry, get_default_registry
 from openviking.session.memory.memory_updater import (
     ExtractContext,
     MemoryUpdater,
@@ -30,14 +30,20 @@ from openviking.session.memory.memory_updater import (
 )
 from openviking.session.memory.merge_op import FieldType, MergeOp
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
-from openviking.session.memory.streaming_memory_updater import clone_operation_for_uri
+from openviking.session.memory.streaming_memory_updater import (
+    MemoryUpdateRequest,
+    StreamingMemoryUpdater,
+    StreamingMemoryUpdaterConfig,
+    clone_operation_for_uri,
+)
 from openviking.session.memory.tools import add_tool_call_pair_to_messages
 from openviking.session.memory.utils import MemoryFileUtils
+from openviking.session.memory.utils.uri import generate_uri
 from openviking.session.memory.validation.create import (
     MemoryCreateConflictError,
     validate_create_operations,
 )
-from openviking_cli.exceptions import NotFoundError
+from openviking_cli.exceptions import ConflictError, NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 
 URI = "viking://user/alice/memories/records/a.md"
@@ -306,13 +312,19 @@ async def test_concurrent_creators_have_one_winner_without_overwrite():
 
 
 @pytest.mark.asyncio
-async def test_create_conflict_not_swallowed_when_strict_extract_errors_is_false():
+@pytest.mark.parametrize(
+    "error",
+    [
+        MemoryCreateConflictError([{"uri": URI, "code": "already_exists"}]),
+        ConflictError("Selected memory cannot be deleted", resource=URI),
+    ],
+)
+async def test_memory_conflict_not_swallowed_when_strict_extract_errors_is_false(error):
     compressor = object.__new__(SessionCompressorV3)
-    compressor._extract_user_memories = AsyncMock(
-        side_effect=MemoryCreateConflictError([{"uri": URI, "code": "already_exists"}])
-    )
-    with pytest.raises(MemoryCreateConflictError):
+    compressor._extract_user_memories = AsyncMock(side_effect=error)
+    with pytest.raises(type(error)) as raised:
         await compressor.extract_long_term_memories([], ctx=CTX, strict_extract_errors=False)
+    assert raised.value is error
 
 
 @pytest.mark.asyncio
@@ -329,28 +341,27 @@ async def test_late_create_race_is_rechecked_at_apply():
 
 
 @pytest.mark.asyncio
-async def test_merge_rejects_existing_create_before_semantic_merge(monkeypatch):
-    from openviking.session.memory.streaming_memory_updater import (
-        MemoryUpdateRequest,
-        StreamingMemoryUpdater,
-    )
-
+async def test_merge_preserves_existing_create_for_locked_apply_guard(monkeypatch):
     fs = MemoryFS({URI: "old"})
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.safe_get_viking_fs", lambda: fs
     )
-    merge = AsyncMock()
+    merge = AsyncMock(side_effect=lambda **kwargs: kwargs["operations"])
     monkeypatch.setattr(
         "openviking.session.memory.streaming_memory_updater.merge_memory_operations", merge
     )
     registry = MemoryTypeRegistry(load_schemas=False)
     registry.register(schema())
     updater = StreamingMemoryUpdater(registry=registry)
+    merged = await updater._merge_requests(
+        [MemoryUpdateRequest(operations=operations(create()), messages=[], ctx=CTX)]
+    )
+    merge.assert_awaited_once()
+    assert merged.upsert_operations[0].create_only
+    writer = guarded_updater(fs)
     with pytest.raises(MemoryCreateConflictError, match="already_exists"):
-        await updater._merge_requests(
-            [MemoryUpdateRequest(operations=operations(create()), messages=[], ctx=CTX)]
-        )
-    merge.assert_not_awaited()
+        await writer.apply_operations(merged, CTX)
+    writer._apply_operations.assert_not_awaited()
     assert fs.files[URI] == "old"
 
 
@@ -671,3 +682,160 @@ async def test_reported_create_conflicts_reset_between_runs():
         resolved, _ = await loop.run()
         assert not resolved.upsert_operations
     assert len(requests) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("memory_type", "fields", "text_field"),
+    [
+        ("entities", {"category": "people", "name": "alice"}, "content"),
+        ("preferences", {"user": "alice", "topic": "communication"}, "content"),
+        (
+            "cases",
+            {
+                "case_name": "payment_selection",
+                "task_signature": "Choose an eligible payment method",
+                "input": '{"summary":"Choose payment"}',
+                "rubric": "[]",
+            },
+            "task_signature",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "outcome", ["merged", "existing_at_merge", "duplicate_output", "late_race"]
+)
+async def test_independent_same_target_creates_merge_before_final_validation(
+    monkeypatch, memory_type, fields, text_field, outcome
+):
+    registry = get_default_registry()
+    uri = generate_uri(registry.get(memory_type), fields, user_space="alice")
+    fs = MemoryFS()
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.safe_get_viking_fs", lambda: fs
+    )
+    monkeypatch.setattr(MemoryUpdater, "_get_viking_fs", lambda self: fs)
+    monkeypatch.setattr(MemoryUpdater, "_sync_resource_refs_for_result", AsyncMock())
+    monkeypatch.setattr(MemoryUpdater, "_vectorize_memories", AsyncMock())
+    monkeypatch.setattr(MemoryUpdater, "generate_overview", AsyncMock())
+    # Only replace model/search work. Batching, merge orchestration, source propagation,
+    # create-intent preservation, locks, validation and the memory write remain real.
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.PatchMergeContextProvider.prefetch",
+        AsyncMock(return_value=[]),
+    )
+    patches = []
+
+    async def model_output(loop):
+        patches.extend(loop.context_provider.patches)
+        candidate = ResolvedOperation(
+            memory_type=memory_type,
+            uris=[uri],
+            memory_fields={**fields, text_field: "First fact. Second fact."},
+        )
+        if outcome == "existing_at_merge":
+            # The merger explicitly read an existing object and returned an update.
+            candidate.old_memory_file_content = MemoryFileUtils.read(
+                await fs.read_file(uri, ctx=CTX), uri=uri
+            )
+            candidate.memory_fields[text_field] = "Existing fact. First fact. Second fact."
+            if memory_type == "cases":
+                # Existing domain Cases are selected without any content update.
+                return ResolvedOperations(
+                    case_references=[candidate],
+                    upsert_operations=[],
+                    delete_file_contents=[],
+                    errors=[],
+                ), []
+        if outcome == "late_race":
+            fs.files[uri] = "Written by another commit after extraction"
+        candidates = [candidate]
+        if outcome == "duplicate_output":
+            candidates.append(candidate.model_copy(deep=True))
+        return operations(*candidates), []
+
+    model = AsyncMock(side_effect=model_output)
+
+    # Preserve the instance argument so the test can inspect both merge proposals.
+    async def run(loop):
+        return await model(loop)
+
+    monkeypatch.setattr(ExtractLoop, "run", run)
+    resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=SimpleNamespace(model="test")))
+    updater = StreamingMemoryUpdater(
+        registry=registry,
+        vlm_resolver=resolver,
+        config=StreamingMemoryUpdaterConfig(max_operations_per_update=2, max_wait_seconds=60),
+    )
+    requests = [
+        MemoryUpdateRequest(
+            operations=operations(
+                ResolvedOperation(
+                    memory_type=memory_type,
+                    uris=[uri],
+                    create_only=True,
+                    memory_fields={**fields, text_field: fact},
+                )
+            ),
+            messages=[],
+            ctx=CTX,
+            metadata={"session_id": f"s{index}", "source_extraction_id": f"source{index}"},
+        )
+        for index, fact in enumerate(["First fact.", "Second fact."])
+    ]
+    for request in requests:
+        await validate_create_operations(request.operations, fs, CTX)
+    if outcome == "existing_at_merge":
+        # Another batch created the target after extraction but before this merge.
+        fs.files[uri] = MemoryFileUtils.write(
+            MemoryFile(
+                uri=uri,
+                memory_type=memory_type,
+                content="Existing fact." if text_field == "content" else "",
+                extra_fields={**fields, text_field: "Existing fact.", "version": 1},
+            )
+        )
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *(updater.submit(request) for request in requests), return_exceptions=True
+            ),
+            timeout=5,
+        )
+    finally:
+        await updater.close()
+    model.assert_awaited_once()
+    assert len(patches) == 2 and {p.target_uri for p in patches} == {uri}
+    assert not fs.lock.locked()
+    if outcome in {"duplicate_output", "late_race"}:
+        assert all(isinstance(result, MemoryCreateConflictError) for result in results)
+        code = "duplicate_target" if outcome == "duplicate_output" else "already_exists"
+        assert all(result.conflicts == [{"uri": uri, "code": code}] for result in results)
+        assert fs.files == (
+            {uri: "Written by another commit after extraction"} if outcome == "late_race" else {}
+        )
+        return
+    assert set(fs.files) == {uri}
+    memory = MemoryFileUtils.read(fs.files[uri], uri=uri)
+    if memory_type == "cases" and outcome == "existing_at_merge":
+        assert memory.extra_fields["task_signature"] == "Existing fact."
+        for result in results:
+            assert result.apply_result.written_uris == [] and result.apply_result.edited_uris == []
+            assert result.operations.upsert_operations == []
+            assert len(result.operations.case_references) == 1
+            assert set(
+                result.operations.case_references[0].memory_fields["source_extraction_ids"]
+            ) == {"source0", "source1"}
+        return
+    assert set(memory.extra_fields["source_extraction_ids"]) == {"source0", "source1"}
+    assert "First fact. Second fact." in memory.plain_content()
+    if outcome == "existing_at_merge":
+        assert "Existing fact." in memory.plain_content()
+    for result in results:
+        assert result.apply_result.written_uris == ([] if outcome == "existing_at_merge" else [uri])
+        assert result.apply_result.edited_uris == ([uri] if outcome == "existing_at_merge" else [])
+        assert result.apply_result.errors == []
+        assert len(result.operations.upsert_operations) == 1
+        assert result.operations.upsert_operations[0].create_only is (
+            outcome != "existing_at_merge"
+        )

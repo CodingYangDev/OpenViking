@@ -15,6 +15,10 @@ from openviking.server.identity import RequestContext
 from openviking.session.archive_store import is_storage_not_found
 from openviking.session.memory import ExtractLoop
 from openviking.session.memory.dataclass import MemoryFile, ResolvedOperations, StoredLink
+from openviking.session.memory.experience.feedback import (
+    injected_experiences,
+    record_experience_feedback_stats,
+)
 from openviking.session.memory.experience.trajectory_context import (
     AgentTrajectoryContextProvider,
     trajectory_source_steps,
@@ -34,6 +38,8 @@ from openviking.session.train.components.trajectory_observation import (
     TRAJECTORY_FORMAT,
     execution_paths,
     observation_evidence,
+    render_trajectory_content,
+    trajectory_evaluation_summary,
     trajectory_source_session_uri,
 )
 from openviking.session.train.domain import Rollout, RolloutAnalysis, Trajectory
@@ -90,6 +96,7 @@ class SessionRolloutAnalyzer:
             gradients=gradients,
             metadata={
                 "case_uri": rollout.metadata.get("case_uri", ""),
+                "task_spec": rollout.metadata.get("task_spec"),
                 "source_session_uri": source_uri,
                 "policy_snapshot_id": rollout.policy_snapshot_id,
                 "experience_execution": _experience_execution_from_rollout(rollout),
@@ -131,7 +138,6 @@ class SessionRolloutAnalyzer:
         raw = await self._read_trajectory(fs, uri, ctx)
         if raw is None:
             paths = execution_paths(analysis.metadata.get("experience_execution") or {})
-            evidence = observation_evidence(rollout.messages, analysis.evaluation, paths)
             source_steps = trajectory_source_steps(rollout.messages)
             outcome = (
                 "unknown"
@@ -146,11 +152,16 @@ class SessionRolloutAnalyzer:
             provider = AgentTrajectoryContextProvider(
                 messages=rollout.messages,
                 case=asdict(rollout.case),
+                task_spec=analysis.metadata.get("task_spec"),
+                external_evaluation=asdict(analysis.evaluation) if analysis.evaluation else None,
                 trajectory_name=identity,
                 case_name=rollout.case.name,
                 outcome=outcome,
                 target_uri=uri,
                 source_steps=source_steps,
+                injected_experiences=injected_experiences(
+                    analysis.metadata.get("experience_execution") or {}
+                ),
                 memory_registry=registry,
                 ctx=ctx,
                 viking_fs=fs,
@@ -179,22 +190,13 @@ class SessionRolloutAnalyzer:
             operation = operations.upsert_operations[0]
             if operation.memory_type != "trajectories" or operation.uris != [uri]:
                 raise ValueError("Trajectory extraction changed the fixed target")
-            evaluation = (
-                None
-                if analysis.evaluation is None
-                else {
-                    "passed": analysis.evaluation.passed,
-                    "score": analysis.evaluation.score,
-                }
-            )
+            evaluation = trajectory_evaluation_summary(analysis.evaluation)
             fields.update(
                 {
                     "outcome": outcome,
+                    "task_spec": analysis.metadata.get("task_spec"),
                     "trajectory_format": TRAJECTORY_FORMAT,
                     "evaluation": evaluation,
-                    "evaluation_criteria": [
-                        item for item in evidence if item.get("kind") == "criterion"
-                    ],
                     "experience_execution": paths,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "experience_update": {
@@ -221,6 +223,17 @@ class SessionRolloutAnalyzer:
                     ).model_dump()
                 )
             operation.memory_fields.update(fields)
+            # Freeze the same learning evidence into the body and structured fields.
+            # Later lifecycle writes must preserve this body, not render it again.
+            operation.memory_fields["content"] = render_trajectory_content(
+                Trajectory(
+                    name=identity,
+                    uri=uri,
+                    outcome=outcome,
+                    content=operation.memory_fields["content"],
+                    metadata={**operation.memory_fields, "source_session_uri": source},
+                )
+            )
             operations.resolved_links = [StoredLink.model_validate(link) for link in links]
             lock = await _acquire_stable_operation_lease(operations, fs, ctx)
             try:
@@ -249,6 +262,8 @@ class SessionRolloutAnalyzer:
         linked_source = trajectory_source_session_uri(memory)
         if memory.extra_fields.get("case_name") != rollout.case.name or linked_source != source:
             raise ValueError("Trajectory identity mismatch")
+        if memory.extra_fields.get("task_spec") != analysis.metadata.get("task_spec"):
+            raise ValueError("Trajectory task identity mismatch")
         metadata = dict(memory.extra_fields)
         metadata["source_session_uri"] = linked_source
         metadata["gate_evidence"] = observation_evidence(
@@ -268,6 +283,9 @@ class SessionRolloutAnalyzer:
         )
         analysis.trajectories = [trajectory]
         analysis.metadata["trajectory_memory"] = memory
+        analysis.metadata["experience_feedback_stats"] = await record_experience_feedback_stats(
+            memory, registry=registry, viking_fs=fs, ctx=ctx
+        )
 
     @staticmethod
     async def _read_trajectory(fs: Any, uri: str, ctx: RequestContext) -> str | None:

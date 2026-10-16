@@ -19,6 +19,10 @@ from openviking.session.train import (
     RubricEvaluation,
     Trajectory,
 )
+from openviking.session.train.components.trajectory_observation import (
+    TRAJECTORY_FORMAT,
+    render_trajectory_content,
+)
 from openviking.session.train.gates.experience import (
     EXPERIENCE_GATE_CONTEXTS_KEY,
 )
@@ -41,7 +45,7 @@ def analysis(name="case_a", session=SESSION, passed=True):
         ],
         policy_snapshot_id="p0",
     )
-    return RolloutAnalysis(
+    result = RolloutAnalysis(
         rollout=rollout,
         trajectories=[
             Trajectory(
@@ -79,6 +83,11 @@ def analysis(name="case_a", session=SESSION, passed=True):
             "case_uri": f"viking://user/u/memories/cases/{name}.md",
         },
     )
+
+    for trajectory in result.trajectories:
+        trajectory.metadata["trajectory_format"] = TRAJECTORY_FORMAT
+        trajectory.content = render_trajectory_content(trajectory)
+    return result
 
 
 def operations(name="case_a", **fields):
@@ -178,7 +187,11 @@ async def test_candidate_copying_session_entity_ids_into_reminder_becomes_noop(m
             return_value=operations(
                 content=(
                     'dag = workflow("scope")\n'
-                    'r = tell("Only modify XEHM4B and 59XX6W unless the user adds another")'
+                    'a = check("A")\n'
+                    'b = check("B")\n'
+                    "either = any_of(a, b)\n"
+                    'r = tell("Only modify XEHM4B and 59XX6W unless the user adds another")\n'
+                    "either.then(r)"
                 )
             )
         ),

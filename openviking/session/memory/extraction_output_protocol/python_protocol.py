@@ -37,9 +37,10 @@ from openviking.session.memory.utils.line_numbers import (
 _PYTHON_FENCE_RE = re.compile(r"```python[ \t]*\r?\n(?P<code>[\s\S]*?)```", re.IGNORECASE)
 _PYTHON_FENCE_START_RE = re.compile(r"```python[ \t]*\r?\n", re.IGNORECASE)
 _HIDDEN_MEMORY_FIELDS = {
+    "feedback_stats",
+    "experience_effect_sources",
     "trajectory_format",
     "evaluation",
-    "evaluation_criteria",
     "experience_execution",
     "experience_update",
     "source_extraction_id",
@@ -74,18 +75,41 @@ _SAFE_STRING_METHODS = {
 # string/list in the server process before schema validation runs; the check is
 # applied to the would-be result size before any allocation.
 _MAX_EXPRESSION_SIZE = 1_000_000
+_MAX_FORMAT_RETRY_EXCERPT_CHARS = 2000
 _REPEATABLE_SEQUENCES = (str, bytes, list, tuple)
-_NESTED_STRING_GUIDANCE = r'''Keep the enclosing triple-quoted SDK string. When its contents include code or quoted text,
-encode each embedded literal """ as \"\"\" and each literal backslash as \\.
-Escape only the string contents, not the enclosing opening and closing delimiters. These
-escapes are decoded once by the outer Python string, so the stored content retains its original
-quotes, backslashes and newlines. Ordinary quotes and real newlines may remain inside the
-triple-quoted string; a backslash that must remain in stored text must be escaped.
-Syntax-only example (use an actual existing-object binding instead of obj, and your own content):
+_NESTED_STRING_GUIDANCE = (
+    "Inside an outer '''...''' SDK string, use "
+    '"""...""" for embedded Python/DAG text literals; '
+    'these inner """ delimiters need no escaping at the outer layer.\n'
+    r"Escape each literal ''' as \'\'\' and each literal backslash as \\."
+    " Escape trailing single quotes that would join the closing delimiter. If retaining a "
+    "different valid outer delimiter, escape that delimiter instead.\n"
+    "Escape only the string contents, not the enclosing opening and closing delimiters. "
+    "Escapes are decoded once by the outer Python string, preserving quotes, backslashes and "
+    "newlines. Never reformat existing source or copied search/drop anchors to enforce this "
+    "convention; their decoded contents must remain verbatim.\n"
+    "Syntax-only example (use an actual existing-object binding instead of obj, and your own content):\n"
+    "```python\n"
+    "obj.content.overwrite('''note = \"\"\"first line\n"
+    "second line\"\"\"''')\n"
+    "```"
+)
+
+_JSON_STRING_GUIDANCE = r"""For fields defined as JSON strings, use sdk.json_dumps(value): it returns a JSON string,
+not a new array/object field type. Write Python data with True/False/None and
+triple-single-quoted text values, not hand-escaped JSON. Pass the returned string directly to a
+listed create/set method, obj.update(), or a string field's overwrite(); do not quote the
+helper call or use str(list_or_dict) as JSON.
+Syntax-only example; use the actual keys and IDs required by the target field:
 ```python
-obj.content.overwrite("""note = \"\"\"first line
-second line\"\"\"""")
-```'''
+json_text = sdk.json_dumps([
+    {"text": '''The user said "yes".''', "ok": True, "missing": None}
+])
+```
+Use json_text as the JSON-string field value in a write call. The helper takes exactly one
+positional argument, no encoder options or callbacks. It supports JSON-serializable data,
+not memory objects or field handles; non-finite numbers and oversized results are rejected.
+This is a local helper in the final output program, not a read-only eval tool call."""
 
 _CONTRACT_PREAMBLE = (
     "## Output Format: restricted Python memory SDK",
@@ -107,17 +131,18 @@ _CONTRACT_PREAMBLE = (
     "from this field. Keep all still-valid existing constraints.",
     "  - obj.content.edit(search=..., replace=...): replace one exact snippet in place.",
     "  - obj.content.drop(text=...): delete one exact snippet in place.",
-    "edit()/drop() may be chained, e.g. obj.content.edit(search='a', replace='b').drop(text='c'); do not mix them with .overwrite() in one chain.",
+    "edit()/drop() may be chained, e.g. obj.content.edit(search='''a''', replace='''b''').drop(text='''c'''); do not mix them with .overwrite() in one chain.",
     "A field attribute is a write handle only; you cannot read it as a string or call str methods on it.",
     "Each search= (and drop text=) MUST be copied verbatim from the current field value shown in the object's sdk.existing(...) binding, and must occur exactly once. If the snippet appears more than once, include an adjacent unique line just before or after it so the match is unique. Never use text from the conversation or the new facts you intend to add as a search anchor; that text is not in the current content and the edit will fail.",
     "edit()/drop() only work on an existing memory's string field; new memories from create/set must be given complete field values.",
     "For existing memories, prefer the smallest unique edit()/drop(). Do not rewrite the entire field just to add or change a few facts; large full-content rewrites are more likely to be truncated or malformed. Use obj.content.overwrite() only when most of the content changes.",
-    'ALWAYS use a triple-quoted string ("""...""") for EVERY natural-language argument '
+    "Use a triple-single-quoted string ('''...''') for every outer SDK natural-language argument "
     "(content, summary, goal, and every search=/replace=/text= snippet), even one-liners. "
-    "Prose frequently contains apostrophes (e.g. Evan's), quotes, colons, or dates that break "
-    'single- or double-quoted literals. Inside triple quotes, escape any literal """ and '
-    "backslash; never put a real newline inside a single- or double-quoted string.",
+    "Use plain strings by default; use f'''...''' only when interpolation is needed, escaping "
+    "literal braces as {{ and }}. This is a generation convention, not a restriction on other "
+    "valid Python quote styles.",
     _NESTED_STRING_GUIDANCE,
+    _JSON_STRING_GUIDANCE,
     "Only keyword arguments are accepted by create, set, and obj.update(); a field's overwrite() takes one positional string. Unknown business fields are ignored.",
     "You may end the program with sdk.commit(); when present it must be the final call. If there are no changes, return only sdk.commit().",
     "Use system-provided existing-object bindings, or assign a fresh alias such as "
@@ -149,6 +174,9 @@ _LINK_RULES = (
     "call .link() on it (see the preamble); existing objects use their provided bindings or aliases.",
     "- Links are optional; only create them when the relationship is explicit in the "
     "conversation. Do not link every memory to every other memory.",
+)
+
+_LINK_EXAMPLE = (
     "",
     "Example — linking a newly created memory to another new one and to an existing binding "
     "(replace create_<type>/fields with methods and fields from the contract above):",
@@ -246,10 +274,26 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         lines = list(_CONTRACT_PREAMBLE)
         for schema in context.schemas:
             lines.extend(self._render_schema_contract(context, schema))
+        if "selected_case_ids" in context.operations_model.model_fields:
+            lines.append(
+                "To associate this execution with existing Cases without writing them, end with "
+                "sdk.commit(cases=[case_object, ...]). Use only explicitly matched, loaded Case "
+                "objects or aliases, never URIs or all search hits. New Cases need no selection."
+            )
+        if "case_sources" in context.operations_model.model_fields:
+            lines.append(
+                "For this Case merge, end with sdk.commit(case_sources=["
+                "(case_object, [patch_number, ...]), ...]). Each tuple associates a final Case "
+                "(loaded or newly created) with its input Patch numbers. Include unchanged Cases; "
+                "cover every proposed Case patch and never attach unrelated patches. "
+                "This also selects existing Cases without writing their content."
+            )
         if not context.link_enabled:
             lines.append("Links are disabled; obj.link(...) is unavailable.")
         else:
             lines.extend(_LINK_RULES)
+            if context.include_link_example:
+                lines.extend(_LINK_EXAMPLE)
         return "\n".join(lines)
 
     def _render_schema_contract(
@@ -371,14 +415,28 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             return None, str(exc)
 
     def render_final_instruction(self, context: ExtractionOutputContext) -> str:
-        del context
+        if "case_sources" in context.operations_model.model_fields:
+            return (
+                "Return the complete restricted Python memory SDK program now. Do not call tools. "
+                "End with sdk.commit(case_sources=[(final_case, [patch_number, ...]), ...]). "
+                "Every proposed Case patch must be associated with its final Case, including "
+                "unchanged existing Cases. Output only Python code."
+            )
+        selection = (
+            " Include matched existing Cases in sdk.commit(cases=[...]) even when no memory "
+            "content changes are needed."
+            if "selected_case_ids" in context.operations_model.model_fields
+            else ""
+        )
         return (
             "You have reached the maximum number of tool call iterations. Do not call any more "
             "tools. Return the complete restricted Python memory SDK program now. Output only "
-            "Python code. If there are no changes, return only sdk.commit()."
+            "Python code."
+            + selection
+            + " If there are no changes or Case selections, return only sdk.commit()."
         )
 
-    def render_format_retry(self, error: str | None = None) -> str:
+    def render_format_retry(self, error: str | None = None, *, failed_content: str = "") -> str:
         detail = f" Parser error: {error}" if error else ""
         tool_guidance = ""
         binding_guidance = ""
@@ -394,9 +452,9 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             quote_guidance = (
                 " If the error is about a string literal, the offending line is shown above; a "
                 "quote, newline or unescaped nested delimiter may have ended the string early. "
-                "Keep valid outer triple quotes and fix escaping inside them. Write every "
+                "Preserve the intended text while fixing the delimiter or escaping. Write every "
                 "natural-language argument (content, summary, goal, and every search=/replace=/"
-                'text= snippet) as a triple-quoted string ("""...""") so embedded quotes and '
+                "text= snippet) as a triple-single-quoted string ('''...''') so embedded quotes and "
                 "newlines stay inside the literal."
             )
         if self.keep_tools_enabled_after_parse_error(error):
@@ -410,13 +468,18 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             "Your previous output was not a valid restricted Python memory SDK program."
             f"{detail}{tool_guidance}{binding_guidance}{quote_guidance} Regenerate the complete "
             "program and output no explanation. "
-            "Put Markdown memory content inside quoted SDK arguments, using triple-quoted strings "
-            '("""...""") for any multi-line or Markdown text so newlines and quotes stay inside '
+            "Make only the changes needed to fix the reported error; preserve all other memory "
+            "operations, Case identities, merge decisions, and source associations. Do not "
+            "re-plan the extraction because formatting failed. Return the complete corrected "
+            "program, not just a repair fragment. "
+            "Put Markdown memory content inside quoted SDK arguments, using triple-single-quoted strings "
+            "('''...''') for any multi-line or Markdown text so newlines and quotes stay inside "
             "the literal; never return it as the program itself. No changes from the invalid program "
             "were applied. A syntax error pointing at prose or punctuation may mean an embedded "
             "quote delimiter closed the surrounding string early; check its escaping rather than "
             "deleting or rewriting valid content to avoid the reported character."
             f"\n\n{_NESTED_STRING_GUIDANCE}"
+            f"{_format_retry_source_excerpt(failed_content, error)}"
         )
 
     def keep_tools_enabled_after_parse_error(self, error: str | None) -> bool:
@@ -454,8 +517,8 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             "For event ranges, pass ranges= with valid in-bounds message indexes that include the "
             "user-role message establishing the event so its owner can be resolved (e.g. "
             'ranges="3-5"). Do not target a disallowed or ambiguous peer. Keep the same event_name '
-            "shown for each failed item so it maps back to that event. Use triple-quoted strings "
-            '("""...""") for every natural-language argument. Output only Python code.'
+            "shown for each failed item so it maps back to that event. Use triple-single-quoted strings "
+            "('''...''') for every natural-language argument. Output only Python code."
             "\n\nResolution issues:\n" + details
         )
 
@@ -630,6 +693,8 @@ class _PythonProgramCompiler:
         self.objects: dict[str, _MemoryObject] = {}
         self.values: dict[str, Any] = {}
         self.links: list[dict[str, Any]] = []
+        self.selected_cases: list[_MemoryObject] = []
+        self.case_sources: list[dict[str, Any]] = []
         self._singleton_identities: set[tuple[str, tuple[tuple[str, Any], ...]]] = set()
         self._next_new_page_id = self._find_next_new_page_id(100)
         self._committed = False
@@ -914,6 +979,26 @@ class _PythonProgramCompiler:
 
     def _call_sdk(self, node: ast.Call, *, statement: bool) -> Any:
         method = node.func.attr
+        if method == "json_dumps":
+            if len(node.args) != 1 or node.keywords:
+                self._error(node, "sdk.json_dumps() accepts exactly one positional argument")
+            value = self._eval(node.args[0])
+            chunks = []
+            size = 0
+            try:
+                # Bound output while encoding: nested containers or escaped strings can
+                # be much larger than their input expressions. Never build it all first.
+                encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False)
+                for chunk in encoder.iterencode(value):
+                    size += len(chunk.encode("utf-8"))
+                    if size > _MAX_EXPRESSION_SIZE:
+                        raise ValueError(
+                            f"serialized JSON exceeds the {_MAX_EXPRESSION_SIZE:,}-byte size limit"
+                        )
+                    chunks.append(chunk)
+            except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+                self._error(node, f"sdk.json_dumps() cannot serialize this value: {exc}")
+            return "".join(chunks)
         if method.startswith(("create_", "set_")):
             verb, type_alias = method.split("_", 1)
             if node.args:
@@ -984,8 +1069,40 @@ class _PythonProgramCompiler:
             return obj
         if method == "commit":
             kwargs = self._eval_keywords(node)
-            if node.args or kwargs or not statement:
-                self._error(node, "sdk.commit() must be an argument-free standalone statement")
+            allowed = (
+                {"cases"}
+                if "selected_case_ids" in self.context.operations_model.model_fields
+                else set()
+            )
+            if "case_sources" in self.context.operations_model.model_fields:
+                allowed.add("case_sources")
+            if node.args or set(kwargs) - allowed or not statement:
+                self._error(
+                    node,
+                    "sdk.commit() accepts only an optional cases= list when Case selection is enabled",
+                )
+            selected = kwargs.get("cases", [])
+            if not isinstance(selected, list) or any(
+                not isinstance(obj, _MemoryObject)
+                or obj.memory_type != "cases"
+                or not obj.existing
+                or obj.deleted
+                for obj in selected
+            ):
+                self._error(
+                    node, "cases= must contain only loaded, non-deleted existing Case objects"
+                )
+            self.selected_cases = selected
+            bindings = kwargs.get("case_sources", [])
+            if not isinstance(bindings, list):
+                self._error(node, "case_sources= must be a list of (Case object, patch IDs) tuples")
+            for binding in bindings:
+                if not isinstance(binding, (list, tuple)) or len(binding) != 2:
+                    self._error(node, "Each case_sources entry must be (Case object, patch IDs)")
+                obj, patch_ids = binding
+                if not isinstance(obj, _MemoryObject) or obj.memory_type != "cases" or obj.deleted:
+                    self._error(node, "case_sources targets must be surviving Case objects")
+                self.case_sources.append({"case_id": obj.page_id, "patch_ids": patch_ids})
             if self._committed:
                 self._error(node, "sdk.commit() may appear only once")
             self._committed = True
@@ -1280,6 +1397,12 @@ class _PythonProgramCompiler:
                     remapped[endpoint] = replacement_id
                 if not skip and remapped["f"] != remapped["t"]:
                     payload["links"].append(remapped)
+        if "selected_case_ids" in payload:
+            payload["selected_case_ids"] = list(
+                dict.fromkeys(obj.page_id for obj in self.selected_cases)
+            )
+        if "case_sources" in payload:
+            payload["case_sources"] = self.case_sources
         try:
             operations = self.context.operations_model.model_validate(payload)
             self.context.create_page_ids = {
@@ -1500,6 +1623,49 @@ def _extract_python_code(content: str) -> str:
             "Python output may contain only one complete ```python code fence"
         )
     return stripped
+
+
+def _format_retry_source_excerpt(content: str, error: str | None) -> str:
+    """Show the compiler's source line and up to three neighbours on each side."""
+    match = re.match(r"Line (\d+):", error or "")
+    if not content or match is None:
+        return ""
+    try:
+        # Use exactly the same fence/whitespace normalization as parse(), so its
+        # line numbers also work for fenced and incomplete-fence responses.
+        code = _extract_python_code(content).replace("\r\n", "\n").replace("\r", "\n")
+        # str.splitlines() also splits Unicode separators inside comments/strings,
+        # whereas Python source line numbers count only physical newlines.
+        lines = code.split("\n")
+        line_index = int(match.group(1)) - 1
+    except ValueError:
+        return ""
+    if not 0 <= line_index < len(lines):
+        return ""
+
+    start, end = max(0, line_index - 3), min(len(lines), line_index + 4)
+    header = (
+        "\n\nPrevious failed program excerpt "
+        "(line numbers and '>' are annotations, not Python):\n```text\n"
+    )
+    footer = "\n```"
+    width = len(str(end))
+    # Bound every line before joining; one huge SDK string must not consume the
+    # budget or hide the marked error line and its neighbouring lines.
+    line_budget = (
+        (_MAX_FORMAT_RETRY_EXCERPT_CHARS - len(header) - len(footer)) // (end - start) - width - 6
+    )
+    excerpt = []
+    marker = " ... [truncated] ... "
+    for index in range(start, end):
+        text = lines[index]
+        if len(text) > line_budget:
+            head = (line_budget - len(marker)) // 2
+            tail = line_budget - len(marker) - head
+            text = text[:head] + marker + text[-tail:]
+        indicator = ">" if index == line_index else " "
+        excerpt.append(f"{indicator} {index + 1:>{width}} | {text}")
+    return header + "\n".join(excerpt) + footer
 
 
 def _is_string_literal_syntax_error(error: str) -> bool:

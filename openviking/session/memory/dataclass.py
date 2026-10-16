@@ -365,6 +365,8 @@ class ResolvedOperation(BaseModel):
 
 
 class ResolvedOperations(BaseModel):
+    # Explicitly selected existing Cases, not writes. Carries normal source-scoping metadata.
+    case_references: List[ResolvedOperation] = Field(default_factory=list, exclude=True)
     upsert_operations: List[ResolvedOperation]
     delete_file_contents: List[MemoryFile]
     errors: List[str]

@@ -10,6 +10,7 @@ from typing import Any
 from openviking.session.memory.experience.dag import (
     DEFAULT_BRANCH_CHOICE,
     MAX_CONTENT_BYTES,
+    AnyOfNode,
     AskUser,
     CallTool,
     Check,
@@ -20,7 +21,7 @@ from openviking.session.memory.experience.dag import (
     TellAgent,
 )
 
-_NODE_FACTORIES = {"ask", "call", "check", "tell", "choose"}
+_NODE_FACTORIES = {"ask", "call", "check", "tell", "choose", "any_of"}
 _RELATION_METHODS = {"then", "if_true", "if_false", "case", "default"}
 _CONTROL_PLANE_TOOLS = {
     "ask_for_advice",
@@ -57,6 +58,12 @@ class _Workflow:
         ids = {draft.name: index for index, draft in enumerate(self.nodes, start=1)}
         predecessors = {draft.name: [] for draft in self.nodes}
         for source in self.nodes:
+            if source.relation_kind in {"if", "choose"} and any(
+                label is None for label, _ in source.targets
+            ):
+                raise ValueError(
+                    "Use branch relations for selectors, and any_of on their selected path nodes"
+                )
             for _, target in source.targets:
                 if target.name is None:
                     raise ValueError("Every referenced node must be assigned first")
@@ -71,8 +78,11 @@ class _Workflow:
                 "id": node_id,
                 "predecessors": predecessors[draft.name],
                 "slot_name": draft.name,
-                "slot_provider": draft.provider,
             }
+            if draft.relation_kind == "any":
+                nodes[node_id] = AnyOfNode(**common)
+                continue
+            common["slot_provider"] = draft.provider
             if draft.relation_kind == "if":
                 targets = {label: ids[target.name] for label, target in draft.targets}
                 nodes[node_id] = IfElseBranch(
@@ -165,6 +175,15 @@ def _compile_source(source: str) -> Dag:
             if len(args) != 1 or not isinstance(args[0], str):
                 raise ValueError("workflow requires one applicability string")
             return _Workflow(applicability=args[0])
+        if name == "any_of":
+            if not args or not all(isinstance(arg, _NodeDraft) for arg in args):
+                raise ValueError("any_of requires one or more node variables")
+            if len({id(arg) for arg in args}) != len(args):
+                raise ValueError("any_of inputs must be distinct")
+            result = _NodeDraft(provider=None, relation_kind="any")
+            for arg in args:
+                arg.targets.append((None, result))
+            return result
         if name == "ask":
             if len(args) != 1 or not isinstance(args[0], str):
                 raise ValueError("ask requires one question string")
@@ -203,6 +222,8 @@ def _compile_source(source: str) -> Dag:
         if not isinstance(source, _NodeDraft) or method not in _RELATION_METHODS or node.keywords:
             raise ValueError("Unsupported DAG relation")
         args = [literal(arg) for arg in node.args]
+        if source.relation_kind == "any" and method != "then":
+            raise ValueError("any_of nodes use then relations, not model-evaluated branches")
         if method == "then":
             if not args or not all(isinstance(target, _NodeDraft) for target in args):
                 raise ValueError("then requires one or more node variables")

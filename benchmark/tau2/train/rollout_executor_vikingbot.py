@@ -12,10 +12,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from benchmark.tau2.common.tau2_env.tau2_environment import Tau2UserSimulatorFormatError
 from benchmark.tau2.train._rollout_helpers import (
     _as_tool_input,
     _case_trial,
     _communicate_text_from_tool_input,
+    _failed_tau2_simulator_rollout,
     _is_communicate_with_user,
     _message,
     _metadata_message,
@@ -34,6 +36,7 @@ from openviking.session.train import (
     RubricEvaluation,
 )
 from openviking.session.train.components.dataset_service import redact_sensitive
+from openviking.session.train.domain import DEFAULT_MAX_ROLLOUT_ITERATIONS
 from openviking.utils.multimodal import redact_image_data_urls
 from openviking_cli.utils import get_logger
 
@@ -299,7 +302,7 @@ class VikingBotTau2RolloutExecutor:
     config_path: str | None = None
     concurrency: int = 20
     keep_default_tools: bool = True
-    max_iterations: int = 30
+    max_iterations: int = DEFAULT_MAX_ROLLOUT_ITERATIONS
     log_timings: bool = True
     rollout_language: str = "default"
 
@@ -325,7 +328,10 @@ class VikingBotTau2RolloutExecutor:
         return list(await asyncio.gather(*(run_one(case) for case in cases)))
 
     async def _execute_one(self, case: Case, context: ExecutionContext) -> Rollout:
-        return await self._execute_one_async(case, context)
+        try:
+            return await self._execute_one_async(case, context)
+        except Tau2UserSimulatorFormatError as exc:
+            return _failed_tau2_simulator_rollout(case, context, exc)
 
     async def _execute_one_async(self, case: Case, context: ExecutionContext) -> Rollout:
         domain = str(case.input["domain"])
@@ -405,17 +411,13 @@ class VikingBotTau2RolloutExecutor:
             timings=timings,
             initial_llm_request=initial_llm_request,
             case_lookup=_tau2_case_lookup(case),
+            should_stop=lambda: provider.env.terminated,
         )
 
         reward = None
         evaluation_result = None
         stage_started_at = time.perf_counter()
-        if execution_error is not None:
-            # Return one failed Rollout, not a failed remote execution that would
-            # make asyncio.gather abort the entire training/evaluation batch.
-            reward = 0.0
-            evaluation_result = dict(execution_error)
-        elif provider.env is not None:
+        if execution_error is None and provider.env is not None:
             try:
                 # Customer-facing content should be sent before `done`; do not append
                 # the post-done final response to tau2's simulator/evaluator.
@@ -436,6 +438,10 @@ class VikingBotTau2RolloutExecutor:
                     "message": str(exc),
                 }
             execution_error = provider.env.execution_error or execution_error
+        if execution_error is not None:
+            # Keep invalid simulations in metrics, but exclude them from learning.
+            reward = 0.0
+            evaluation_result = dict(execution_error)
         timings.record("reward", stage_started_at)
 
         stage_started_at = time.perf_counter()
@@ -446,8 +452,6 @@ class VikingBotTau2RolloutExecutor:
                 user_prompt=user_prompt,
                 tools_used=tools_used,
                 final_content=final_content,
-                evaluation_result=evaluation_result,
-                reward=reward,
                 artifact_created_at=_tau2_policy_current_time_iso(system_prompt),
                 experience_messages=experience_messages,
             ),
@@ -566,8 +570,8 @@ _TAU2_USER_TRANSFER_TOKENS = ("###TRANSFER###",)
 
 
 def _tau2_user_reply_terminates(reply: Any) -> bool:
-    text = str(reply or "")
-    return any(tok in text for tok in _TAU2_USER_STOP_TOKENS + _TAU2_USER_TRANSFER_TOKENS)
+    text = str(reply or "").strip()
+    return text in _TAU2_USER_STOP_TOKENS + _TAU2_USER_TRANSFER_TOKENS + ("###OUT-OF-SCOPE###",)
 
 
 def _is_real_tau2_user_reply(reply: Any) -> bool:
@@ -575,7 +579,6 @@ def _is_real_tau2_user_reply(reply: Any) -> bool:
     return bool(
         text
         and not _tau2_user_reply_terminates(text)
-        and text != "###OUT-OF-SCOPE###"
         and not text.startswith(("Error:", "Error executing ", "Error calling "))
     )
 
@@ -888,6 +891,7 @@ async def _run_agent(
     timings: "_RolloutTiming | None" = None,
     case_lookup: dict[str, Any] | None = None,
     initial_llm_request: dict[str, Any] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ):
     stage_started_at = time.perf_counter()
     message_context = agent.context
@@ -949,6 +953,7 @@ async def _run_agent(
             sender_id=sender_id,
             ov_tools_enable=False,
             stop_tool_names=["done"],
+            should_stop=should_stop,
             on_plain_text=plain_text_router,
             inject_write_experience=False,
             experience_context_provider=runtime.recall if runtime else None,
@@ -977,7 +982,11 @@ async def _run_agent(
         timings.record("agent_loop", stage_started_at)
     final_content, final_reasoning_content, tools_used, token_usage, iteration = result
     memory_content = "\n\n".join(message["content"] for message in experience_messages) or None
-    if _last_tool_name(tools_used) == "done":
+    if (
+        tools_used
+        and tools_used[-1].get("tool_name") == "done"
+        and tools_used[-1].get("execute_success")
+    ):
         final_content = None
         final_reasoning_content = None
     return (
@@ -1113,8 +1122,6 @@ def _build_rollout_messages(
     user_prompt: str,
     tools_used: Any,
     final_content: str | None,
-    evaluation_result: Any,
-    reward: Any,
     artifact_created_at: str | None = None,
     experience_messages: list[dict[str, Any]] | None = None,
 ) -> list[Message]:
@@ -1205,18 +1212,7 @@ def _build_rollout_messages(
         messages.append(
             _message("tau2-final", "assistant", str(final_content), created_at=artifact_created_at)
         )
-    reward_jsonable = _to_jsonable(reward)
-    evaluation_jsonable = _to_jsonable(evaluation_result)
-    success = reward_jsonable == 1 or reward_jsonable == 1.0
-    messages.append(
-        _message(
-            "tau2-reward",
-            "user",
-            f"task_success: {success}\ntask_reward: {reward_jsonable}\n"
-            f"evaluation report: {_stringify(evaluation_jsonable)}",
-            created_at=artifact_created_at,
-        )
-    )
+    # Evaluation travels through Rollout.evaluation / OutcomeEvaluation, not a fake user turn.
     return messages
 
 
@@ -1224,15 +1220,6 @@ def _tau2_evaluation(*, reward: Any, evaluation_result: Any) -> RubricEvaluation
     return _tau2_evaluation_helper(
         reward=reward, evaluation_result=evaluation_result, source="tau2_executor"
     )
-
-
-def _last_tool_name(tools_used: Any) -> str:
-    if not isinstance(tools_used, list) or not tools_used:
-        return ""
-    last = tools_used[-1]
-    if not isinstance(last, dict):
-        return ""
-    return str(last.get("tool_name") or "")
 
 
 # Backwards-compatible alias for existing imports.

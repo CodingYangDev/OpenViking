@@ -3,12 +3,11 @@
 """Session Compressor V3.
 
 V3 keeps the V2 extraction interface while changing user-memory commits to a
-patch-merge flow without directory-level memory locks.  Training cases are not
-extracted by a separate LLM call; they are a normal user-memory ``memory_type``
-(``cases``) emitted by the same ExtractLoop that extracts profile/preferences/
-events/etc.  When such case memories are produced, Session commit persists a
-factual Trajectory; a separate Agent Evolution API later batches pending
-Trajectories into Experience updates.
+patch-merge flow without directory-level memory locks. Reusable task scenarios
+(called Cases) are a normal user-memory type (``cases``), emitted by the same
+ExtractLoop as profile/preferences/events. Multiple concrete tasks may share a
+Case. Session commit persists factual Trajectories; a separate Agent Evolution
+API later batches them into Experience updates.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, List, Optional
 from uuid import uuid4
@@ -40,28 +39,25 @@ from openviking.session.memory.constants import (
 from openviking.session.memory.dataclass import (
     MemoryFile,
     MemoryOperationSkipCode,
-    MemoryOperationSource,
-    ResolvedOperation,
     ResolvedOperations,
     StoredLink,
 )
 from openviking.session.memory.experience.dag import MAX_EVIDENCE_SUMMARY_CHARS
+from openviking.session.memory.experience.rubric import parse_case_rubric
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_type_registry import get_default_registry
-from openviking.session.memory.memory_updater import ExtractContext, write_stored_links
+from openviking.session.memory.memory_updater import write_stored_links
 from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
 )
 from openviking.session.memory.streaming_memory_updater import (
     MemoryUpdateRequest,
-    _acquire_stable_operation_lease,
     get_streaming_memory_updater,
     make_streaming_memory_updater_key,
 )
 from openviking.session.memory.utils.json_parser import JsonUtils
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.utils.uri import generate_uri
-from openviking.session.memory.validation.create import MemoryCreateConflictError
 from openviking.session.skill.session_skill_context_provider import (
     SESSION_SKILL_MEMORY_TYPE,
     load_skill_extract_registry,
@@ -103,6 +99,7 @@ from openviking.session.train.components.trajectory_observation import (
 from openviking.session.train.components.trajectory_optimizer import TrajectoryExperienceOptimizer
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import get_current_telemetry, tracer
+from openviking_cli.exceptions import ConflictError
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.config.agent_evolution_config import DagDeciderConfig
@@ -120,7 +117,6 @@ _AGENT_MEMORY_TYPES = EXECUTION_MEMORY_TYPES
 _TRAINING_CASE_SPEC_PROTOCOL = "openviking.batch_train.case_spec.v1"
 _TRAINING_CASE_SPEC_HEADER = "# OpenViking Batch Training CaseSpec v1"
 _TRAINING_EVALUATION_HEADER = "# OpenViking OutcomeEvaluation"
-_TRAINING_FAST_PATH_MEMORY_TYPES = frozenset({"cases", "trajectories", "experiences"})
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 _EXPERIENCE_SESSION_MAP_PREFIX = "OpenViking-Experience-Session-Map: "
 _EXPERIENCE_UPDATE_FIELD = "experience_update"
@@ -542,25 +538,16 @@ class SessionCompressorV3:
             allowed_memory_types = effective_types - AGENT_EVOLUTION_MEMORY_TYPES
 
         message_list = list(messages)
-        fast_path_case = _training_case_from_first_message(
-            message_list,
-            allowed_memory_types,
-        )
+        task = _training_case_from_first_message(message_list)
+        cases_allowed = allowed_memory_types is None or _CASES_MEMORY_TYPE in allowed_memory_types
         try:
-            if fast_path_case is not None:
-                return await self._commit_training_case_fast_path(
-                    case=fast_path_case,
-                    messages=message_list,
-                    ctx=ctx,
-                    session_id=session_id,
-                    archive_uri=archive_uri or "",
-                    strict_extract_errors=strict_extract_errors,
-                    agent_evolution_enabled=agent_evolution_enabled,
-                    allowed_memory_types=allowed_memory_types,
-                )
-
             result = await self._extract_user_memories(
-                messages=message_list,
+                messages=_training_conversation_messages(message_list),
+                case_rubric_evidence=_case_rubric_model_evidence(
+                    task, _training_evaluation_from_messages(message_list)
+                )
+                if cases_allowed
+                else [],
                 user=user,
                 session_id=session_id,
                 ctx=ctx,
@@ -577,9 +564,6 @@ class SessionCompressorV3:
                 extract_thinking=extract_thinking,
             )
             agent_memory_types = _allowed_agent_memory_types(allowed_memory_types)
-            cases_allowed = (
-                allowed_memory_types is None or _CASES_MEMORY_TYPE in allowed_memory_types
-            )
             session_skills_enabled = self._session_skill_extraction_enabled()
             if (
                 agent_evolution_enabled
@@ -588,6 +572,7 @@ class SessionCompressorV3:
             ):
                 train_result = await self.train_from_extracted_cases(
                     cases=result.cases,
+                    task=task,
                     messages=message_list,
                     ctx=ctx,
                     case_uri_by_name=getattr(result, "case_uri_by_name", {}),
@@ -628,148 +613,13 @@ class SessionCompressorV3:
                 archive_uri=archive_uri or "",
             )
         except Exception as exc:
-            if strict_extract_errors or isinstance(exc, MemoryCreateConflictError):
+            if strict_extract_errors or isinstance(exc, ConflictError):
                 raise
             tracer.error(
                 "V3 memory extraction failed; returning empty result", e=exc, console=False
             )
             return {"contexts": [], "session_skills": []}
 
-    async def _commit_training_case_fast_path(
-        self,
-        *,
-        case: Case,
-        messages: list[Message],
-        ctx: Optional[RequestContext],
-        session_id: Optional[str],
-        archive_uri: str,
-        strict_extract_errors: bool,
-        agent_evolution_enabled: bool,
-        allowed_memory_types: Optional[set[str]],
-    ) -> dict[str, Any]:
-        if ctx is None:
-            logger.warning("No RequestContext provided, skipping training case fast path")
-            return {"contexts": [], "session_skills": []}
-        case_write = await self._write_training_case_memory(
-            case=case,
-            ctx=ctx,
-            archive_uri=archive_uri,
-        )
-        case_result = _applied_memory_result(case_write)
-        contexts = _contexts_from_update_result(case_result)
-        agent_memory_types = _allowed_agent_memory_types(allowed_memory_types)
-        if agent_evolution_enabled and _TRAJECTORIES_MEMORY_TYPE in agent_memory_types:
-            train_result = await self.train_from_extracted_cases(
-                cases=[case],
-                messages=_training_messages_after_case_spec(messages),
-                ctx=ctx,
-                case_uri_by_name={case.name: _first_context_uri(contexts)},
-                session_id=session_id,
-                archive_uri=archive_uri,
-                strict_extract_errors=strict_extract_errors,
-                collect_memory_diff=True,
-                allowed_memory_types=agent_memory_types,
-            )
-        else:
-            train_result = {
-                "case_count": 1,
-                "submitted": 0,
-                "reason": "agent_evolution_disabled",
-            }
-        await self._write_final_memory_diff(
-            archive_uri=archive_uri,
-            ctx=ctx,
-            memory_diffs=[
-                _applied_memory_diff(case_write),
-                train_result.get("memory_diff"),
-            ],
-        )
-        return _v3_extraction_response(
-            contexts=contexts,
-            train_result=train_result,
-            archive_uri=archive_uri,
-        )
-
-    @tracer("train.compressor_v3.fast_path.write_case", ignore_result=True, ignore_args=True)
-    async def _write_training_case_memory(
-        self,
-        *,
-        case: Case,
-        ctx: RequestContext,
-        archive_uri: str,
-    ) -> Any:
-        viking_fs = get_viking_fs()
-        registry = get_default_registry()
-        schema = registry.get(_CASES_MEMORY_TYPE)
-        if schema is None or not schema.enabled:
-            raise RuntimeError("cases memory schema is not available")
-
-        extract_context = ExtractContext([])
-        fields = _case_to_memory_fields(case)
-        uri = generate_uri(
-            memory_type=schema,
-            fields=fields,
-            user_space=getattr(getattr(ctx, "user", None), "user_id", None) or "default",
-            extract_context=extract_context,
-        )
-        source = MemoryOperationSource(
-            extraction_id=(archive_uri.rstrip("/").rsplit("/", 1)[-1] if archive_uri else ""),
-            archive_uri=archive_uri or None,
-            trace_id=tracer.get_trace_id() or None,
-        )
-        operations = ResolvedOperations(
-            upsert_operations=[
-                ResolvedOperation(
-                    memory_fields=fields,
-                    memory_type=_CASES_MEMORY_TYPE,
-                    uris=[uri],
-                    source=source,
-                )
-            ],
-            delete_file_contents=[],
-            errors=[],
-        )
-        lease = await _acquire_stable_operation_lease(operations, viking_fs, ctx)
-        try:
-            # Read after acquiring the Case and overview locks to keep the snapshot current.
-            old_file = None
-            try:
-                raw = await viking_fs.read_file(uri, ctx=ctx)
-                if raw:
-                    old_file = MemoryFileUtils.read(raw, uri=uri)
-            except Exception:
-                old_file = None
-            operations.upsert_operations[0].old_memory_file_content = old_file
-            updater = self._get_or_create_updater(registry, transaction_handle=lease)
-            result = await updater.apply_operations(
-                operations,
-                ctx,
-                extract_context=extract_context,
-                isolation_handler=MemoryIsolationHandler(
-                    ctx,
-                    extract_context,
-                    allowed_memory_types={_CASES_MEMORY_TYPE},
-                ),
-            )
-            memory_diff = None
-            if archive_uri:
-                memory_diff = await self._build_memory_diff(
-                    result=result,
-                    operations=operations,
-                    viking_fs=viking_fs,
-                    ctx=ctx,
-                    archive_uri=archive_uri,
-                )
-        finally:
-            if lease is not None:
-                await viking_fs._async_agfs.pathlock_release(lease)
-        tracer.info(
-            "Training CaseSpec fast path wrote case memory: "
-            f"case={case.name} uri={uri} written={result.written_uris} edited={result.edited_uris}"
-        )
-        return _V3AppliedMemory(result=result, operations=operations, memory_diff=memory_diff)
-
-    @tracer("train.compressor_v3.extract_user_memories", ignore_result=True, ignore_args=True)
     async def _extract_user_memories(
         self,
         messages: List[Message],
@@ -785,6 +635,7 @@ class SessionCompressorV3:
         allowed_peer_ids: Optional[set[str]] = None,
         event_search_tags: Optional[List[str]] = None,
         extraction_context: str = "",
+        case_rubric_evidence: list[str] | None = None,
         *,
         extract_max_iterations: int = DEFAULT_EXTRACT_MAX_ITERATIONS,
         extract_thinking: bool = False,
@@ -822,6 +673,7 @@ class SessionCompressorV3:
             messages=messages,
             latest_archive_overview=latest_archive_overview,
             extraction_context=extraction_context,
+            case_rubric_evidence=case_rubric_evidence,
             isolation_handler=None,
             ctx=ctx,
             viking_fs=viking_fs,
@@ -913,6 +765,7 @@ class SessionCompressorV3:
         contexts = _contexts_from_update_result(result)
         canonical_cases = await _canonical_cases_from_update_result(
             operations=patch_operations,
+            requested_operations=operations,
             result=result,
             viking_fs=viking_fs,
             ctx=ctx,
@@ -1057,6 +910,7 @@ class SessionCompressorV3:
         self,
         *,
         cases: list[Case],
+        task: Case | None = None,
         messages: list[Message],
         ctx: Optional[RequestContext],
         case_uri_by_name: dict[str, str] | None = None,
@@ -1133,6 +987,7 @@ class SessionCompressorV3:
                     metadata={
                         "source_session_uri": archive_uri,
                         "case_uri": case_uri,
+                        "task_spec": asdict(task) if task is not None else None,
                         "experience_execution": experience_execution,
                     },
                 )
@@ -1197,7 +1052,7 @@ class SessionCompressorV3:
         lease_seconds: int = 900,
         on_progress: Callable[[dict[str, int]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
-        """Phase 2: synthesize one Experience update for each claimed Case."""
+        """Phase 2: update each claimed Case's Experience through the shared trainer."""
         if max_cases <= 0:
             raise ValueError("max_cases must be > 0")
         if lease_seconds <= 0:
@@ -1253,23 +1108,15 @@ class SessionCompressorV3:
                         finalize_lock=finalize_lock,
                     )
                     terminal_state = "applied" if result["written_experience_uris"] else "no_op"
-                    for memory in claimed:
-                        await self._write_trajectory_update_state(
-                            viking_fs=viking_fs,
-                            memory=memory,
-                            ctx=ctx,
-                            state=terminal_state,
-                            batch_id=batch_id,
-                            experience_uri=result["experience_uri"],
-                        )
                     return {**result, "state": terminal_state}
                 except Exception as exc:
                     tracer.error(
                         f"Experience learning skipped Case {case_name}", e=exc, console=False
                     )
+                    written_uris = []
                     for memory in claimed:
                         try:
-                            await self._write_trajectory_update_state(
+                            updated = await self._write_trajectory_update_state(
                                 viking_fs=viking_fs,
                                 memory=memory,
                                 ctx=ctx,
@@ -1277,6 +1124,10 @@ class SessionCompressorV3:
                                 batch_id=batch_id,
                                 error=str(exc),
                             )
+                            # An earlier chunk may already have completed successfully.
+                            state = _trajectory_update_state(updated)
+                            if state["state"] == "applied" and state.get("experience_uri"):
+                                written_uris.append(state["experience_uri"])
                         except Exception as state_exc:
                             tracer.info(
                                 "Failed to persist Trajectory failure state: "
@@ -1288,7 +1139,7 @@ class SessionCompressorV3:
                         "experience_uri": _experience_uri_for_case(
                             registry, case_name=case_name, ctx=ctx
                         ),
-                        "written_experience_uris": [],
+                        "written_experience_uris": list(dict.fromkeys(written_uris)),
                         "state": "failed",
                         "error": str(exc),
                     }
@@ -1371,8 +1222,6 @@ class SessionCompressorV3:
         )
         target_uri = _experience_uri_for_case(registry, case_name=case_name, ctx=ctx)
         signals = []
-        analyses = []
-        source_session_uris = []
         for memory in memories:
             source_session_uri = trajectory_source_session_uri(memory)
             metadata = dict(memory.extra_fields)
@@ -1411,8 +1260,6 @@ class SessionCompressorV3:
                 },
                 rollout=rollout,
             )
-            analyses.append(analysis)
-            source_session_uris.append(source_session_uri)
             signals.append(
                 ObservationGradient(
                     analysis=analysis,
@@ -1455,10 +1302,15 @@ class SessionCompressorV3:
             apply_result = training_result.apply_result
             if apply_result.errors:
                 raise ExperienceTrainingError("; ".join(apply_result.errors))
+            batch_signals = training_result.gradients
+            visible_uris = _visible_experience_snapshot_uris(plan=plan, apply_result=apply_result)
+            source_session_uris = [
+                signal.analysis.metadata["source_session_uri"] for signal in batch_signals
+            ]
             async with finalize_lock:
                 if case_uri:
                     await self._link_case_to_training_outputs(
-                        analysis=analyses[0],
+                        analysis=batch_signals[0].analysis,
                         case_uri=case_uri,
                         plan=plan,
                         apply_result=apply_result,
@@ -1468,15 +1320,21 @@ class SessionCompressorV3:
                 await _commit_experience_snapshot(
                     viking_fs,
                     ctx=ctx,
-                    experience_uris=_visible_experience_snapshot_uris(
-                        plan=plan, apply_result=apply_result
-                    ),
+                    experience_uris=visible_uris,
                     archive_uri=f"trajectory-batch:{batch_id}",
                     experience_session_map={target_uri: source_session_uris},
                 )
+            for signal in batch_signals:
+                await self._write_trajectory_update_state(
+                    viking_fs=viking_fs,
+                    memory=signal.after_file,
+                    ctx=ctx,
+                    state="applied" if visible_uris else "no_op",
+                    batch_id=batch_id,
+                    experience_uri=target_uri,
+                )
 
-        # Each admitted Case owns its trainer state; only the execution implementation
-        # is shared. Explicit batches neither start a timer nor split this Case's evidence.
+        # Use the same count/window batching and serial updates as other gradients.
         trainer = StreamingPolicyTrainer(
             policy_set=policy_set,
             rollout_analyzer=self.rollout_analyzer,
@@ -1491,9 +1349,7 @@ class SessionCompressorV3:
             config=self.streaming_trainer_config,
         )
         try:
-            training_result = await trainer.train_gradients(
-                signals, analyses=analyses, batch_finalizer=finalize
-            )
+            training_result = await trainer.submit_gradients(signals, batch_finalizer=finalize)
         finally:
             await trainer.close()
         plan = training_result.plan
@@ -1628,6 +1484,9 @@ class SessionCompressorV3:
                 uri=memory.uri,
             )
             previous = _trajectory_update_state(latest)
+            # A later chunk failure must not undo a completed chunk's terminal state.
+            if state == "failed" and previous["state"] in _EXPERIENCE_UPDATE_TERMINAL_STATES:
+                return latest
             latest.extra_fields[_EXPERIENCE_UPDATE_FIELD] = {
                 "state": state,
                 "attempts": int(previous.get("attempts") or 0)
@@ -1820,28 +1679,12 @@ def _contexts_from_update_result(result: Any) -> list[Context]:
     return contexts
 
 
-def _training_case_from_first_message(
-    messages: list[Message],
-    allowed_memory_types: Optional[set[str]],
-) -> Case | None:
-    """Parse a batch-training CaseSpec control message from message[0].
-
-    The fast path is deliberately gated by the commit memory policy so normal
-    user sessions never bypass user-memory extraction.  Once the protocol
-    header is present, malformed payloads are treated as errors instead of
-    silently falling back to LLM extraction.
-    """
-    if not messages or allowed_memory_types is None:
+def _training_case_from_first_message(messages: list[Message]) -> Case | None:
+    """Read the concrete task envelope, never use it as a memory Case identity."""
+    if not messages:
         return None
-    if not {_CASES_MEMORY_TYPE, _TRAJECTORIES_MEMORY_TYPE}.issubset(allowed_memory_types):
-        return None
-    if not set(allowed_memory_types).issubset(_TRAINING_FAST_PATH_MEMORY_TYPES):
-        return None
-
     payload = _training_case_spec_payload_from_message(messages[0])
-    if payload is None:
-        return None
-    return _case_from_payload(payload)
+    return _case_from_payload(payload) if payload is not None else None
 
 
 def _allowed_agent_memory_types(allowed_memory_types: Optional[set[str]]) -> set[str]:
@@ -1855,6 +1698,45 @@ def _training_case_spec_payload_from_message(message: Message) -> dict[str, Any]
     if not text.startswith(_TRAINING_CASE_SPEC_HEADER):
         return None
     return _parse_training_case_spec_payload(text)
+
+
+def _case_rubric_model_evidence(
+    task: Case | None, evaluation: RubricEvaluation | None
+) -> list[str]:
+    """Project rubric evidence without exposing the concrete task's control-plane identity."""
+    documents = []
+    descriptions = {}
+    if task is not None:
+        descriptions = {item.name: item.description for item in task.rubric.criteria}
+        documents.append(
+            {
+                # These are the business fields carried by the CaseSpec transport.
+                # Split/task/trial identifiers remain in the original envelope, not this view.
+                "task_context": {
+                    key: task.input[key] for key in ("domain", "user_query") if key in task.input
+                },
+                "rubric": {
+                    "description": task.rubric.description,
+                    "criteria": [
+                        {
+                            "description": item.description,
+                            "required": item.required,
+                            "weight": item.weight,
+                        }
+                        for item in task.rubric.criteria
+                    ],
+                },
+            }
+        )
+    if evaluation is not None:
+        report = asdict(evaluation)
+        for result in report["criterion_results"]:
+            # Bind reports to the criterion text, not potentially task-derived labels.
+            name = result.pop("criterion_name")
+            if name in descriptions:
+                result["description"] = descriptions[name]
+        documents.append({"external_evaluation": report})
+    return [json.dumps(document, ensure_ascii=False) for document in documents]
 
 
 def _training_evaluation_from_messages(
@@ -1958,11 +1840,6 @@ def _message_text(message: Message) -> str:
     return "\n".join(texts)
 
 
-def _training_messages_after_case_spec(messages: list[Message]) -> list[Message]:
-    """Return commit messages after CaseSpec."""
-    return list(messages[1:])
-
-
 def _training_conversation_messages(messages: list[Message]) -> list[Message]:
     """Remove batch-training control envelopes from the business conversation."""
     return [
@@ -1980,21 +1857,21 @@ def _parse_training_case_spec_payload(text: str) -> dict[str, Any]:
         match.group(1).strip() if match else text.removeprefix(_TRAINING_CASE_SPEC_HEADER).strip()
     )
     if not raw_payload:
-        raise ValueError("Training CaseSpec fast path payload is empty")
+        raise ValueError("Training CaseSpec payload is empty")
     try:
         payload = JsonUtils.loads(raw_payload)
     except Exception as exc:
-        raise ValueError("Training CaseSpec fast path payload is not valid JSON") from exc
+        raise ValueError("Training CaseSpec payload is not valid JSON") from exc
     if not isinstance(payload, dict):
-        raise ValueError("Training CaseSpec fast path payload must be a JSON object")
+        raise ValueError("Training CaseSpec payload must be a JSON object")
     protocol = str(payload.get("protocol") or "")
     if protocol != _TRAINING_CASE_SPEC_PROTOCOL:
         raise ValueError(
-            "Training CaseSpec fast path protocol mismatch: "
+            "Training CaseSpec protocol mismatch: "
             f"expected {_TRAINING_CASE_SPEC_PROTOCOL!r}, got {protocol!r}"
         )
     if not isinstance(payload.get("case"), dict):
-        raise ValueError("Training CaseSpec fast path payload must contain a case object")
+        raise ValueError("Training CaseSpec payload must contain a case object")
     return payload
 
 
@@ -2063,81 +1940,68 @@ def _rubric_from_payload(raw_rubric: Any, *, fallback_name: str) -> Rubric:
     )
 
 
-def _case_to_memory_fields(case: Case) -> dict[str, Any]:
-    return {
-        "case_name": case.name,
-        "task_signature": case.task_signature,
-        "input": json.dumps(case.input or {}, ensure_ascii=False, sort_keys=True),
-        "rubric": json.dumps(
-            _rubric_to_payload(case.rubric),
-            ensure_ascii=False,
-            sort_keys=True,
-        ),
-        "evidence": _case_evidence(case),
-    }
-
-
-def _rubric_to_payload(rubric: Rubric) -> dict[str, Any]:
-    return {
-        "name": rubric.name,
-        "description": rubric.description,
-        "criteria": [
-            {
-                "name": criterion.name,
-                "description": criterion.description,
-                "required": criterion.required,
-                "weight": criterion.weight,
-            }
-            for criterion in rubric.criteria
-        ],
-    }
-
-
-def _case_evidence(case: Case) -> str:
-    raw_evidence = (case.metadata or {}).get("evidence")
-    if raw_evidence:
-        return str(raw_evidence)
-    return "Structured batch training CaseSpec supplied by the training pipeline."
-
-
 async def _canonical_cases_from_update_result(
     *,
     operations: ResolvedOperations,
     result: Any,
     viking_fs: Any,
     ctx: RequestContext,
+    requested_operations: ResolvedOperations,
 ) -> list[Case]:
-    """Build training cases from canonical case files after patch merge/apply.
+    """Resolve applied or unchanged Case contributions to their persisted scenario.
 
-    The extractor can emit multiple case proposals, but ``StreamingMemoryUpdater``
-    may merge, rename, or deduplicate them before storage.  Training must follow
-    the actual persisted case-first state, so only cases whose canonical URI was
-    written/edited by this update are returned.
+    Use the merge result for canonicalized names. An explicitly proposed existing
+    target still contributes a trajectory when its immutable fields need no edit.
+    Explicit references associate an execution without any Case write. Prefetched/search-hit
+    memories alone are never evidence of association.
     """
-
-    touched_uris = _case_result_touched_uris(result)
-    if not touched_uris:
-        return []
-
-    case_ops_by_uri: dict[str, ResolvedOperation] = {}
-    for op in getattr(operations, "upsert_operations", []) or []:
-        if getattr(op, "memory_type", None) != _CASES_MEMORY_TYPE:
-            continue
-        for uri in getattr(op, "uris", []) or []:
-            if uri in touched_uris and uri not in case_ops_by_uri:
-                case_ops_by_uri[uri] = op
-
-    cases: list[Case] = []
-    for uri in touched_uris:
-        if uri not in case_ops_by_uri:
+    selected = {
+        uri
+        for ref in [*requested_operations.case_references, *operations.case_references]
+        for uri in ref.uris
+        if ref.memory_type == _CASES_MEMORY_TYPE
+    }
+    touched = set(_case_result_touched_uris(result))
+    uris = [
+        uri
+        for op in operations.upsert_operations
+        if op.memory_type == _CASES_MEMORY_TYPE
+        for uri in op.uris
+        if uri in touched
+    ]
+    deleted = set(getattr(result, "deleted_uris", []) or [])
+    skipped = {item.uri for item in getattr(result, "skipped_operations", []) or [] if item.uri}
+    canonical_uris = selected | {
+        uri
+        for op in operations.upsert_operations
+        if op.memory_type == _CASES_MEMORY_TYPE
+        for uri in op.uris
+    }
+    if not getattr(result, "errors", None) and not operations.errors:
+        # Unchanged existing Cases may be omitted from the merge's write set.
+        # A policy-filtered request must not acquire an association through this path.
+        for op in requested_operations.upsert_operations:
+            if op.memory_type != _CASES_MEMORY_TYPE:
+                continue
+            if any(
+                item.memory_type == _CASES_MEMORY_TYPE and (item.uri in op.uris or item.uri is None)
+                for item in getattr(result, "skipped_operations", []) or []
+            ):
+                continue
+            # A final Case selection supersedes the original proposal, even if the
+            # proposed alias happens to exist on disk as another Case.
+            uris.extend(uri for uri in op.uris if not canonical_uris or uri in canonical_uris)
+    cases = []
+    for uri in dict.fromkeys([*uris, *sorted(selected)]):
+        if uri in deleted or uri in skipped or not _uri_is_case_memory_file(uri):
+            if uri in selected:
+                raise ValueError(f"Selected Case is not available after the memory update: {uri}")
             continue
         case = await _case_from_persisted_memory_file(uri=uri, viking_fs=viking_fs, ctx=ctx)
-        if case is None:
-            case = _operation_to_case(
-                case_ops_by_uri[uri].model_copy(update={"uris": [uri]}, deep=True)
-            )
         if case is not None:
             cases.append(case)
+        elif uri in selected:
+            raise ValueError(f"Selected Case no longer exists: {uri}")
     return cases
 
 
@@ -2167,18 +2031,17 @@ async def _case_from_persisted_memory_file(
     try:
         raw = await viking_fs.read_file(uri, ctx=ctx)
     except Exception as exc:
-        tracer.info(f"Failed to read canonical case memory for training {uri}: {exc}")
-        return None
-    try:
-        memory_file = MemoryFileUtils.read(raw or "", uri=uri)
-    except Exception as exc:
-        tracer.info(f"Failed to parse canonical case memory for training {uri}: {exc}")
-        return None
-    return _memory_file_to_case(memory_file)
+        if is_storage_not_found(exc):
+            return None
+        raise
+    return _memory_file_to_case(MemoryFileUtils.read(raw, uri=uri))
 
 
 def _memory_file_to_case(memory_file: MemoryFile) -> Case | None:
+    if memory_file.memory_type != _CASES_MEMORY_TYPE:
+        return None
     fields = dict(getattr(memory_file, "extra_fields", {}) or {})
+    fields.pop("evidence", None)
     uri = str(getattr(memory_file, "uri", "") or "")
     name = str(fields.get("case_name") or fields.get("name") or _basename_case_name(uri)).strip()
     task_signature = str(fields.get("task_signature") or name).strip()
@@ -2190,87 +2053,23 @@ def _memory_file_to_case(memory_file: MemoryFile) -> Case | None:
     return Case(
         name=name,
         task_signature=task_signature,
-        input=_parse_case_input(fields.get("input")),
-        rubric=_parse_rubric(fields.get("rubric"), fallback_name=f"{name}_rubric"),
+        input={"summary": str(fields.get("input") or "")},
+        rubric=Rubric(
+            name=f"{name}_rubric",
+            description="",
+            criteria=[
+                RubricCriterion(
+                    name=item["id"], description=item["description"], required=True, weight=1.0
+                )
+                for item in parse_case_rubric(fields.get("rubric", "[]"))
+            ],
+        ),
         metadata={
             "source": "session_commit_case_memory",
             "case_uris": [uri] if uri else [],
-            "evidence": str(fields.get("evidence") or ""),
             "memory_fields": memory_fields,
         },
     )
-
-
-def _operation_to_case(op: ResolvedOperation) -> Case | None:
-    fields = dict(getattr(op, "memory_fields", {}) or {})
-    name = str(fields.get("case_name") or fields.get("name") or _fallback_case_name(op)).strip()
-    task_signature = str(fields.get("task_signature") or name).strip()
-    if not name or not task_signature:
-        return None
-    return Case(
-        name=name,
-        task_signature=task_signature,
-        input=_parse_case_input(fields.get("input")),
-        rubric=_parse_rubric(fields.get("rubric"), fallback_name=f"{name}_rubric"),
-        metadata={
-            "source": "session_commit_case_memory",
-            "case_uris": list(getattr(op, "uris", []) or []),
-            "evidence": str(fields.get("evidence") or ""),
-            "memory_fields": fields,
-        },
-    )
-
-
-def _parse_case_input(raw_input: Any) -> dict[str, Any]:
-    parsed = _parse_jsonish(raw_input)
-    if isinstance(parsed, dict):
-        return parsed
-    if isinstance(parsed, list):
-        return {"items": parsed}
-    return {"summary": str(raw_input or "")}
-
-
-def _parse_rubric(raw_rubric: Any, *, fallback_name: str) -> Rubric:
-    parsed = _parse_jsonish(raw_rubric)
-    raw = parsed if isinstance(parsed, dict) else {}
-    raw_criteria = raw.get("criteria") if isinstance(raw.get("criteria"), list) else []
-    criteria: list[RubricCriterion] = []
-    for index, item in enumerate(raw_criteria):
-        if not isinstance(item, dict):
-            continue
-        criteria.append(
-            RubricCriterion(
-                name=str(item.get("name") or f"criterion_{index + 1}"),
-                description=str(item.get("description") or "The rollout satisfies the task."),
-                required=bool(item.get("required", True)),
-                weight=_safe_weight(item.get("weight"), default=1.0),
-            )
-        )
-    if not criteria:
-        criteria = [
-            RubricCriterion(
-                name="task_completed",
-                description="The assistant completed the user's task with verifiable outcome.",
-                required=True,
-                weight=1.0,
-            )
-        ]
-    return Rubric(
-        name=str(raw.get("name") or fallback_name),
-        description=str(raw.get("description") or "Defines what good means for this commit case."),
-        criteria=criteria,
-    )
-
-
-def _parse_jsonish(value: Any) -> Any:
-    if isinstance(value, (dict, list)):
-        return value
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        return JsonUtils.loads(value)
-    except Exception:
-        return None
 
 
 def _safe_weight(value: Any, *, default: float) -> float:
@@ -2279,18 +2078,6 @@ def _safe_weight(value: Any, *, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
-
-
-def _first_uri(uris: list[str] | None) -> str | None:
-    return uris[0] if uris else None
-
-
-def _fallback_case_name(op: ResolvedOperation) -> str:
-    uri = _first_uri(getattr(op, "uris", []) or [])
-    name = _basename_case_name(uri)
-    if name:
-        return name
-    return "commit_case"
 
 
 def _basename_case_name(uri: str | None) -> str:
@@ -2333,7 +2120,7 @@ class _NoopGradientEstimator:
     """GradientEstimator that returns empty gradients.
 
     Skills and persisted Trajectory observations are supplied directly through
-    ``submit_gradients`` or ``train_gradients``. Those paths bypass estimation,
+    ``submit_gradients``. That path bypasses estimation,
     but ``StreamingPolicyTrainer`` still requires this component.
     """
 
@@ -2386,14 +2173,6 @@ def _case_uri_by_name(
             if uri:
                 mapping[case.name] = uri
     return mapping
-
-
-def _first_context_uri(contexts: list[Context]) -> str:
-    for context in contexts or []:
-        uri = getattr(context, "uri", "")
-        if uri:
-            return str(uri)
-    return ""
 
 
 def _case_training_links(

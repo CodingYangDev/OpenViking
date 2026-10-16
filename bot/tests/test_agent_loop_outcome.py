@@ -1,7 +1,7 @@
 import copy
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from vikingbot.agent import loop as loop_module
@@ -1412,3 +1412,351 @@ async def test_real_tau2_runtime_checks_user_and_write_boundaries_and_dedups_rep
         assert len([e for e in runtime.events if e.get("event") == "reminder_delivered"]) == 1
     finally:
         await runtime.close()
+
+
+@pytest.fixture
+def tau2_feedback_environment():
+    import json
+    from types import SimpleNamespace
+
+    from benchmark.tau2.common.tau2_env.tau2_environment import _GymTau2BenchEnv
+
+    adapter = _GymTau2BenchEnv.__new__(_GymTau2BenchEnv)
+    adapter.terminated = False
+    writes = []
+    deliveries = []
+    replies = iter([("Please add two checked bags.", False), ("###STOP###", True)])
+
+    def step(action):
+        if action.startswith("{"):
+            name = json.loads(action)["name"]
+            assert name != "done", "Active conversations must reject done before Gym sees it"
+            writes.append(name)
+            return "tool: updated", 0.0, False, False, {}
+        deliveries.append(action)
+        text, terminal = next(replies)
+        return f"user: {text}", 0.0, terminal, False, {}
+
+    adapter.env = SimpleNamespace(step=step, _orchestrator=None)
+    schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": name,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}}
+                    if name == "communicate_with_user"
+                    else {},
+                },
+            },
+        }
+        for name in [
+            "update_reservation_flights",
+            "update_reservation_baggages",
+            "communicate_with_user",
+            "done",
+        ]
+    ]
+    provider = SimpleNamespace(call_tool=adapter.tool_call, list_openai_tools=lambda: schemas)
+    return adapter, provider, writes, deliveries
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["plain", "tool"])
+@pytest.mark.parametrize("done_first", [False, True])
+@pytest.mark.parametrize("external_stop", [False, True])
+async def test_tau2_done_cannot_skip_result_feedback_and_followup(
+    make_loop, monkeypatch, tau2_feedback_environment, delivery, done_first, external_stop
+):
+    from benchmark.tau2.train import rollout_executor_vikingbot as tau2
+
+    adapter, environment, writes, deliveries = tau2_feedback_environment
+
+    def write_and_done(name, index):
+        calls = [
+            ToolCallRequest(f"write-{index}", name, {}, 0),
+            ToolCallRequest(f"done-{index}", "done", {}, 0),
+        ]
+        return LLMResponse(content=None, tool_calls=list(reversed(calls)) if done_first else calls)
+
+    def report(text, index):
+        if delivery == "plain":
+            return LLMResponse(content=text)
+        return LLMResponse(
+            content=None,
+            tool_calls=[
+                ToolCallRequest(f"report-{index}", "communicate_with_user", {"content": text}, 0)
+            ],
+        )
+
+    responses = [
+        write_and_done("update_reservation_flights", 1),
+        report("Your flight changes are complete. Anything else?", 1),
+        write_and_done("update_reservation_baggages", 2),
+        report("Your two checked bags have been added.", 2),
+    ]
+    if delivery == "tool" and not external_stop:
+        responses.append(
+            LLMResponse(content=None, tool_calls=[ToolCallRequest("final-done", "done", {}, 0)])
+        )
+    provider = _MediaProvider([])
+    provider.responses = iter(responses)
+    loop = make_loop(provider=provider, max_iterations=10)
+    monkeypatch.setattr(
+        loop.context,
+        "build_messages",
+        AsyncMock(return_value=[{"role": "user", "content": "Change my flight"}]),
+    )
+    tau2._configure_tools(loop, environment, keep_default_tools=False)
+
+    result = await tau2._run_agent(
+        agent=loop,
+        system_prompt="Airline policy",
+        user_prompt="Change my flight",
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="done-feedback"),
+        sender_id="customer",
+        keep_default_tools=False,
+        should_stop=(lambda: adapter.terminated) if external_stop else None,
+    )
+
+    assert len(provider.calls) == len(responses)
+    assert writes == ["update_reservation_flights", "update_reservation_baggages"]
+    assert len(deliveries) == 2
+    assert adapter.terminated
+    assert any(
+        "Please add two checked bags." in str(message.get("content"))
+        for message in provider.calls[2]
+    )
+    done_results = [item for item in result[2] if item["tool_name"] == "done"]
+    assert len([item for item in done_results if not item["execute_success"]]) == 2
+    assert all(item["result"].startswith("Error:") for item in done_results[:2])
+    assert sum(bool(item["execute_success"]) for item in done_results) == int(
+        delivery == "tool" and not external_stop
+    )
+    if external_stop:
+        assert result[0] is None
+
+
+@pytest.mark.asyncio
+async def test_rejected_tau2_done_preserves_unfinished_fallback_instead_of_success(
+    make_loop, monkeypatch, tau2_feedback_environment
+):
+    from benchmark.tau2.train import rollout_executor_vikingbot as tau2
+
+    adapter, environment, writes, deliveries = tau2_feedback_environment
+    provider = _MediaProvider([])
+    provider.responses = iter(
+        [
+            LLMResponse(content=None, tool_calls=[ToolCallRequest("premature", "done", {}, 0)]),
+            LLMResponse(content=""),
+            LLMResponse(content="The requested work remains unfinished."),
+        ]
+    )
+    loop = make_loop(provider=provider, max_iterations=2)
+    monkeypatch.setattr(
+        loop.context,
+        "build_messages",
+        AsyncMock(return_value=[{"role": "user", "content": "Change my flight"}]),
+    )
+    tau2._configure_tools(loop, environment, keep_default_tools=False)
+
+    result = await tau2._run_agent(
+        agent=loop,
+        system_prompt="Airline policy",
+        user_prompt="Change my flight",
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="blocked-done-limit"),
+        sender_id="customer",
+        keep_default_tools=False,
+    )
+
+    assert len(provider.calls) == 3
+    assert result[0] == "The requested work remains unfinished."
+    assert result[2][-1]["execute_success"] is False
+    assert not adapter.terminated and not writes and not deliveries
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_iterations", [1, 100])
+@pytest.mark.parametrize("tool_result", ["updated", "Task Terminated", "Error: simulator failed"])
+async def test_external_stop_records_tool_result_without_next_model_or_fallback(
+    make_loop, max_iterations, tool_result
+):
+    provider = _MediaProvider([[_image_call("call-1")]])
+    loop = make_loop(provider=provider, max_iterations=max_iterations)
+    state = {"terminated": False}
+    registry = _ImageRegistry()
+    received = AsyncMock()
+
+    async def execute(name, params, **kwargs):
+        state["terminated"] = True
+        return ToolExecutionResult(tool_result, params, on_result_added=received)
+
+    registry.execute_detailed = AsyncMock(side_effect=execute)
+    recall_calls = []
+
+    async def advice(messages, *, before_tools=False):
+        recall_calls.append(before_tools)
+        if False:
+            yield ""
+
+    captured = []
+    final, reasoning, tools, _usage, iterations = await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "run task"}],
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="external-stop"),
+        publish_events=False,
+        stop_tool_names=["done"],
+        tool_registry=registry,
+        inject_write_experience=False,
+        experience_context_provider=advice,
+        should_stop=lambda: state["terminated"],
+        captured_turns=captured,
+    )
+
+    assert final is None and reasoning is None
+    assert iterations == len(provider.calls) == 1
+    assert recall_calls == [False, True]
+    assert len(tools) == 1 and tools[0]["tool_name"] == "read_image"
+    assert tools[0]["result"] == tool_result
+    assert tools[0]["execute_success"] == (not tool_result.startswith("Error:"))
+    assert captured[0]["tool_calls"] == tools
+    received.assert_awaited_once_with(tool_result)
+
+
+@pytest.mark.asyncio
+async def test_external_stop_before_first_iteration_skips_compaction_advice_and_model(make_loop):
+    provider = _RecordingProvider()
+    loop = make_loop(provider=provider, max_iterations=100)
+    loop._compact_tool_loop = AsyncMock()
+    status = AsyncMock()
+    initial_request = Mock()
+    recalls = []
+
+    async def advice(messages, *, before_tools=False):
+        recalls.append(before_tools)
+        if False:
+            yield ""
+
+    final, reasoning, tools, usage, iterations = await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "already ended"}],
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="already-ended"),
+        publish_events=False,
+        should_stop=lambda: True,
+        context_compact_budget=1,
+        status_note_provider=status,
+        experience_context_provider=advice,
+        on_initial_llm_request=initial_request,
+    )
+    assert final is None and reasoning is None
+    assert tools == [] and iterations == 0 and usage["total_tokens"] == 0
+    assert provider.calls == [] and recalls == []
+    loop._compact_tool_loop.assert_not_awaited()
+    status.assert_not_awaited()
+    initial_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_terminal_words_without_terminal_state_do_not_stop_agent(make_loop):
+    provider = _MediaProvider([[_image_call("call-1")]])
+    loop = make_loop(provider=provider, max_iterations=100)
+    registry = _ImageRegistry()
+    registry.execute_detailed = AsyncMock(return_value=ToolExecutionResult("Task Terminated", {}))
+    final, _reasoning, tools, _usage, iterations = await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "read the document"}],
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="terminal-words"),
+        publish_events=False,
+        tool_registry=registry,
+        should_stop=lambda: False,
+        inject_write_experience=False,
+    )
+    assert final == "done"  # The next normal model response, not a fabricated done tool.
+    assert len(provider.calls) == iterations == 2
+    assert len(tools) == 1 and tools[0]["result"] == "Task Terminated"
+
+
+@pytest.mark.asyncio
+async def test_external_stop_collects_all_inflight_tool_results(make_loop):
+    import asyncio
+
+    provider = _MediaProvider([[_image_call("fast", "fast"), _image_call("slow", "slow")]])
+    loop = make_loop(provider=provider, max_iterations=1)
+    state = {"terminated": False}
+    finished = []
+    registry = _ImageRegistry()
+
+    async def execute(name, params, **kwargs):
+        if params["label"] == "slow":
+            await asyncio.sleep(0.01)
+        else:
+            state["terminated"] = True
+        finished.append(params["label"])
+        return ToolExecutionResult(params["label"], params)
+
+    registry.execute_detailed = AsyncMock(side_effect=execute)
+    captured = []
+    final, _reasoning, tools, _usage, iterations = await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "run both"}],
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="terminal-batch"),
+        publish_events=False,
+        tool_registry=registry,
+        should_stop=lambda: state["terminated"],
+        inject_write_experience=False,
+        captured_turns=captured,
+    )
+    assert final is None and iterations == len(provider.calls) == 1
+    assert finished == ["fast", "slow"]
+    assert [item["tool_call_id"] for item in tools] == ["fast", "slow"]
+    assert [item["result"] for item in captured[0]["tool_calls"]] == ["fast", "slow"]
+
+
+@pytest.mark.asyncio
+async def test_tau2_terminal_tool_batch_records_queued_write_without_executing_it(
+    make_loop, monkeypatch, tau2_feedback_environment
+):
+    import json
+
+    from benchmark.tau2.train import rollout_executor_vikingbot as tau2
+
+    adapter, environment, writes, deliveries = tau2_feedback_environment
+
+    def terminal_step(action):
+        writes.append(json.loads(action)["name"])
+        return "tool: simulator ended", 0.0, True, False, {}
+
+    adapter.env.step = terminal_step
+    provider = _MediaProvider(
+        [
+            [
+                ToolCallRequest("first", "update_reservation_flights", {}, 0),
+                ToolCallRequest("queued", "update_reservation_baggages", {}, 0),
+            ]
+        ]
+    )
+    loop = make_loop(provider=provider, max_iterations=1)
+    monkeypatch.setattr(
+        loop.context,
+        "build_messages",
+        AsyncMock(return_value=[{"role": "user", "content": "Update my booking"}]),
+    )
+    tau2._configure_tools(loop, environment, keep_default_tools=False)
+
+    result = await tau2._run_agent(
+        agent=loop,
+        system_prompt="Airline policy",
+        user_prompt="Update my booking",
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="terminal-write-batch"),
+        sender_id="customer",
+        keep_default_tools=False,
+        should_stop=lambda: adapter.terminated,
+    )
+    assert result[0] is None
+    assert adapter.terminated
+    assert len(provider.calls) == 1
+    assert writes == ["update_reservation_flights"]
+    assert deliveries == []
+    assert [tool["tool_name"] for tool in result[2]] == [
+        "update_reservation_flights",
+        "update_reservation_baggages",
+    ]
+    assert [tool["result"] for tool in result[2]] == ["simulator ended", "Task Terminated"]

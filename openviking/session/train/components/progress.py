@@ -273,8 +273,8 @@ async def run_with_progress(
     """Run ``coroutine_factory(item, index)`` for each item with a ProgressPrinter.
 
     Creates a semaphore, starts/fails/completes progress rows per item, and
-    guarantees ``progress.finish()`` in a finally block. Returns the gathered
-    results in input order.
+    cancels and joins remaining tasks on failure before returning control to the
+    caller, and guarantees ``progress.finish()``. Results preserve input order.
     """
     import asyncio
 
@@ -282,19 +282,33 @@ async def run_with_progress(
     progress = ProgressPrinter(total=n, label=label, enabled=enabled, description=description)
     progress.render()
     semaphore = asyncio.Semaphore(concurrency)
+    stopped = False
 
     async def _run_one(item: Any, index: int) -> Any:
+        nonlocal stopped
         async with semaphore:
+            if stopped:
+                return None
             progress.start_one()
             try:
                 result = await coroutine_factory(item, index)
-            except Exception:
+            except BaseException:
+                stopped = True
                 progress.fail_one()
                 raise
             progress.complete_one()
             return result
 
+    tasks = [asyncio.create_task(_run_one(item, idx)) for idx, item in enumerate(items)]
+    group = asyncio.gather(*tasks)
     try:
-        return list(await asyncio.gather(*(_run_one(item, idx) for idx, item in enumerate(items))))
+        # Own cancellation here: gather must not cancel async cleanup a second time.
+        return list(await asyncio.shield(group))
+    except BaseException:
+        stopped = True
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(group, *tasks, return_exceptions=True)
+        raise
     finally:
         progress.finish()

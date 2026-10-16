@@ -38,6 +38,8 @@ class ExtractionOutputContext:
     create_page_ids: set[int] = field(default_factory=set)
     template_context: dict[str, Any] = field(default_factory=dict)
     memory_eval_bindings: dict[str, Any] = field(default_factory=dict)
+    # Presentation only; link availability and validation still use link_enabled.
+    include_link_example: bool = True
 
 
 class ExtractionOutputProtocol(ABC):
@@ -64,8 +66,8 @@ class ExtractionOutputProtocol(ABC):
         """Render the instruction used when tool iterations are exhausted."""
 
     @abstractmethod
-    def render_format_retry(self, error: str | None = None) -> str:
-        """Render guidance after output parsing fails."""
+    def render_format_retry(self, error: str | None = None, *, failed_content: str = "") -> str:
+        """Render repair guidance, optionally including bounded failed-source context."""
 
     @abstractmethod
     def render_patch_repair(self, patch_errors: list[dict[str, Any]]) -> str:

@@ -674,6 +674,75 @@ async def test_skill_policy_creation_preserves_lock_ownership(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["edit", "drop", "overwrite", "noop"])
+async def test_fixed_case_merge_materializes_sdk_edits_against_latest_source(method):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    policy_set = _experience_set()
+    current = policy_set.policies[0]
+    stale = (
+        'dag = workflow("review")\n'
+        "reminder = tell(\n"
+        '    "Verify eligibility"\n'
+        '    "; skip eligibility"\n'
+        ")"
+    )
+    obsolete_line = '    "; skip eligibility"'
+    obsolete_block = obsolete_line + "\n"
+    current.content = stale + '\nkeep = tell("Preserve the current request scope")'
+    current.version = 3
+    expected = current.content.replace(obsolete_block, "")
+    fs = FakeVikingFS(
+        {
+            current.uri: MemoryFileUtils.write(
+                _memory_file(name=current.name, uri=current.uri, content=current.content, version=3)
+            )
+        }
+    )
+    gradient = _patch_gradient(
+        before=stale,
+        after=stale.replace(obsolete_block, ""),
+        base_version=1,
+        metadata={
+            "proposal_source_sessions": [{"source_session_uri": "viking://session/s/archives/1"}],
+            "experience_proposal_gate": {"passed": True},
+        },
+    )
+    programs = {
+        "edit": (
+            f"prefetched_memory_1.content.edit(search={obsolete_block!r}, replace='')\nsdk.commit()"
+        ),
+        "drop": f"prefetched_memory_1.content.drop(text={obsolete_line!r})\nsdk.commit()",
+        "overwrite": f"prefetched_memory_1.content.overwrite({expected!r})\nsdk.commit()",
+        "noop": "sdk.commit()",
+    }
+    model = SimpleNamespace(
+        model="test", get_completion_async=AsyncMock(return_value=programs[method])
+    )
+
+    plan = await PatchMergePolicyOptimizer(viking_fs=fs, vlm=model).plan(
+        [gradient],
+        policy_set,
+        PatchMergePolicyOptimizerContext(request_context=fake_request_context()),
+    )
+
+    model.get_completion_async.assert_awaited_once()
+    assert MemoryFileUtils.read(fs.files[current.uri]).content == current.content
+    assert plan.read_policy_uris == [current.uri]
+    if method == "noop":
+        assert plan.items == []
+        return
+    assert len(plan.items) == 1
+    item = plan.items[0]
+    assert item.after_content == expected
+    assert item.before_content == current.content
+    assert item.base_version == 3
+    assert item.target_uri == current.uri
+    assert item.links == gradient.links
+
+
+@pytest.mark.asyncio
 async def test_fixed_case_merge_groups_sessions_and_rebases_on_latest_policy(monkeypatch):
     from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
 

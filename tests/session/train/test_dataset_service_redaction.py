@@ -164,3 +164,24 @@ def test_redact_sensitive_preserves_full_prompt_and_returns_independent_copy():
 def test_prompt_redaction_does_not_mistake_basic_economy_for_basic_auth():
     text = "Basic economy cannot be modified. Query basic flight information first."
     assert redact_sensitive(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'api_key="private-value"',
+        "api_key='private-value'",
+        '{"api_key": "private-value"}',
+        'Authorization: "Bearer private-value"',
+        'api_key="<redacted>"',
+        "api_key='<redacted>'",
+    ],
+)
+def test_redaction_preserves_json_escaped_quotes_and_is_idempotent(text):
+    encoded = json.dumps({"message": text})
+
+    redacted = redact_sensitive(encoded)
+
+    assert "private-value" not in redacted
+    assert json.loads(redacted) == {"message": redact_sensitive(text)}
+    assert redact_sensitive(redacted) == redacted

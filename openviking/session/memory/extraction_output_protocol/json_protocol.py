@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
+
 from openviking.session.memory.extraction_output_protocol.base import (
     ExtractionOutputContext,
     ExtractionOutputProtocol,
@@ -110,6 +112,26 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
     def parse(
         self, content: str, context: ExtractionOutputContext
     ) -> tuple[Any | None, str | None]:
+        if "selected_case_ids" in context.operations_model.model_fields:
+            # The tolerant parser coerces booleans/strings to integers and drops invalid
+            # items. Never let those repairs silently change which Case was selected.
+            raw, _ = parse_json_with_stability(content=content)
+            if raw is not None and "selected_case_ids" in raw:
+                selected = raw["selected_case_ids"]
+                if not isinstance(selected, list) or any(
+                    type(item) is not int for item in selected
+                ):
+                    return None, "selected_case_ids must be a list of integer page_ids"
+            if raw is not None and "case_sources" in context.operations_model.model_fields:
+                # Source patch numbers must not be repaired into different associations.
+                if not isinstance(raw, dict):
+                    return None, "Case merge output must be an object with case_sources"
+                try:
+                    TypeAdapter(
+                        context.operations_model.model_fields["case_sources"].annotation
+                    ).validate_python(raw.get("case_sources", []))
+                except ValidationError as exc:
+                    return None, str(exc)
         operations, error = parse_json_with_stability(
             content=content,
             model_class=context.operations_model,
@@ -120,6 +142,12 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
         return operations, error
 
     def render_final_instruction(self, context: ExtractionOutputContext) -> str:
+        if "case_sources" in context.operations_model.model_fields:
+            return (
+                "Return the complete operations JSON now, without tool calls. Include "
+                "case_sources entries with case_id and patch_ids for every final Case, including "
+                "unchanged existing Cases. Cover every proposed Case patch. Output JSON only."
+            )
         fields = ["delete_ids", *context.operations_model.model_fields]
         skeleton = json.dumps(
             {name: [] for name in dict.fromkeys(fields)},
@@ -130,12 +158,17 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
             "You have reached the maximum number of tool call iterations. "
             "Do not call any more tools. Return your final result now as ONLY a valid JSON object "
             "matching the required schema. Do not include explanations or markdown. "
-            "If there are no memory changes, return this exact empty-shape JSON with all fields present:\n"
-            f"{skeleton}"
+            + (
+                "Include matched existing Cases in selected_case_ids even when no content changes are needed. "
+                if "selected_case_ids" in context.operations_model.model_fields
+                else ""
+            )
+            + "If there are no changes or selections, return this empty-shape JSON with all fields present:\n"
+            + skeleton
         )
 
-    def render_format_retry(self, error: str | None = None) -> str:
-        del error
+    def render_format_retry(self, error: str | None = None, *, failed_content: str = "") -> str:
+        del error, failed_content
         return (
             "Your previous output could not be parsed as valid JSON. "
             "Please output ONLY a valid JSON object matching the required schema. "

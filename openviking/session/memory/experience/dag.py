@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 MAX_NODES = 256
 MAX_CONTENT_BYTES = 256 * 1024
@@ -79,13 +79,22 @@ class ParallelBranch(GeneralNode):
     branches: list[int] = Field(default_factory=list, max_length=MAX_NODES)
 
 
+class AnyOfNode(DagModel):
+    """A deterministic OR join, with no model-provided slot value."""
+
+    id: int = Field(gt=0, strict=True)
+    predecessors: list[int] = Field(min_length=1, max_length=MAX_NODES)
+    node_type: Literal["AnyOfNode"] = "AnyOfNode"
+    slot_name: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+
+
 Node = Annotated[
-    GeneralNode | IfElseBranch | ConditionalBranch | ParallelBranch,
+    GeneralNode | IfElseBranch | ConditionalBranch | ParallelBranch | AnyOfNode,
     Field(discriminator="node_type"),
 ]
 
 
-def branch_targets(node: GeneralNode) -> set[int] | None:
+def branch_targets(node: Node) -> set[int] | None:
     if isinstance(node, IfElseBranch):
         return {target for target in (node.true_branch, node.false_branch) if target is not None}
     if isinstance(node, ConditionalBranch):
@@ -98,20 +107,20 @@ def branch_targets(node: GeneralNode) -> set[int] | None:
 
 
 class Dag(DagModel):
-    """A reusable template. All predecessors must complete before activation (AND)."""
+    """A reusable template with AND dependencies and explicit AnyOfNode OR joins."""
 
     version: Literal[1] = 1
     applicability: str = ""
     nodes: dict[int, Node] = Field(default_factory=dict, max_length=MAX_NODES)
 
-    def add_node(self, node: GeneralNode) -> None:
+    def add_node(self, node: Node) -> None:
         if node.id in self.nodes:
             raise ValueError(f"Node {node.id} already exists; use update_node")
         if len(self.nodes) >= MAX_NODES:
             raise ValueError(f"DAG exceeds {MAX_NODES} nodes")
         self.nodes[node.id] = node
 
-    def update_node(self, node: GeneralNode) -> None:
+    def update_node(self, node: Node) -> None:
         if node.id not in self.nodes:
             raise ValueError(f"Node {node.id} does not exist")
         self.nodes[node.id] = node
@@ -153,6 +162,8 @@ class Dag(DagModel):
             if node.slot_name in slots:
                 raise ValueError(f"Duplicate slot_name: {node.slot_name}")
             slots.add(node.slot_name)
+            if isinstance(node, AnyOfNode) and not node.predecessors:
+                raise ValueError(f"AnyOfNode {key} must have at least one predecessor")
             if len(set(node.predecessors)) != len(node.predecessors):
                 raise ValueError(f"Duplicate predecessors for node {key}")
             missing = set(node.predecessors) - self.nodes.keys()
@@ -319,6 +330,8 @@ class DagInstance(DagModel):
     executed_nodes: list[int] = Field(default_factory=list)
     current_nodes: list[int] = Field(default_factory=list)
     state: Literal["pending", "running", "completed"] = "pending"
+    # Ephemeral witness edges from the latest traversal, never persisted as slot facts.
+    _active_predecessors: dict[int, set[int]] = PrivateAttr(default_factory=dict)
 
     def merge_slot_values(
         self,
@@ -330,6 +343,8 @@ class DagInstance(DagModel):
             node = by_slot.get(name)
             if node is None:
                 raise ValueError(f"Unknown slot: {name}")
+            if isinstance(node, AnyOfNode):
+                raise ValueError(f"AnyOfNode {name} is evaluated locally, not supplied as a slot")
             if value is None:
                 continue
             if isinstance(node, ConditionalBranch):
@@ -355,12 +370,12 @@ class DagInstance(DagModel):
 
     def advance(self) -> tuple[list[DagAction], list[int]]:
         self.dag.validate_graph()
-        if self.state == "completed":
-            return [], []
         self.state = "running"
+        self._active_predecessors = {}
+        reached: dict[int, set[int]] = {}
         executed = set(self.executed_nodes)
         # Recompute reachability from current slot facts, not a previous frontier.
-        # Only nodes visited on this path satisfy an AND predecessor relationship.
+        # Only edges actually traversed on this path can satisfy either kind of join.
         processed: set[int] = set()
         current = {key for key, node in self.dag.nodes.items() if not node.predecessors}
         while True:
@@ -369,9 +384,12 @@ class DagInstance(DagModel):
             for key in sorted(current):
                 node = self.dag.nodes[key]
                 value = self.slot_values.get(node.slot_name)
-                if value is None:
+                if isinstance(node, AnyOfNode):
+                    # Reaching this node already proves one of its inputs is satisfied.
+                    targets = self.dag.successors(key)
+                elif value is None:
                     continue
-                if isinstance(node, IfElseBranch):
+                elif isinstance(node, IfElseBranch):
                     target = node.true_branch if value else node.false_branch
                     targets = [] if target is None else [target]
                 elif isinstance(node, ConditionalBranch):
@@ -391,14 +409,22 @@ class DagInstance(DagModel):
                     )
                 finished.add(key)
                 candidate_successors.update(targets)
+                for target in targets:
+                    reached.setdefault(target, set()).add(key)
             if not finished:
                 break
-            completed = processed | finished
             successors = {
                 successor
                 for successor in candidate_successors
-                if set(self.dag.nodes[successor].predecessors).issubset(completed)
+                if isinstance(self.dag.nodes[successor], AnyOfNode)
+                or set(self.dag.nodes[successor].predecessors).issubset(reached[successor])
             }
+            for successor in successors:
+                # Freeze the first sufficient witness: later alternatives need not also hold.
+                parents = reached[successor]
+                if isinstance(self.dag.nodes[successor], AnyOfNode):
+                    parents = {min(parents)}
+                self._active_predecessors.setdefault(successor, set(parents))
             self.executed_nodes.extend(sorted(finished - executed))
             executed.update(finished)
             processed.update(finished)
@@ -410,6 +436,8 @@ class DagInstance(DagModel):
         waiting: list[int] = []
         for key in sorted(current):
             node = self.dag.nodes[key]
+            if isinstance(node, AnyOfNode):
+                continue
             if isinstance(node.slot_provider, Check):
                 waiting.append(key)
             else:
@@ -426,20 +454,22 @@ class DagInstance(DagModel):
     def trigger_conditions(self, node_id: int) -> list[DagTriggerCondition]:
         """Describe only ancestors of an action reached by this advance, in path order.
 
-        Activation already proves all predecessors were visited on the current path.
-        Tell nodes are traversed but never presented as delivery facts or predicates.
+        AND nodes retain all required inputs; OR nodes retain one sufficient witness.
+        Tell and logic nodes are traversed but never presented as external facts.
         """
         visited: set[int] = set()
         conditions: list[DagTriggerCondition] = []
 
         def visit(key: int) -> None:
-            for parent_id in sorted(self.dag.nodes[key].predecessors):
+            for parent_id in sorted(self._active_predecessors.get(key, ())):
                 if parent_id in visited:
                     continue
                 visited.add(parent_id)
                 visit(parent_id)
                 parent = self.dag.nodes[parent_id]
-                if not isinstance(parent.slot_provider, TellAgent):
+                if isinstance(parent, GeneralNode) and not isinstance(
+                    parent.slot_provider, TellAgent
+                ):
                     conditions.append(
                         _trigger_condition(parent, self.slot_values[parent.slot_name])
                     )

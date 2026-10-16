@@ -14,6 +14,8 @@ if str(REPO_ROOT) not in sys.path:
 
 
 def parse_args() -> argparse.Namespace:
+    from openviking.session.train.domain import DEFAULT_MAX_ROLLOUT_ITERATIONS
+
     parser = argparse.ArgumentParser(description="Run remote benchmark batch policy train/eval")
     parser.add_argument("--dataset", required=True, help="Remote benchmark dataset")
     parser.add_argument("--domain", required=True, help="Benchmark domain")
@@ -74,8 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-iterations",
         type=int,
-        default=30,
-        help="Max steps/iterations per rollout (default: 30)",
+        default=DEFAULT_MAX_ROLLOUT_ITERATIONS,
+        help=f"Max steps/iterations per rollout (default: {DEFAULT_MAX_ROLLOUT_ITERATIONS})",
     )
     parser.add_argument(
         "--train-index",

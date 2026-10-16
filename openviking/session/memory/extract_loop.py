@@ -266,6 +266,10 @@ class ExtractLoop:
             available_tools=tuple(allowed_tools),
             template_context={"language": output_language},
         )
+        configure_output = getattr(self.context_provider, "configure_output_context", None)
+        if callable(configure_output):
+            configure_output(self._output_context)
+            self._operations_model = self._output_context.operations_model
         tracer.set("memory.extraction.output_format", output_format)
 
         # Build initial messages from provider
@@ -476,22 +480,25 @@ class ExtractLoop:
 
                     continue
                 gate_errors = await self._validate_content_gates(final_operations)
-                patch_errors = gate_errors + await self._validate_patch_operations(final_operations)
-                if patch_errors and patch_repair_count == 0:
+                patch_errors = await self._validate_patch_operations(final_operations)
+                if (gate_errors or patch_errors) and patch_repair_count == 0:
                     patch_repair_count += 1
                     max_iterations += 1
                     self._disable_tools_for_iteration = True
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Memory content validation failed after applying the proposed edits. "
-                                "Re-emit corrected operations. Errors: " + json.dumps(gate_errors)
-                                if gate_errors
-                                else self._build_patch_repair_instruction(patch_errors)
-                            ),
-                        }
-                    )
+                    if self._last_operations_content:
+                        messages.append(
+                            {"role": "assistant", "content": self._last_operations_content}
+                        )
+                    repair_parts = []
+                    if patch_errors:
+                        repair_parts.append(self._build_patch_repair_instruction(patch_errors))
+                    if gate_errors:
+                        repair_parts.append(
+                            "Memory content validation failed after applying the proposed edits. "
+                            "Re-emit corrected operations. Errors: "
+                            + json.dumps(gate_errors, ensure_ascii=False)
+                        )
+                    messages.append({"role": "user", "content": "\n\n".join(repair_parts)})
                     tracer.info(
                         f"Extended max_iterations to {max_iterations} for retry patch repair"
                     )
@@ -504,14 +511,13 @@ class ExtractLoop:
             failure_kind = self._last_llm_failure_kind or "unknown"
             failure_preview = _preview_text(self._last_llm_failure_content)
             parse_error = self._last_parse_error
-            # Add format error message if parse failed (max 1 retry). This may raise
-            # max_iterations, granting one more attempt after this failure.
+            # Grant only one extra attempt. Later failures still need fresh feedback
+            # while the existing iteration budget allows another call.
             if self._format_retry_count == 0:
                 self._format_retry_count += 1
                 max_iterations += 1
                 retry_reason = "refusal_text" if failure_kind == "refusal_text" else "format_retry"
                 tracer.info(f"Extended max_iterations to {max_iterations} for {retry_reason}")
-                self._add_format_error_message(messages)
 
             # A failure is only terminal when no retry attempt remains after it.
             retry_remaining = iteration < max_iterations
@@ -522,6 +528,7 @@ class ExtractLoop:
                 f"response_preview={failure_preview!r}"
             )
             if retry_remaining:
+                self._add_format_error_message(messages)
                 # Recoverable: another attempt will run. Keep it in the trace only,
                 # not the console/log stream.
                 tracer.info(failure_message)
@@ -1024,6 +1031,39 @@ class ExtractLoop:
             if replacement_uri and replacement_uri != delete_uri:
                 delete_replacements[delete_uri] = replacement_uri
 
+        case_references = []
+        case_schema = next((schema for schema in schemas if schema.memory_type == "cases"), None)
+        for selected_id in dict.fromkeys(getattr(operations, "selected_case_ids", []) or []):
+            uri = page_id_map.resolve(selected_id) if page_id_map is not None else None
+            memory = self.context_provider.read_file_contents.get(uri)
+            if case_schema is None or memory is None or self._memory_type_for_uri(uri) != "cases":
+                raise ValueError(f"Selected Case page_id {selected_id} is not a loaded Case")
+            if any(file.uri == uri for file in delete_file_contents):
+                raise ValueError(f"Selected Case page_id {selected_id} is deleted by this response")
+            fields = {
+                field.name: memory.extra_fields[field.name]
+                for field in case_schema.fields
+                if field.name in memory.extra_fields
+            }
+            reference = ResolvedOperation(
+                memory_type="cases",
+                memory_fields=fields,
+                uris=[],
+                old_memory_file_content=memory,
+                page_id=selected_id,
+            )
+            allowed_uris = self._isolation_handler.calculate_memory_uris(
+                memory_type_schema=case_schema,
+                operation=reference,
+                extract_context=self._extract_context,
+            )
+            if uri not in allowed_uris:
+                raise ValueError(
+                    f"Selected Case page_id {selected_id} is outside the allowed Case scope"
+                )
+            reference.uris = [uri]
+            case_references.append(reference)
+
         raw_links = getattr(operations, "links", None) or []
         if invalid_reference_page_ids:
             raw_links = [
@@ -1038,6 +1078,7 @@ class ExtractLoop:
             page_id_map,
         )
         resolved = ResolvedOperations(
+            case_references=case_references,
             upsert_operations=upsert_operations,
             delete_file_contents=delete_file_contents,
             errors=errors,
@@ -1051,6 +1092,9 @@ class ExtractLoop:
                     op.old_memory_file_content = old_content
                     break
 
+        resolve_metadata = getattr(self.context_provider, "resolve_operation_metadata", None)
+        if callable(resolve_metadata):
+            resolve_metadata(operations, resolved)
         return resolved, raw_links
 
     def _normalize_delete_ids(self, raw_delete_ids: List[Any]) -> List[DeleteId]:
@@ -1340,7 +1384,9 @@ class ExtractLoop:
         messages.append(
             {
                 "role": "user",
-                "content": self._output_protocol.render_format_retry(self._last_parse_error),
+                "content": self._output_protocol.render_format_retry(
+                    self._last_parse_error, failed_content=self._last_llm_failure_content
+                ),
             }
         )
 
@@ -1353,7 +1399,7 @@ class ExtractLoop:
             clone_operation_for_uri,
             render_operation_after_file,
         )
-        from openviking.session.memory.validation.content import get_content_gate
+        from openviking.session.memory.validation.content import get_field_gates
 
         schemas = {
             schema.memory_type: schema
@@ -1362,7 +1408,7 @@ class ExtractLoop:
         errors = []
         staged = {}
         for operation in operations.upsert_operations:
-            if get_content_gate(operation.memory_type) is None:
+            if not get_field_gates(operation.memory_type):
                 continue
             for uri in operation.uris:
                 try:
@@ -1473,6 +1519,7 @@ class ExtractLoop:
                             "field": field_name,
                             "block_index": block_index,
                             "search": search,
+                            "replace": block.replace,
                             "reason": reason,
                             "match_count": match_count,
                             "found_in_other_uris": found_in,

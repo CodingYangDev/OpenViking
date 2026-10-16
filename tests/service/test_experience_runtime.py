@@ -68,6 +68,9 @@ class MemoryFS:
     async def write_file(self, uri, content, ctx, **kwargs):
         self.files[self._uri_to_path(uri, ctx)] = content
 
+    async def exists(self, uri, ctx):
+        return self._uri_to_path(uri, ctx) in self.files
+
     async def stat(self, uri, **kwargs):
         return {}
 
@@ -503,7 +506,23 @@ async def test_ack_endpoint_is_removed(env, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_python_extraction_to_storage_to_runtime(env, monkeypatch):
+@pytest.mark.parametrize(
+    "source,slot_values",
+    [
+        (PROGRAM, {"known": True}),
+        (
+            'dag = workflow("Alternative evidence")\n'
+            'a = check("A holds")\n'
+            'b = check("B holds")\n'
+            "either = any_of(a, b)\n"
+            'order = call("query_order", "Use the current order ID")\n'
+            "either.then(order)",
+            {"a": True},
+        ),
+    ],
+    ids=["ordinary", "any-of"],
+)
+async def test_python_extraction_to_storage_to_runtime(env, monkeypatch, source, slot_values):
     from openviking.session.memory.experience.experience_context import (
         AgentExperienceContextProvider,
     )
@@ -539,7 +558,7 @@ async def test_python_extraction_to_storage_to_runtime(env, monkeypatch):
     # Exercise both the ordinary SDK program parser and the nested DAG program
     # interpreter, including the existing one-retry extraction repair path.
     bad = 'sdk.create_experiences(experience_name="fresh", content="dag.delete_node(999)", supersedes="")\nsdk.commit()'
-    good = f'sdk.create_experiences(experience_name="fresh", content={PROGRAM!r}, supersedes="")\nsdk.commit()'
+    good = f'sdk.create_experiences(experience_name="fresh", content={source!r}, supersedes="")\nsdk.commit()'
     model.model = "mock"
     model.get_completion_async.side_effect = [bad, good]
     loop = ExtractLoop(
@@ -555,21 +574,28 @@ async def test_python_extraction_to_storage_to_runtime(env, monkeypatch):
     assert model.get_completion_async.await_count == 2
     assert len(resolved.upsert_operations) == 1
     op = resolved.upsert_operations[0]
-    assert (
-        json.loads(compile_dag(op.memory_fields["content"]))["nodes"]["2"]["slot_provider"][
-            "tool_name"
-        ]
-        == "query_order"
+    assert any(
+        node.get("slot_provider", {}).get("tool_name") == "query_order"
+        for node in json.loads(compile_dag(op.memory_fields["content"]))["nodes"].values()
     )
-    assert "DAG construction failed" in str(model.get_completion_async.call_args)
+    retry_messages = model.get_completion_async.call_args.kwargs["messages"]
+    assert any(
+        "Memory content validation failed after applying the proposed edits" in message["content"]
+        for message in retry_messages
+    )
+    assert any("Unsupported DAG relation" in message["content"] for message in retry_messages)
 
     updater = MemoryUpdater(registry=registry)
     updater._viking_fs = fs
-    await updater._apply_upsert(op, ctx)
+    lease = await fs.acquire(fs._uri_to_path(op.uris[0], ctx))
+    try:
+        await updater._apply_upsert(op, ctx, lease_ref=lease["lease_ref"])
+    finally:
+        await fs.release(lease)
     stored = await fs.read_file(op.uris[0], ctx)
     assert MemoryFileUtils.read(stored).memory_type == "experiences"
     model.get_completion_async.side_effect = None
-    model.get_completion_async.return_value = '{"slot_values":{"known":true}}'
+    model.get_completion_async.return_value = json.dumps({"slot_values": slot_values})
     result = await ExperienceRuntime(fs, resolver).advance(
         "viking://session/s1",
         AdvanceExperienceRequest(
@@ -672,3 +698,40 @@ def test_sync_http_client_forwards_explicit_advice_query(options, expected_thres
         "score_threshold": expected_threshold,
     }
     assert request.await_args.kwargs["limit"] == 3
+
+
+@pytest.mark.asyncio
+async def test_direct_slot_filling_cannot_override_local_or_logic(env):
+    ctx, fs, model, resolver = env
+    program = """dag = workflow("Alternative conditions")
+a = check("A")
+b = check("B")
+either = any_of(a, b)
+r = tell("Act")
+either.then(r)"""
+    fs.files[fs._uri_to_path(EXPERIENCE, ctx)] = MemoryFileUtils.write(
+        MemoryFile(content=program, memory_type="experiences")
+    )
+    runtime = ExperienceRuntime(fs, resolver)
+    for values, expected in [
+        ({"either": True, "r": True}, []),
+        ({"a": True, "either": False}, ["r"]),
+        ({"a": False, "b": False, "either": True}, []),
+    ]:
+        model.get_completion_async.return_value = json.dumps({"slot_values": values})
+        model.get_completion_async.reset_mock()
+        result = await runtime.advance(
+            "viking://session/s1",
+            AdvanceExperienceRequest(
+                experience_uri=EXPERIENCE, state=[{"role": "user", "content": "Current facts"}]
+            ),
+            ctx,
+        )
+        assert [action.slot_name for action in result.actions] == expected
+        assert "either" not in result.slot_values
+        assert 3 not in result.executed_nodes
+        model.get_completion_async.assert_awaited_once()
+        assert (
+            "Never emit values for AnyOfNode"
+            in model.get_completion_async.await_args.kwargs["messages"][0]["content"]
+        )

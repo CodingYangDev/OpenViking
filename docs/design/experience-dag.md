@@ -5,6 +5,78 @@ The `content` field contains the complete DAG construction source. Python is nev
 with `exec` or `eval`; a restricted interpreter validates and builds the runtime DAG.
 Existing text experiences are not converted or accepted as DAG templates.
 
+## Case means a business domain
+
+The existing `Case`, `cases` memory type, `case_name` and learning APIs keep their names.
+A memory Case describes a business domain, not one benchmark question or narrow workflow.
+Tasks within the same domain share its fixed Experience; workflow/rule differences live in
+conditional Experience branches. Different business domains remain distinct.
+
+Batch CaseSpec remains the concrete task transport for execution and scoring. Commits use the
+same user-memory extraction, retrieval and merge pipeline as ordinary Sessions, not a task-ID
+Case writer. Control envelopes stay outside the numbered business conversation. When Cases are
+allowed, task requirements and external evaluation reports are supplied separately to the Case
+extractor as rubric evidence, not as personal memories, events or task-specific domain rules.
+This is a model-facing projection, not the full CaseSpec: retain domain/user request, rubric
+text and reported evaluation evidence; omit task name/signature, split/task/trial metadata and
+rubric labels derived from task identity. Criterion results are associated with criterion text
+when available. The original envelopes, Session identifiers and experiment records remain
+unchanged for tracing/scoring. This does not scrub literal strings from business dialogue or
+migrate Trajectories when a Case is merged.
+
+A Case has no `evidence` field: domain scope/context/principles are its definition; execution
+facts and external scores belong to Trajectories. Existing Cases are explicitly selected without
+content writes using `sdk.commit(cases=[loaded_case])` or JSON `selected_case_ids`. Only loaded,
+in-scope, non-deleted Case references are accepted. New Cases are associated through creation.
+Read-only selections bypass the write batch; reading search candidates alone never selects them.
+Selections remain internal references, separate from upserts and archive write diffs. Recording a
+Trajectory still maintains its real provenance links/backlinks through the existing storage code.
+Old evidence fields are ignored when loading a Case for learning; existing files are not migrated.
+
+New memory proposals use the existing merge candidate lookup even in single-request batches.
+Without existing candidates, a singleton can be written without a second model call; otherwise
+freshly read candidates and the proposal are compared by the shared patch merger. Each type/peer
+batcher keeps at most ten recent successful target URIs as additional read hints, bridging
+asynchronous vector indexing without caching file contents. These hints are process-local, not
+a global identity registry. Reading a candidate does not select it: existing Cases must still
+be explicitly associated with the submitting execution. Candidate lookup/read/model failures
+must not fall back to blindly applying new creates. Existing duplicate files are not migrated.
+Automatic flushes recheck current count/time readiness after acquiring the flush lock; queued
+flush tasks cannot prematurely consume a new underfilled buffer. Close still drains remaining work.
+
+```text
+Task A -> its Session, task_spec and evaluation -> Trajectory A --+
+                                                              +-> shared Case -> one Experience
+Task B -> its Session, task_spec and evaluation -> Trajectory B --+
+```
+
+Each Trajectory stores the supplied concrete `task_spec` (input and rubric included) as server-owned
+metadata, alongside its own outcome/evaluation and source archive. It is null for Sessions without
+a task envelope; their concrete facts remain in the Session/Trajectory. Case `input` remains
+plain-text domain context. Case `rubric` is a mutable JSON list of `{id, description}` criteria
+(stored in the schema's string field with `patch` merge semantics). The Case extractor maintains
+stable IDs from supplied rules, requirements and feedback without storing task-specific answers.
+The normal field gate validates the complete list after patch application; unchanged Cases can
+still be selected without writes. Loading maps these definitions into `Rubric.criteria`.
+
+The existing Trajectory extraction call receives the Case rubric, conversation and, if available,
+the full external evaluator report. Its LLM supplies best-effort assessments with
+`passed: true/false/null` and evidence; null covers insufficient evidence or inapplicability.
+Partial or empty assessments do not block factual Trajectory persistence. The server omits
+unknown IDs, all entries for repeated IDs, and malformed judgments; unparseable JSON or a
+non-list value becomes an empty assessment list. Discarded data is logged without inventing
+missing judgments or remapping IDs. No evaluator field-name whitelist creates the results.
+The server binds each retained result to the exact `{id, description}` snapshot supplied to
+that call and persists it in `evaluation_criteria`. Case rubric definitions remain strict; other
+trajectory validations are unchanged. Later Case edits or
+removals cannot reinterpret historical results. Original external outcomes/scores remain separate
+and unchanged for benchmark reporting; ordinary Sessions without them retain an unknown overall
+outcome. No additional model call or historical rewrite is introduced. Synthesis keeps
+these executions separate and judges each against its own task and rules. Feedback collection and
+fixed Case-to-Experience ownership are unchanged. Cross-Case feedback routing is not added here.
+Existing task-bound Case files are not automatically merged or migrated; running services and
+experiments must explicitly adopt the new code/templates before their behavior changes.
+
 ## Extraction and updates
 
 Agent Evolution first persists one factual Trajectory for each `(Case, Session archive)`.
@@ -18,7 +90,7 @@ or refused. It preserves conditions and exceptions, not unrelated persona/style 
 an empty context section is valid when no relevant rule is supplied. Training control messages
 are excluded. Relevant rule selection is prompt-guided; paragraphs are not required by a runtime
 validator to match contiguous substrings of the source text.
-No separate memory-schema field or extra LLM call is added. The model is asked to preserve the
+Rule selection uses the existing Trajectory extraction call. The model is asked to preserve the
 order, source labels and important facts of user messages, assistant messages, Experience Reminders
 and tool records. Source input types remain explicit; the server owns Case name, archive
 link, outcome, compact evaluation and Experience execution paths. Client-recorded reminder delivery is never
@@ -63,10 +135,13 @@ complete combined `content` plus compact evaluation and execution metadata, so e
 own rules rather than inheriting another run's policy. Each selected Trajectory occupies its own
 `user` message: compact YAML metadata followed by the original Markdown content, not a JSON-escaped
 string. A separate `user` message holds Case/batch metadata, and another holds the existing
-Experience as plain source text (or the read error). The final user message requests the update.
+Experience as plain source text (or the read error). After the system instructions, model messages
+are ordered as Case/batch metadata → existing Experience → Trajectories (success, failure, other)
+→ final update request. The generic SDK binding index is still appended at the request boundary.
+Existing Experience content stays in a `user` message, not the system rules.
 All records still share one model request; this is not one extraction call per Trajectory.
 The existing read/SDK-binding path runs before this presentation step, so
-`experience.content.overwrite(...)` still refers to the actually loaded memory. No assistant/tool
+`experience.content.edit(...)`, `drop(...)`, and `overwrite(...)` refer to the actually loaded memory. No assistant/tool
 prefetch pair is sent to the model on this Experience path; ordinary memory extraction keeps its
 native tool messages. Instruction normalization does not rewrite quoted Trajectory evidence.
 The 240,000-character comparison budget counts the rendered Case/Trajectory message text,
@@ -75,8 +150,9 @@ instructions). It always retains current Trajectories. If any current Trajectory
 historical lookup is skipped entirely. Otherwise, at most the latest eligible same-Case historical
 success is selected and admitted while space remains; historical failures, partial, unfinished
 and unknown outcomes are never used as witnesses. If no historical success exists, the batch
-proceeds without one. Oversized current batches fail rather than silently dropping or splitting
-Trajectories.
+proceeds without one. This check applies to each trainer chunk. A chunk that still exceeds the
+budget fails rather than silently truncating or dropping Trajectories; count-based batching is not
+a guarantee that arbitrarily long records fit the character budget.
 
 The comparison prompt distinguishes successful runs, failed runs and unknown/partial runs. Without
 a successful run it preserves passed subcriteria and can return no-op. A grading literal alone is
@@ -91,16 +167,19 @@ Experience; the synthesized reminder should preserve the grounded scope, timing,
 
 Concurrent Sessions still extract and persist Trajectories independently, but Session commit no
 longer generates an Experience. The Phase 2 caller provides an explicit batch of Trajectory URIs,
-or asks the server to scan pending records. Each invocation produces at most one DAG per Case.
+or asks the server to scan pending records. Each Case keeps one fixed Experience target, which
+may be updated by multiple consecutive chunks in the same invocation.
 `pending -> processing -> applied|no_op|failed` is server-owned metadata; processing leases permit
 recovery after interruption. The benchmark invokes Phase 2 once after all commit tasks in its
 epoch finish and before evaluation. Online callers may invoke it after a quiet window or another
 external batch boundary. Inside an invocation, up to ten Case groups execute concurrently by default
-(`StreamingPolicyTrainerConfig.max_concurrent_cases`). Each admitted Case uses the explicit
-`StreamingPolicyTrainer.train_gradients` entry, sharing the existing plan/apply implementation
-without starting a time-window timer or splitting that Case's observations by the streaming
-chunk-size limit. Model planning runs outside the policy-directory lock; fresh-version
-validation and apply remain locked. Case-link/snapshot finalizers are serialized. Queued Cases
+(`StreamingPolicyTrainerConfig.max_concurrent_cases`). Each admitted Case uses the existing
+`StreamingPolicyTrainer.submit_gradients` count/window batching. Updates are split by
+`max_gradients_per_update` (default 16) and execute serially against the latest Experience.
+Model planning runs outside the policy-directory lock; fresh-version validation and apply remain
+locked. Case-link/snapshot finalizers are serialized and finish each chunk before the next update.
+Only that chunk's source Sessions and Trajectories are finalized; later failures preserve earlier
+`applied`/`no_op` states and report already completed Experience writes. Queued Cases
 remain pending until admitted, and overlapping learning invocations remain serialized. On
 cancellation, active workers are joined; unfinished processing records retain their expiring
 leases for recovery. Optional proposal Gate configuration is retained and defaults to
@@ -188,10 +267,38 @@ Trajectories it observed while also recovering pending records from an interrupt
 are idempotent: `applied` and `no_op` records are skipped; expired `processing` leases may be
 reclaimed; `failed` records require `retry_failed=true`. Historical records without the
 server-owned `experience_update` state are never re-consumed as pending work. Only records marked
-with the current `ordered_markdown_v2` format participate in comparison; older formats are ignored
+with the current `ordered_markdown_v3` format participate in comparison; older formats are ignored
 and are not automatically migrated.
 
-Updates read the old source and may apply exact local patches or a full replacement. The
+Trajectory `content` is the complete immutable model-facing evidence. At observation creation,
+the server prepends a `# Trajectory Record` YAML block with identity/provenance, `task_spec`,
+`outcome`, compact `evaluation`, `evaluation_criteria`, `experience_execution`, and validated
+`experience_effects` / `experience_effect_sources`, followed by the extracted Session Context
+and ordered observation body. The external outcome/evaluation and fixed identity are server-owned;
+criterion judgments and effects are model-produced, validated and frozen with their definitions. Metadata remains available for outcome selection,
+optional Gate inputs, attribution and lifecycle management; mutable `experience_update` state
+is excluded from the body. Lifecycle writes and retries preserve the body without re-rendering.
+Experience synthesis sends each Trajectory as one user message, retaining the Session Context
+and dialogue verbatim while compacting its generated header: identity/task metadata is omitted
+and only explicitly failed criterion snapshots are presented. Full results, including true/null,
+remain stored. Missing checks are not proof of success. Case context and the existing Experience
+remain separate messages, and the budget counts the compact model-facing view. Formats before v3 are
+not promoted or repaired at read time and are excluded from Phase 2 selection.
+
+Trajectory source preparation omits the empty text placeholder of tool-bearing messages,
+not their tool records or meaningful mixed text. Independent empty dialogue is preserved.
+System rules remain in the single `source_steps` input and are used only for Session Context,
+not numbered policy-receipt steps; real policy quotations and assistant explanations remain
+observed dialogue. Native and VikingBot Tau2 builders no longer append synthetic `tau2-reward`
+user messages. Evaluation travels through `Rollout.evaluation` and OutcomeEvaluation instead.
+The persisted `evaluation` includes optional `details` for original termination reasons,
+non-null evaluator information and errors, so removing duplicate dialogue does not hide
+`max_steps` or evaluation failures. Scores, criteria, confirmations, rejected tool calls and
+actual STOP events retain their existing meanings. This changes newly produced observations;
+it does not rewrite existing archives, Trajectories or cached rollouts.
+
+
+Updates read the old source and may apply local patches or a full replacement. The
 resulting complete program begins with `dag = workflow(...)`, declares observable trigger conditions with `check(...)`
 and reminder leaves with `tell(...)`, and adds relationships through object references. New
 Experience programs do not encode the agent's complete action path. Node variable names stay stable
@@ -208,10 +315,53 @@ and validation path. Storage validates again before accepting replacements or re
 The source body bypasses Markdown content templates and linkification; relations remain in
 `MEMORY_FIELDS` metadata.
 
+### JSON-string fields in the Python SDK
+
+Memory fields such as Case `rubric`, Trajectory `evaluation_criteria`, and `experience_effects`
+remain `string` fields. In the final Python SDK program, serialize Python literal data with
+`sdk.json_dumps(value)` instead of manually escaping JSON inside another string:
+
+```python
+json_text = sdk.json_dumps([
+    {"id": "confirmation", "passed": True, "evidence": """The user said "yes" before the action."""}
+])
+# Pass json_text to the appropriate JSON-string field in a listed write method.
+```
+
+This pure helper takes one positional argument and no options/callbacks. It uses standard JSON
+serialization with Unicode text preserved and non-finite numbers rejected. Encoded UTF-8 output
+is bounded by the SDK expression-size limit while encoding, not after building a potentially huge
+string. Memory objects and write handles are not serializable. No Python imports, arbitrary calls,
+read-only eval functions, or additional model calls are enabled. JSON-mode output is unchanged.
+This only guarantees serialization for supported data: rubric IDs, evidence types, missing entries
+and judgments still follow their domain validation and existing nonblocking commit behavior.
+
 ### Materialized content validity gate
 
-Experience `content` uses `merge_op: patch`: exact local `edit`/`drop` operations and complete
-`overwrite` replacements are supported. The persisted result must remain a complete DAG.
+Experience `content` uses `merge_op: patch`: local `edit`/`drop` operations and complete
+`overwrite` replacements are supported. Synthesis and fixed-target merge prompts follow the generic
+SDK policy: prefer the smallest unique local edit; use overwrite only for broad rewrites. Create
+still requires complete source. The persisted result, not each edit snippet, must be a complete DAG.
+Both JSON and Python edits reuse the shared exact-first, fuzzy-fallback patch matcher. Validated
+fields apply blocks sequentially and reject the whole candidate if any block fails, rather than
+saving a partial update. Preview and locked persistence use the same merge-and-validation path.
+If the field changed after it was read, anchors must still match exactly; fuzzy matching must not
+silently overwrite concurrent changes. Unrelated changes with intact exact anchors remain mergeable.
+Prompt examples show a simple check/tell graph as read-only input for a local edit and a complete
+ask/call/choose/tell graph for overwrite. Create uses a compact call form; no-op is a one-line
+instruction. Generated SDK text arguments use outer `'''...'''` strings; embedded DAG text literals
+use `"""..."""`, which need no outer-layer quote escaping. Plain strings are the default; use
+`f'''...'''` only for interpolation and escape literal braces. Escape literal outer delimiters,
+trailing quotes that would join the closing delimiter, and backslashes that must survive decoding.
+This is a generation convention, not a parser restriction: other valid quote styles remain accepted.
+Do not reformat saved content or copied search/drop anchors to enforce it. The shared generation
+and repair prompts demonstrate the same convention. Experience synthesis and fixed-target merge
+omit only the cross-memory link example, not link rules, parser support, or validation; other
+extraction contexts keep that example.
+SDK editing and binding rules are defined by the output protocol, with fixed-target details in
+the Experience provider. The schema owns node selection, entity-ID generalization, preservation
+of unaffected graph structure, ordinary AND semantics, and explicit `any_of` joins. The provider owns trajectory evidence scope
+and attribution, rather than repeating those schema rules.
 
 The common path is **schema field merge → type-owned content gate → persistence**.
 `session/memory/validation/content.py` registers type-owned validators; the Experience
@@ -387,8 +537,10 @@ particular, `call("search_advice")`, `call("search_exp")`, `call("search_experie
 
 Each `instructions` entry returned by Experience search carries structured `conditions` for
 its reached predecessor path. Each entry has `description`, `operator` (`is_true`, `is_false`, `equals`, or `not_in`),
-and `values` for choice labels. All entries are required together, matching DAG predecessor
-AND semantics. A condition's original text, including any internal AND/OR, is not rewritten.
+and `values` for choice labels. Entries form one sufficient activation path: ordinary AND joins
+include all required inputs, while `any_of` includes one actually satisfied input path, not every
+alternative. Logical joins themselves are not model judgments or evidence facts. A condition's
+original text, including any internal AND/OR, is not rewritten.
 False branches negate the whole predicate; choice branches retain the selected label. An
 explicit default branch lists the excluded named choices, not an unknown or missing answer.
 
@@ -463,7 +615,7 @@ metadata, including the user-message or before-action trigger. Injected messages
 tool-history positions. `dag_runtime` keeps evaluations and separate `delivered_advice` facts;
 client delivery does not manufacture completed Ask/Call nodes. Existing retrieval thresholds and DAG rules are unchanged.
 
-When a rollout is committed, the opening CaseSpec contains only static Case input and rubric data.
+When a rollout is committed, the opening CaseSpec contains only static concrete-task input and rubric data.
 The final OutcomeEvaluation control message carries two sibling fields: `evaluation` and
 `experience_execution`. The latter is the final runtime snapshot keyed by Experience URI:
 current evaluation state, slot values, evaluated/current nodes, actions,
@@ -497,7 +649,20 @@ Gate rejections remain explicit diagnostics in the memory diff.
 ## Semantics and state
 
 - A source may fan out to many nodes with `source.then(a, b)`. Multiple predecessor edges
-  form an AND join: all predecessors must be reached in this evaluation.
+  to an ordinary node form an AND join: all incoming paths must be reached in this evaluation.
+- `either = any_of(a, b)` creates a native `AnyOfNode` with OR inputs. It has no slot provider:
+  the runtime traverses it locally when any incoming path is satisfied. False, unknown or
+  unreachable checks do not satisfy the join. OR results are recomputed, never latched across requests.
+  The node is excluded from JEV/LLM slot questions, advice and external completion facts.
+  Nested joins are supported; empty or duplicate inputs and cycles are rejected. Branch selectors
+  retain their routing semantics: join their selected path nodes rather than the selector itself.
+  For example, `(a OR b) AND confirmed` is expressed as:
+
+  ```python
+  either = any_of(a, b)
+  either.then(reminder)
+  confirmed.then(reminder)
+  ```
 - Non-choice conditions and evidence-backed AskUser/CallTool nodes use booleans. TellAgent
   nodes emit advice; models cannot mark them delivered. A Tell does not act as a cross-request
   gate for subsequent advice. The server may return the same applicable advice on every call.
@@ -534,3 +699,33 @@ These checks include the Python extraction protocol, repair, graph materializati
 serialization and server runtime in one flow, using a mock VLM and storage. They also cover
 invalid programs/graphs, branches, default-instance validation, stateless reevaluation, client restart recovery, isolation,
 and concurrent state updates. They do not measure live-model slot-filling accuracy.
+
+
+## Experience 效果反馈
+
+Trajectory 提取会在同一次模型调用中生成 schema 字段 `experience_effects`：
+`positive_ids`、`negative_ids`、`weak_ids` 三个互斥数组。未分类代表未知或中性，
+不等于证明经验无用；这些标签也不等于 reward 或因果结论。
+
+服务端只为运行时 `delivered_advice` 中实际送达的经验分配 `E1` 等编号，
+不会把候选、等待中的 DAG 节点或模型声明当作已注入。对应的编号到 URI 映射作为
+`experience_effect_sources` 系统元数据与不可变 Trajectory 一同保存。
+不合法或未注入的编号由现有 provider 操作校验与修复循环处理。
+
+`feedback_stats` 不声明为模型可写的 schema 字段。它作为 Experience 的隐藏系统元数据，
+由代码通过既有 `MemoryUpdater` 在写集合锁内更新，不单独直接改写文件，也不重新嵌入
+未改变的 DAG 内容。普通内容更新保留这些元数据；模型 SDK、JSON 输出和合并提示词
+不能把它们作为可写的业务字段。
+
+统计包含 `injected_count`、`positive_count`、`negative_count`、`weak_count` 和
+`neutral_count`。同一 Experience 在同一 Trajectory 中最多计一次；`injected_count`
+是被计入反馈的轨迹数量，而不是提醒插入消息的次数；统计按 Experience URI 跨版本累计，
+不代表当前版本的成功率。内部 `observed_trajectories`
+集合与计数在同一次文件更新中持久化，支持并发提交及失败后的幂等重试。
+
+缓存命中已保存的 Trajectory 时，仅重试未完成的统计，不重新调用模型提取标签。
+没有送达绑定的历史轨迹不回填，已删除的 Experience 不会因统计而重建。
+读取或写入故障、损坏的统计结构会报错而不是清零或伪报成功。
+
+Phase 2 可以读取单条轨迹的效果标签和编号绑定来辅助分析，但必须重新核对源步骤、
+当前政策与评估事实。当前不根据累计统计自动重排、删除经验或修改 benchmark 分数。

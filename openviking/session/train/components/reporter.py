@@ -232,34 +232,6 @@ class ConsolePipelineReporter(NoopPipelineLifecycleHook):
         del context
         label = str(report.get("rollout_stage") or label)
         split = report.get("split")
-        trial_count = int(report.get("trial_count") or 1)
-        if trial_count > 1:
-            self._print_line(
-                label,
-                [
-                    ("epoch", report["epoch"]),
-                    *_split_field(split),
-                    ("trials", trial_count, "cyan"),
-                    ("cases_per_trial", report.get("case_count_per_trial") or "varies"),
-                    (
-                        "total_rollouts",
-                        report.get("total_rollout_count", report["case_count"]),
-                        "cyan",
-                    ),
-                    (
-                        "accuracy",
-                        fmt_percent(report.get("accuracy_mean")),
-                        _accuracy_style(report.get("accuracy_mean")),
-                    ),
-                    ("", f"± {fmt_percentage_point_abs(report.get('accuracy_std'))}", "yellow"),
-                    *_cost_field(report),
-                ],
-            )
-            self._remember_eval_report(label, report)
-            if _is_epoch_test_report(label, report):
-                self._print_epoch_summary(int(report["epoch"]))
-            self._print_stage_separator()
-            return
         self._print_line(
             label,
             [
@@ -276,6 +248,8 @@ class ConsolePipelineReporter(NoopPipelineLifecycleHook):
                     f"{report['passed_count']}/{report['case_count']}",
                     _passed_style(report),
                 ),
+                *_execution_error_field(report),
+                *_token_usage_field(report),
                 *_cost_field(report),
             ],
         )
@@ -320,6 +294,8 @@ class ConsolePipelineReporter(NoopPipelineLifecycleHook):
                     f"{report['passed_count']}/{report['case_count']}",
                     _passed_style(report),
                 ),
+                *_execution_error_field(report),
+                *_token_usage_field(report),
                 *_cost_field(report),
             ],
         )
@@ -344,6 +320,8 @@ class ConsolePipelineReporter(NoopPipelineLifecycleHook):
                     else []
                 ),
                 ("errors", error_count, "green" if error_count == 0 else "red bold"),
+                *_execution_error_field(report),
+                *_token_usage_field(report),
                 *_cost_field(report),
             ],
         )
@@ -451,9 +429,9 @@ class ConsolePipelineReporter(NoopPipelineLifecycleHook):
         border_bottom = "=" * len(border_top)
         self._print_summary_fragments([(border_top, "cyan bold")])
         if train_data is not None:
-            self._print_summary_fragments(_train_summary_fragments(train_data))
+            self._print_summary_fragments(_accuracy_summary_fragments(train_data, label="TRAIN"))
         if test_data is not None:
-            self._print_summary_fragments(_test_summary_fragments(test_data))
+            self._print_summary_fragments(_accuracy_summary_fragments(test_data, label="EVAL "))
         self._print_summary_fragments([(border_bottom, "cyan bold")])
 
     def _print_summary_fragments(self, fragments: list[tuple[str, str]]) -> None:
@@ -466,20 +444,24 @@ class ConsolePipelineReporter(NoopPipelineLifecycleHook):
         Console().print(line)
 
     def _report_eval_line(self, label: str, data: dict[str, Any]) -> None:
-        trial_count = int(data.get("trial_count") or 1)
-        if trial_count > 1:
-            print(
-                f"{label} accuracy: {fmt_percent(data.get('accuracy_mean'))} ± "
-                f"{fmt_percentage_point_abs(data.get('accuracy_std'))} "
-                f"(trials={trial_count}, "
-                f"cases_per_trial={data.get('case_count_per_trial') or 'varies'})"
-            )
-            return
-        print(
-            f"{label} accuracy: "
-            f"{fmt_percent(data['accuracy'])} "
-            f"({data['passed_count']}/{data['case_count']})"
-        )
+        print("".join(text for text, _ in _accuracy_summary_fragments(data, label=label)))
+
+
+def _execution_error_field(report: dict[str, Any]) -> list[tuple[str, int, str]]:
+    count = int(report.get("execution_error_count", 0))
+    return [("execution_errors", count, "red bold")] if count else []
+
+
+def _token_usage_field(report: dict[str, Any]) -> list[tuple[str, str, str]]:
+    usage = report.get("token_usage")
+    if not isinstance(usage, dict):
+        return []
+    average = usage["average_tokens_per_rollout"]
+    value = "n/a" if average is None else f"{average:,.1f}"
+    reported, count = usage["reported_rollout_count"], usage["rollout_count"]
+    if reported != count:
+        value += f" (usage {reported}/{count})"
+    return [("avg_tokens", value, "cyan")]
 
 
 def _cost_field(report: dict[str, Any]) -> list[tuple[str, str, str]]:
@@ -573,40 +555,18 @@ def _summary_train_report(summary: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _train_summary_fragments(data: dict[str, Any]) -> list[tuple[str, str]]:
+def _accuracy_summary_fragments(data: dict[str, Any], *, label: str = "") -> list[tuple[str, str]]:
+    """Use the same compact accuracy/count/token display for every report."""
     accuracy = data.get("accuracy")
     passed = data.get("passed_count")
     total = data.get("case_count")
     fragments = [
-        ("TRAIN accuracy: ", "bold"),
+        (f"{label} accuracy: " if label else "accuracy: ", "bold"),
         (fmt_percent(accuracy), _accuracy_style(accuracy)),
     ]
     if passed is not None and total is not None:
-        fragments.extend([("  passed=", "default"), (f"{passed}/{total}", _passed_style(data))])
-    return fragments
-
-
-def _test_summary_fragments(data: dict[str, Any]) -> list[tuple[str, str]]:
-    trial_count = int(data.get("trial_count") or 1)
-    if trial_count > 1:
-        accuracy = data.get("accuracy_mean")
-        fragments = [
-            ("EVAL  accuracy: ", "bold"),
-            (fmt_percent(accuracy), _accuracy_style(accuracy)),
-            (" ± ", "default"),
-            (fmt_percentage_point_abs(data.get("accuracy_std")), "yellow"),
-            ("  trials=", "default"),
-            (str(trial_count), "cyan"),
-        ]
-        return fragments
-
-    accuracy = data.get("accuracy")
-    fragments = [
-        ("EVAL  accuracy: ", "bold"),
-        (fmt_percent(accuracy), _accuracy_style(accuracy)),
-        ("  passed=", "default"),
-        (f"{data.get('passed_count')}/{data.get('case_count')}", _passed_style(data)),
-    ]
+        fragments.append((f" ({passed}/{total})", _passed_style(data)))
+    fragments.extend((f"  {_plain_field(field)}", field[2]) for field in _token_usage_field(data))
     return fragments
 
 
@@ -620,12 +580,6 @@ def fmt_percentage_point(value: Any) -> str:
     if value is None:
         return "n/a"
     return f"{float(value) * 100:+.2f}pp"
-
-
-def fmt_percentage_point_abs(value: Any) -> str:
-    if value is None:
-        return "n/a"
-    return f"{float(value) * 100:.2f}pp"
 
 
 def _accuracy_style(value: Any) -> str:

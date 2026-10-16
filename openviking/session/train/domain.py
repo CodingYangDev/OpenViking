@@ -20,6 +20,8 @@ from openviking.session.memory.dataclass import StoredLink
 if TYPE_CHECKING:
     from openviking.session.train.gradients import PatchSemanticGradient
 
+DEFAULT_MAX_ROLLOUT_ITERATIONS = 100
+
 PolicyStatus = Literal["draft", "staging", "production", "deprecated", "archived"]
 TrajectoryOutcome = Literal["success", "failure", "partial", "unfinished", "unknown"]
 PolicyPlanItemKind = Literal["upsert", "delete"]
@@ -141,7 +143,12 @@ class Rubric:
 
 @dataclass(slots=True)
 class Case:
-    """An executable, reproducible, evaluable training/evaluation sample."""
+    """Structured task description with preconditions and success criteria.
+
+    Dataset CaseSpecs describe concrete executable tasks. Persisted ``cases``
+    memories use the same shape for reusable scenarios, shared by multiple tasks;
+    they are not a substitute for each task's original input and evaluation.
+    """
 
     name: str
     task_signature: str

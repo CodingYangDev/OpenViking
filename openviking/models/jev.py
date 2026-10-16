@@ -67,11 +67,11 @@ class JevClient:
         )
 
         owns_client = self.client is None
+        headers = httpx.Headers(self.config.extra_headers)
+        headers["Authorization"] = f"Bearer {self.config.api_key}"
+        headers["Content-Type"] = "application/json"
         client = self.client or httpx.AsyncClient(
-            headers={
-                "Authorization": f"Bearer {self.config.api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             timeout=self.config.timeout,
             verify=self.config.verify_ssl,
         )

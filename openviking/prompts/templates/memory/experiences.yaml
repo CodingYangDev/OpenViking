@@ -25,38 +25,49 @@ fields:
       There are two Python layers: the final reply is a write-only memory SDK program, while
       this content field is a string containing one complete, standalone DAG program.
       DAG source belongs only inside the content string, never at the top level of the reply.
+      Use triple-single-quoted strings for outer SDK text arguments and triple-double-quoted
+      strings for new text literals inside the DAG; do not reformat existing search/drop anchors.
       Inside the string, do NOT include Markdown or DAG JSON. The stored source must rebuild
-      the DAG from an empty graph: start with `dag = workflow("...")` and include every node
+      the DAG from an empty graph: start with `dag = workflow("""...""")` and include every node
       that the final DAG needs. After applying any edits, the stored result must still be a
       complete valid DAG; preserve unaffected rules, node names, and relationships.
-      SDK content editing rules:
-      - For a missing fixed target, use a bare `sdk.create_experiences(experience_name=..., content=...)`
-        call with the exact canonical Case name. Do not assign to the prefetch result variable.
-      - For an existing target, use the system-provided existing-object variable directly.
-        Never call or assign `sdk.existing(...)` yourself.
-      - The native tool reply shows the existing-object binding. Copy its exact left-hand variable
-        name and use `.content.edit(search=..., replace=...)` or `.content.drop(text=...)` for
-        local changes. Never invent or substitute a generic object variable name.
-      - Copy each search/drop snippet exactly from the existing source and ensure it matches
-        uniquely. Use `.content.overwrite("""<complete DAG source>""")` for a full replacement.
-      - Do not repeat `sdk.read(...)` or other read operations in the final write-only program.
-        End a create/update program with `sdk.commit()`; for no change, return only `sdk.commit()`.
       Experience semantics:
       - An Experience is focused conditional guidance, not a full task plan, tool trace,
         transcription of a successful execution path, rubric transcription, or complete SOP.
       - Capture only a non-obvious risk, boundary, exception, calculation scope, ordering hazard,
-        or decision distinction that the Session evidence shows the agent needs to re-check.
+        or decision distinction that the Session evidence shows the agent needs to correct or verify.
       - Do not reproduce ordinary task steps that the base policy and tool definitions already
         specify. Do not map every Case requirement or every observed tool call into a node.
       - A Case Experience may contain multiple independent guidance subgraphs. Keep unrelated
         concerns separate instead of connecting them into an artificial path.
+      Evidence and learning rules:
+      - External evaluation is authoritative for outcome and requirement compliance.
+        Do not reinterpret an evaluated failure as success because the failed trajectory gives
+        a plausible explanation.
+      - For observable behavior changes, evaluator-backed successful comparison behavior takes
+        precedence over the failed trajectory's interpretation. Derive a narrow runtime-observable
+        correction or exception from differing inputs and actions, not a full workflow or hardcoded
+        answer. A failed trajectory need not independently prove the successful comparison action.
+      - When an existing experience was delivered before the relevant decision boundary and the
+        corresponding failure still occurred, require a concrete decision-rule or action delta.
+        Reject paraphrases, stronger wording or extra checklists that preserve the same decision logic.
+      - Ground required behavior in runtime-visible evidence and preserve nearby correct cases.
+        Do not invent hidden causes, unsupported policy rules or tool capabilities.
+        A successful comparison alone does not authorize overriding an explicit source rule.
       New Experience DAGs use only these node factories. The Python variable is the stable slot
       name:
-      - check("one observable condition in the current conversation or tool evidence")
-      - ask("one specific question for information needed from the user")
-      - call("tool_name", "guidance for arguments using the current context")
-      - choose("one classification question about the current context")
-      - tell("one focused rule-review reminder to inject into the agent context")
+      - check("""one observable condition in the current conversation or tool evidence""")
+      - ask("""one specific question for information needed from the user""")
+      - call("tool_name", """guidance for arguments using the current context""")
+      - choose("""one classification question about the current context""")
+      - any_of(node_a, node_b, ...): a local OR join over distinct node variables, not a question
+      - tell("""one focused correction or verification reminder to inject into the agent context""")
+      Select node types by the evidenced correction, not to include every available type.
+      A simple check -> tell graph is sufficient for a single reminder.
+      Missing user information belongs in ask; an independent necessary tool step belongs in
+      call; mutually exclusive alternatives belong in choose.
+      Do not repeat questions or tool calls already satisfied by current evidence. When stages are needed, represent them as nodes rather than hiding
+      them inside a tell. Keep each tell local; do not pack a multi-step procedure into its text.
       Use `ask(...)` and `call(...)` only for information or tool steps supported by the Session
       evidence. The runtime checks their completion from user replies or successful tool results;
       incomplete nodes may be returned as suggestions to the agent, not executed by the DAG.
@@ -73,7 +84,7 @@ fields:
         been calculated", or "the write is about to run" predecessors of a reminder that tells
         the agent to retrieve, calculate, or prepare before writing.
       - State the applicability boundary explicitly. Split independent conditions into separate
-        check nodes. Multiple `.then(reminder)` edges into the same reminder have AND semantics.
+        check nodes.
       - Conditions describe evidence that already exists, never future steps that the agent is
         expected to perform. Unknown evidence leaves the reminder inactive.
       - Use `choose(...)` for mutually exclusive cases supported by the current context.
@@ -86,21 +97,14 @@ fields:
         the runtime continues traversing them without waiting for the advice to be followed.
         Emitting a reminder does not establish user confirmation or successful tool execution.
         Express any required evidence as separate `check(...)`, `ask(...)` or `call(...)` nodes.
-      - Each reminder focuses attention on concrete rules, facts, or decision distinctions to
-        re-check, rather than prescribing the final action. Identify the evidence-backed risk
-        and the relevant applicability conditions, exceptions, scope, or timing to review.
-      - Current authoritative policy and current user/tool evidence determine the decision.
-        Experience is a review aid, not a new business rule or a substitute for that policy.
-        Do not turn a successful Trajectory's action or outcome into a standing instruction
-        to execute, refuse, or escalate. Leave the final choice to the agent after review.
+      - Each reminder gives one evidence-backed, actionable correction or verification at a
+        concrete decision boundary. State what decision, action or output needs to change and
+        its applicability conditions, exceptions, scope and timing.
       - Do not expand a restriction on one operation to the whole goal. Remind the agent to
         check the restriction's scope and other allowed approaches against
-        task requirements and constraints; do not decide the plan for it.
-      - Keep the review specific and concise: name what needs checking, not just "be careful"
-        or "review the policy". Do not request a full policy recap, lengthy reasoning, or an
-        extra user-facing review report.
-      - Apply this review-oriented wording when creating or updating reminders. Preserve
-        supported review concerns, not a previous reminder's unexamined action prescription.
+        task requirements and constraints; do not turn one correction into a full task plan.
+      - Keep the correction specific and concise, not just "be careful" or "review the policy".
+        Do not request a full policy recap, lengthy reasoning, or an extra user-facing review report.
       - Generalize rollout-specific values unless they are invariant parts of the canonical Case.
         Do not invent rules unsupported by the Session or evaluation evidence.
       - Never copy concrete user, reservation, payment, flight, order, ticket, account or other
@@ -121,8 +125,16 @@ fields:
       No imports, loops, functions, arbitrary method calls, attribute access, expressions
       or real tool execution.
       Graphs must be acyclic and nonempty (a single node is allowed), with at most 256 nodes.
-      Predecessors have AND semantics: a node with multiple incoming edges waits until every
-      predecessor condition is satisfied.
+      Ordinary predecessors have AND semantics: a node waits until every incoming requirement is
+      satisfied. For example, multiple `.then(reminder)` edges require all their predecessors, not just one.
+      Use `either = any_of(a, b)` followed by `either.then(reminder)` when either input is sufficient.
+      Adding another `.then(reminder)` edge adds a requirement; it does not add an alternative trigger.
+      For `(a OR b) AND confirmed`, connect both `either` and `confirmed` to the reminder.
+      any_of is computed locally from currently reachable, satisfied inputs, without a model call.
+      False or unknown checks do not satisfy it. It is not a slot to ask, fill, or emit as advice.
+      any_of accepts existing distinct node variables, including other any_of joins, and uses then
+      for its successors. To join alternative branch paths, combine their path nodes, not the selector.
+      Keep ordinary independent guidance separate; do not add OR joins merely to use every node type.
       Boolean branch slots come from any node connected with `if_true/if_false`; use this form for
       true/false applicability. A Check is true only when its condition holds. False or unknown
       must not activate a `.then(...)` reminder. TellAgent is the reminder emitted for an active

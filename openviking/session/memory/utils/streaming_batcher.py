@@ -113,6 +113,10 @@ class StreamingBatcher(Generic[T, R]):
 
     async def flush(self, reason: str) -> R | None:
         async with self._flush_lock:
+            # Another flush may have consumed the items that originally triggered us.
+            # Only close/manual flushes may drain a fresh, below-threshold tail.
+            if reason in {"count", "time"} and not await self._should_flush_by_time_or_count():
+                return None
             async with self._buffer_lock:
                 if not self._buffer:
                     return None
@@ -135,7 +139,7 @@ class StreamingBatcher(Generic[T, R]):
                     if metadata is not None:
                         metadata.setdefault("batch_id", batch_id)
                         metadata.setdefault("batch_trace_id", batch_trace_id)
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 for item in items:
                     if not item.future.done():
                         item.future.set_exception(exc)

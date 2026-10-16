@@ -134,6 +134,10 @@ async def test_analysis_uses_context_memory_registry(analyzer_setup):
     assert len(result.trajectories) == 1
     request = model.get_completion_async.await_args.kwargs["messages"]
     assert "ACCOUNT_SPECIFIC_TRAJECTORY_RULE" in request[0]["content"]
+    prompt = " ".join(request[0]["content"].split())
+    assert "not the Case's entire business scope" in prompt
+    assert "retain enough candidate values to check the choice" in prompt
+    model.get_completion_async.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -193,3 +197,96 @@ async def test_optional_skill_extraction_exposes_only_skill_schema(monkeypatch):
     ]
     assert result["skill_gradients"][0].after_file.memory_type == "skills"
     fs.write_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("external_passed", [None, True, False])
+async def test_trajectory_snapshots_llm_rubric_results_without_rewriting_external_score(
+    analyzer_setup, external_passed
+):
+    import json
+    from dataclasses import asdict
+
+    import yaml
+
+    from openviking.session.memory.experience.experience_context import _trajectory_model_content
+    from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+    from openviking.session.train import RubricCriterion
+
+    fs, model, analyzer, context = analyzer_setup
+    definition = RubricCriterion("confirm", "Confirm changes before execution.", True, 1.0)
+    rubric = Rubric(
+        "domain",
+        "",
+        [
+            definition,
+            RubricCriterion("other", "Check another applicable requirement.", True, 1.0),
+        ],
+    )
+    judgments = [
+        {
+            "id": "confirm",
+            "passed": False,
+            "evidence": "Step 2: changed records without confirmation.",
+        },
+        {"id": "other", "passed": None, "evidence": "Not applicable to this request."},
+    ]
+    model.get_completion_async.return_value = (
+        "sdk.create_trajectories(trajectory_name='fixed', case_name='fixed', outcome='unknown', "
+        f"evaluation_criteria={json.dumps(judgments)!r}, content='1. Observed execution.')\n"
+        "sdk.commit()"
+    )
+    evaluation = (
+        None
+        if external_passed is None
+        else RubricEvaluation(
+            external_passed,
+            float(external_passed),
+            [],
+            [],
+            metadata={"custom_verdict": {"state": "reported", "details": "keep verbatim"}},
+        )
+    )
+    rollout = Rollout(
+        Case("library", "library", {}, rubric),
+        [
+            Message(id="m", role="user", parts=[TextPart(text="Change the booking.")]),
+        ],
+        "p",
+        evaluation,
+    )
+    result = await analyzer.analyze(rollout, context)
+    trajectory = result.trajectories[0]
+    payload = json.loads(model.get_completion_async.await_args.kwargs["messages"][1]["content"])
+    instruction = model.get_completion_async.await_args.kwargs["messages"][0]["content"]
+    assert "Preserve explicitly reported results for matching criteria" in instruction
+    assert "Use null for insufficient evidence or inapplicable criteria" in instruction
+    assert payload["case"]["rubric"][0] == {"id": "confirm", "description": definition.description}
+    assert payload["external_evaluation"] == (asdict(evaluation) if evaluation else None)
+    assert result.evaluation is evaluation
+    snapshots = trajectory.metadata["evaluation_criteria"]
+    assert snapshots[0] == {**judgments[0], "description": definition.description}
+    assert snapshots[1]["passed"] is None
+    expected = (
+        None if evaluation is None else {"passed": external_passed, "score": float(external_passed)}
+    )
+    assert trajectory.metadata.get("evaluation") == expected
+    stored = MemoryFileUtils.read(fs.files[trajectory.uri], uri=trajectory.uri)
+    assert stored.extra_fields["evaluation_criteria"] == snapshots
+    header = yaml.safe_load(stored.content.split("```yaml\n", 1)[1].split("\n```", 1)[0])
+    assert header["evaluation_criteria"] == snapshots
+    view = yaml.safe_load(
+        _trajectory_model_content(stored.content).split("```yaml\n", 1)[1].split("\n```", 1)[0]
+    )
+    assert view["evaluation_criteria"] == [snapshots[0]]
+    original_description = definition.description
+    definition.description = "Changed later"
+    rubric.criteria.clear()
+    # Reusing an immutable archive must not evaluate again against the changed/deleted rubric.
+    cached = await analyzer.analyze(rollout, context)
+    assert (
+        cached.trajectories[0].metadata["evaluation_criteria"][0]["description"]
+        == original_description
+    )
+    assert fs.files[trajectory.uri] == MemoryFileUtils.write(stored)
+    model.get_completion_async.assert_awaited_once()

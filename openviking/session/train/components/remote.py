@@ -206,7 +206,9 @@ class RemoteRolloutExecutor:
                 )
                 response.raise_for_status()
             except Exception as exc:
-                logger.warning("Could not cancel rollout %s: %s", execution_id, type(exc).__name__)
+                logger.warning(
+                    "Could not cancel rollout %s: %s: %s", execution_id, type(exc).__name__, exc
+                )
             if isinstance(failure, TimeoutError):
                 raise TimeoutError(
                     f"rollout execution {execution_id} timed out for case {case.name} "
