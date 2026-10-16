@@ -124,6 +124,10 @@ class SessionCommitProcessor(DequeueHandlerBase):
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self.report_error(str(exc), data)
             return None
-        await self._process(msg, ctx)
+        try:
+            await self._process(msg, ctx)
+        except Exception as exc:
+            self.report_error(str(exc), data)
+            return None
         self.report_success()
         return None

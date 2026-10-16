@@ -238,14 +238,54 @@ async def test_task_result_redacts_user_key(tracker: TaskTracker):
 
 
 async def test_fail_task(tracker: TaskTracker):
-    task = await tracker.create("session_commit", **_owner_kwargs())
-    await tracker.start(task.task_id)
-    await tracker.fail(task.task_id, "LLM timeout")
+    """A Phase-2 load failure must persist failure before acknowledging its queue work."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from openviking.service.task_work_index import TaskWorkIndex
+    from openviking.storage.queuefs.named_queue import NamedQueue
+    from openviking.storage.queuefs.session_commit_msg import SessionCommitMsg
+    from openviking.storage.queuefs.session_commit_processor import SessionCommitProcessor
+
+    task = await tracker.create("session_commit", resource_id="session-1", **_owner_kwargs())
+    index = TaskWorkIndex()
+    tracker.attach_work_index(index)
+    backend = _FakeAgfs()
+    session = SimpleNamespace(
+        exists=AsyncMock(return_value=True),
+        load=AsyncMock(side_effect=json.JSONDecodeError("torn session message", "{", 1)),
+    )
+    queue = NamedQueue(
+        backend,
+        "/queue",
+        "SessionCommit",
+        dequeue_handler=SessionCommitProcessor(
+            SimpleNamespace(session=lambda *args, **kwargs: session)
+        ),
+        task_work_index=index,
+    )
+    msg = SessionCommitMsg(
+        task_id=task.task_id,
+        session_id="session-1",
+        session_uri="viking://user/alice/sessions/session-1",
+        archive_uri="viking://user/alice/sessions/session-1/history/archive_001",
+        user={"account_id": "acme", "user_id": "alice"},
+    )
+    await queue.enqueue(msg.to_dict())
+    payload = json.loads(backend.files[f"{queue.path}/enqueue"])
+    backend.files[f"{queue.path}/dequeue"] = json.dumps(
+        {"id": "delivery-1", "data": payload}
+    ).encode()
+
+    await queue.dequeue()
+
     retrieved = await tracker.get(task.task_id)
-    assert retrieved is not None
+    persisted = await tracker._store.get(task.task_id, **_owner_kwargs())
     assert retrieved.status == TaskStatus.FAILED
-    assert retrieved.stage == "failed"
-    assert "LLM timeout" in retrieved.error
+    assert persisted["status"] == "failed"
+    assert "torn session message" in persisted["error"]
+    assert backend.files[f"{queue.path}/ack"] == b"delivery-1"
+    assert not index.has_work(task.task_id)
 
 
 async def test_mark_externally_cancelled_task_without_enabling_active_cancel(
