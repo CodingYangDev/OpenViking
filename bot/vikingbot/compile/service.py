@@ -311,6 +311,11 @@ class BotCompileService:
                     stage="queued",
                 )
             connection = connection or {}
+            account_id = connection.get("account_id")
+            if self._openviking_auth_mode() != "dev" and not (account_id or "").strip():
+                raise CompileFailure(
+                    "UNAUTHENTICATED", "Compile requires account_id.", stage="queued"
+                )
             normalized_request = await self._normalize_request(request, connection=connection)
             task_id = task_id or "cmp_" + uuid.uuid4().hex
             now = utc_now()
