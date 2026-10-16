@@ -3,6 +3,7 @@
 """Tests for resource-memory linking service."""
 
 import asyncio
+import json
 import re
 import threading
 from types import SimpleNamespace
@@ -11,15 +12,18 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openviking.server.identity import RequestContext, Role
+from openviking.service.fs_service import FSService
 from openviking.service.resource_memory_link_service import (
+    _RESOURCE_REASON_SESSION_ID,
     ResourceMemoryLinkService,
-    _resource_reason_session_id,
 )
 from openviking.service.task_tracker import TaskStatus
 from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.queuefs.session_commit_processor import SessionCommitProcessor
+from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -29,20 +33,32 @@ class _FakeVikingFS:
         self.rm_calls = []
         self.read_calls = []
         self.tree_calls = []
+        self._async_agfs = SimpleNamespace(
+            stat=AsyncMock(return_value={"isDir": True}),
+            pathlock_acquire_tree=AsyncMock(return_value={"lease_ref": "resource-lock"}),
+            pathlock_acquire_exact=AsyncMock(return_value={"lease_ref": "memory-lock"}),
+            pathlock_release=AsyncMock(),
+        )
+
+    def _uri_to_path(self, uri, ctx=None):
+        return f"/local/{ctx.account_id}/{uri.removeprefix('viking://')}"
+
+    async def exists(self, uri, ctx=None):
+        return uri in self.store or any(key.startswith(uri.rstrip("/") + "/") for key in self.store)
 
     async def read_file(self, uri, ctx=None):
         self.read_calls.append(uri)
+        if uri not in self.store:
+            raise NotFoundError(uri)
         return self.store[uri]
 
-    async def exists(self, uri, ctx=None):
-        return True
-
-    async def write_file(self, uri, content, ctx=None):
+    async def write_file(self, uri, content, ctx=None, lease_ref=None):
         self.store[uri] = content
 
-    async def rm(self, uri, recursive=False, ctx=None, lock_handle=None):
+    async def rm(self, uri, recursive=False, ctx=None, lock_handle=None, lease_ref=None):
         self.rm_calls.append((uri, recursive))
         self.store.pop(uri, None)
+        return {"estimated_deleted_count": 1}
 
     async def tree(self, uri, ctx=None, node_limit=None, level_limit=None):
         self.tree_calls.append(
@@ -154,12 +170,14 @@ class _FakeSession:
 
     async def add_messages_async(self, specs):
         self.messages.extend(specs)
+        self.meta.memory_policy = None
 
 
 class _FakeSessionService:
     def __init__(self):
         self.session = _FakeSession()
         self.created = []
+        self.memory_policy = None
         self.task_id = None
         self.got = []
         self.committed = []
@@ -185,7 +203,8 @@ class _FakeSessionService:
         )
         return self.session
 
-    async def commit_async(self, session_id, ctx, keep_recent_count=0):
+    async def commit_async(self, session_id, ctx, keep_recent_count=0, *, memory_policy=None):
+        self.memory_policy = memory_policy
         archive_index = len(self.committed) + 1
         self.committed.append(
             {
@@ -213,25 +232,47 @@ def request_context():
     )
 
 
-@pytest.fixture(autouse=True)
-def task_tracker(monkeypatch):
+@pytest.fixture
+def cleanup_queue(monkeypatch):
+    queued = []
     tracker = SimpleNamespace(
-        list_tasks=AsyncMock(return_value=[]), wait=AsyncMock(), has_work=lambda _: False
+        list_tasks=AsyncMock(return_value=[]), get=AsyncMock(), has_work=lambda _: False
     )
     monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
-    return tracker
+    monkeypatch.setattr(
+        "openviking.service.resource_memory_link_service.get_queue_manager",
+        lambda: SimpleNamespace(
+            enqueue=AsyncMock(side_effect=lambda _queue, payload: queued.append(dict(payload)))
+        ),
+    )
+    monkeypatch.setattr(MemoryUpdater, "refresh_file_embedding", AsyncMock())
+    monkeypatch.setattr(MemoryUpdater, "refresh_schema_overview", AsyncMock())
+    return queued
+
+
+async def _drain_cleanup(service, queued):
+    for _ in range(4):
+        if not queued:
+            return
+        await service.resume_cleanup(queued.pop(0))
+    assert not queued
 
 
 @pytest.mark.asyncio
-async def test_on_resource_added_bridges_reason_through_resource_session(
-    request_context, task_tracker
-):
+async def test_on_resource_added_bridges_reason_through_fixed_session(request_context, monkeypatch):
     resource_uri = "viking://resources/images/2026/06/11/yueqian_jpeg"
     session_service = _FakeSessionService()
     session_service.task_id = "reason-1"
+    tracker = SimpleNamespace(
+        wait=AsyncMock(side_effect=AssertionError("ingestion waits for reason"))
+    )
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
     service = ResourceMemoryLinkService(
         viking_fs=_FakeVikingFS(
-            {"viking://resources/images/2026/06/11/.abstract.md": "动漫角色照片合集"}
+            {
+                resource_uri: "resource",
+                "viking://resources/images/2026/06/11/.abstract.md": "动漫角色照片合集",
+            }
         ),
         session_service=session_service,
     )
@@ -246,9 +287,8 @@ async def test_on_resource_added_bridges_reason_through_resource_session(
     session_id = result["session_id"]
     assert result["status"] == "accepted"
     assert result["commit_task_id"] == "reason-1"
-    task_tracker.wait.assert_not_awaited()
-    assert session_id == _resource_reason_session_id(resource_uri)
-    assert session_id != _resource_reason_session_id(resource_uri + "_other")
+    tracker.wait.assert_not_awaited()
+    assert session_id == _RESOURCE_REASON_SESSION_ID
     assert session_service.got == [
         {
             "ctx": request_context,
@@ -257,7 +297,7 @@ async def test_on_resource_added_bridges_reason_through_resource_session(
         }
     ]
     assert session_service.created == []
-    assert session_service.session.meta.memory_policy == {
+    assert session_service.memory_policy == {
         "self": {"enabled": True},
         "peer": {"enabled": False},
         "memory_types": ["entities", "events", "preferences"],
@@ -294,14 +334,19 @@ async def test_on_resource_added_reuses_same_reason_session(request_context):
 
     session_service = BlockingSessionService()
     service = ResourceMemoryLinkService(
-        viking_fs=_FakeVikingFS({}),
+        viking_fs=_FakeVikingFS(
+            {
+                f"viking://resources/images/{name}.jpeg": "resource"
+                for name in ("ryoma", "fuji", "tezuka")
+            }
+        ),
         session_service=session_service,
     )
 
     async def add_reason(name):
         return await service.on_resource_added(
             ctx=request_context,
-            resource_uri="viking://resources/images/ryoma.jpeg",
+            resource_uri=f"viking://resources/images/{name}.jpeg",
             reason=f"这是{name}的照片",
             source_name=f"{name}.jpeg",
         )
@@ -325,7 +370,10 @@ async def test_on_resource_added_reuses_same_reason_session(request_context):
         results = await asyncio.wait_for(asyncio.gather(first, second, worker), timeout=3)
 
     assert all(result["status"] == "accepted" for result in results)
-    assert all(result["session_id"] == results[0]["session_id"] for result in results)
+    assert all(result["session_id"] == _RESOURCE_REASON_SESSION_ID for result in results)
+    assert [call["session_id"] for call in session_service.committed] == [
+        _RESOURCE_REASON_SESSION_ID
+    ] * 3
     assert session_service.deleted == []
     messages = [item["parts"][0].text for item in session_service.session.messages]
     assert len(messages) == 3
@@ -342,7 +390,7 @@ async def test_on_resource_added_routes_reason_to_actor_peer(request_context):
     )
     session_service = _FakeSessionService()
     service = ResourceMemoryLinkService(
-        viking_fs=_FakeVikingFS({}),
+        viking_fs=_FakeVikingFS({"viking://resources/images/ryoma.jpeg": "resource"}),
         session_service=session_service,
     )
 
@@ -353,7 +401,8 @@ async def test_on_resource_added_routes_reason_to_actor_peer(request_context):
         source_name="ryoma.jpeg",
     )
 
-    assert session_service.session.meta.memory_policy == {
+    assert result["session_id"] == _RESOURCE_REASON_SESSION_ID
+    assert session_service.memory_policy == {
         "self": {"enabled": False},
         "peer": {"enabled": True},
         "memory_types": ["entities", "events", "preferences"],
@@ -362,7 +411,7 @@ async def test_on_resource_added_routes_reason_to_actor_peer(request_context):
     assert session_service.committed == [
         {
             "ctx": peer_ctx,
-            "session_id": result["session_id"],
+            "session_id": _RESOURCE_REASON_SESSION_ID,
             "keep_recent_count": 0,
         }
     ]
@@ -373,7 +422,7 @@ async def test_on_resource_added_routes_peer_resource_uri_to_peer(request_contex
     resource_uri = "viking://user/alice/peers/web-visitor-alice/resources/images/ryoma.jpeg"
     session_service = _FakeSessionService()
     service = ResourceMemoryLinkService(
-        viking_fs=_FakeVikingFS({}),
+        viking_fs=_FakeVikingFS({resource_uri: "resource"}),
         session_service=session_service,
     )
 
@@ -384,42 +433,12 @@ async def test_on_resource_added_routes_peer_resource_uri_to_peer(request_contex
         source_name="ryoma.jpeg",
     )
 
-    assert session_service.session.meta.memory_policy == {
+    assert session_service.memory_policy == {
         "self": {"enabled": False},
         "peer": {"enabled": True},
         "memory_types": ["entities", "events", "preferences"],
     }
     assert session_service.session.messages[0]["peer_id"] == "web-visitor-alice"
-
-
-@pytest.mark.asyncio
-async def test_on_resource_deleted_bridges_through_resource_session(request_context):
-    resource_uri = "viking://resources/images/2026/06/11/yueqian_jpeg"
-    memory_uri = "viking://user/alice/memories/entities/photos.md"
-    session_service = _FakeSessionService()
-    service = ResourceMemoryLinkService(
-        viking_fs=_FakeVikingFS({}),
-        session_service=session_service,
-    )
-
-    result = await service.on_resource_deleted(
-        ctx=request_context,
-        resource_uri=resource_uri,
-        memory_uris=[memory_uri],
-        recursive=True,
-    )
-
-    assert result["status"] == "success"
-    assert result["session_id"] == _resource_reason_session_id(resource_uri)
-    assert session_service.session.meta.memory_policy == {
-        "self": {"enabled": True},
-        "peer": {"enabled": False},
-        "memory_types": ["entities", "preferences"],
-    }
-    message_text = session_service.session.messages[0]["parts"][0].text
-    assert "## Resource Deletion" in message_text
-    assert resource_uri in message_text
-    assert memory_uri in message_text
 
 
 @pytest.mark.asyncio
@@ -546,10 +565,6 @@ async def test_find_referencing_memories_uses_grep_candidates_without_tree_scan(
     assert viking_fs.read_calls == [memory_uri]
     assert viking_fs.tree_calls == []
 
-    viking_fs.grep = AsyncMock(side_effect=RuntimeError("storage unavailable"))
-    with pytest.raises(RuntimeError, match="storage unavailable"):
-        await service._grep_candidate_memory_uris(ctx=request_context, resource_uri=resource_uri)
-
 
 @pytest.mark.asyncio
 async def test_find_referencing_memories_scans_actor_peer_memory(request_context):
@@ -582,80 +597,6 @@ async def test_find_referencing_memories_scans_actor_peer_memory(request_context
     )
 
     assert matches == [memory_uri]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("reason_pending", [False, True])
-async def test_before_resource_delete_commits_then_unlinks_stale_refs(
-    request_context, task_tracker, monkeypatch, reason_pending
-):
-    memory_uri = "viking://user/alice/memories/entities/wang.md"
-    resource_uri = "viking://resources/id_card.pdf"
-    raw = (
-        "王大锤资料。\n\n"
-        "<!-- MEMORY_FIELDS\n"
-        "{\n"
-        '  "resource_refs": [\n'
-        "    {\n"
-        f'      "resource_uri": "{resource_uri}",\n'
-        '      "reason": "这是王大锤的身份证"\n'
-        "    }\n"
-        "  ]\n"
-        "}\n"
-        "-->"
-    )
-    session_service = _FakeSessionService()
-    service = ResourceMemoryLinkService(
-        viking_fs=_FakeVikingFS({memory_uri: raw}),
-        session_service=session_service,
-    )
-
-    session_service.task_id = "commit-1"
-    task_tracker.wait.side_effect = TimeoutError()
-    task_tracker.get = AsyncMock(return_value=SimpleNamespace(status=TaskStatus.RUNNING))
-    if reason_pending:
-        task_tracker.list_tasks.return_value = [
-            SimpleNamespace(
-                task_id="reason-1",
-                resource_id=_resource_reason_session_id(resource_uri),
-                status=TaskStatus.RUNNING,
-            )
-        ]
-    queued = []
-    enqueue = AsyncMock(side_effect=lambda _queue, payload: queued.append(payload))
-    monkeypatch.setattr(
-        "openviking.service.resource_memory_link_service.get_queue_manager",
-        lambda: SimpleNamespace(enqueue=enqueue),
-    )
-    refresh = AsyncMock(side_effect=[RuntimeError("index unavailable"), None])
-    monkeypatch.setattr(MemoryUpdater, "refresh_file_embedding", refresh)
-    monkeypatch.setattr(MemoryUpdater, "refresh_schema_overview", AsyncMock())
-    processor = SessionCommitProcessor(session_service, service)
-
-    result = await service.before_resource_delete(
-        ctx=request_context,
-        resource_uri=resource_uri,
-    )
-
-    assert result["status"] == "pending"
-    await processor.on_dequeue(queued.pop(0))
-    assert service._get_viking_fs().store[memory_uri] == raw
-    task_tracker.get.return_value = (
-        None if reason_pending else SimpleNamespace(status=TaskStatus.FAILED)
-    )
-    phase = "on_resource_deleted" if reason_pending else "_find_referencing_memories"
-    failing = AsyncMock(wraps=getattr(service, phase), side_effect=RuntimeError("unavailable"))
-    monkeypatch.setattr(service, phase, failing)
-    await processor.on_dequeue(queued.pop(0))
-    failing.side_effect = None
-    for _ in range(4):
-        if queued:
-            await processor.on_dequeue(queued.pop(0))
-    assert not queued
-    assert refresh.await_count == 2
-    assert len(session_service.committed) == 1
-    mf = MemoryFileUtils.read(service._get_viking_fs().store[memory_uri], uri=memory_uri)
-    assert "resource_refs" not in mf.extra_fields
 
 
 @pytest.mark.asyncio
@@ -728,8 +669,9 @@ async def test_unlink_memory_reference_does_not_delete_event_memory(
 
 
 @pytest.mark.asyncio
-async def test_before_resource_delete_cleans_visible_uri_without_resource_refs(
+async def test_prepared_resource_delete_cleans_visible_uri_without_resource_refs(
     request_context,
+    cleanup_queue,
 ):
     memory_uri = "viking://user/alice/memories/events/2026/06/11/yueqian.md"
     resource_uri = "viking://resources/images/2026/06/12/yueqian_jpeg"
@@ -745,21 +687,22 @@ async def test_before_resource_delete_cleans_visible_uri_without_resource_refs(
     store = {memory_uri: raw}
     service = ResourceMemoryLinkService(viking_fs=_FakeVikingFS(store))
 
-    result = await service.before_resource_delete(
+    result = await service.prepare_resource_delete(
         ctx=request_context,
         resource_uri=resource_uri,
     )
 
-    assert result["status"] == "success"
-    assert result["memory_uris"] == [memory_uri]
+    assert result["status"] == "pending"
+    await _drain_cleanup(service, cleanup_queue)
     mf = MemoryFileUtils.read(store[memory_uri], uri=memory_uri)
     assert mf.content == "今天是清明节。\n用户昨晚查看了越前龙马照片，之后可参考该资源。"
     assert "resource_refs" not in mf.extra_fields
 
 
 @pytest.mark.asyncio
-async def test_before_resource_delete_exact_keeps_child_resource_refs(
+async def test_prepared_resource_delete_exact_keeps_child_resource_refs(
     request_context,
+    cleanup_queue,
 ):
     memory_uri = "viking://user/alice/memories/entities/photos.md"
     resource_uri = "viking://resources/images/album"
@@ -781,13 +724,14 @@ async def test_before_resource_delete_exact_keeps_child_resource_refs(
     store = {memory_uri: raw}
     service = ResourceMemoryLinkService(viking_fs=_FakeVikingFS(store))
 
-    result = await service.before_resource_delete(
+    result = await service.prepare_resource_delete(
         ctx=request_context,
         resource_uri=resource_uri,
         recursive=False,
     )
 
-    assert result["status"] == "success"
+    assert result["status"] == "pending"
+    await _drain_cleanup(service, cleanup_queue)
     mf = MemoryFileUtils.read(store[memory_uri], uri=memory_uri)
     assert f"[相册资源]({resource_uri})" not in mf.content
     assert "用户保存了相册资源。" in mf.content
@@ -806,3 +750,159 @@ async def test_assert_resource_unlinked_propagates_non_not_found_errors(request_
             "viking://resources/id_card.pdf",
             request_context,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["enqueue", "delete", "task_store", "pending", "replacement"])
+async def test_resource_cleanup_survives_delete_failures_and_preserves_replacements(
+    request_context, cleanup_queue, monkeypatch, failure
+):
+    resource_uri = "viking://resources/report.pdf"
+    memory_uri = "viking://user/alice/memories/entities/report.md"
+    raw = MemoryFileUtils.write(
+        MemoryFile(
+            uri=memory_uri,
+            content=f"A report [saved]({resource_uri})",
+            extra_fields={"resource_refs": [{"resource_uri": resource_uri}]},
+        )
+    )
+    fs = _FakeVikingFS({resource_uri: "resource", memory_uri: raw})
+    links = ResourceMemoryLinkService(viking_fs=fs)
+    files = FSService(
+        viking_fs=fs,
+        resource_memory_link_service=links,
+        uri_mutation_coordinator=links._uri_mutation_coordinator,
+    )
+    files._semantic_refresh_parent_uri = lambda *_: None
+    files._sync_watch_after_rm = AsyncMock()
+    original_rm = fs.rm
+
+    async def checked_rm(*args, **kwargs):
+        assert cleanup_queue and resource_uri in fs.store
+        if failure == "delete":
+            raise RuntimeError("delete failed")
+        return await original_rm(*args, **kwargs)
+
+    fs.rm = AsyncMock(side_effect=checked_rm)
+    if failure == "enqueue":
+        monkeypatch.setattr(
+            "openviking.service.resource_memory_link_service.get_queue_manager",
+            lambda: SimpleNamespace(enqueue=AsyncMock(side_effect=RuntimeError("queue failed"))),
+        )
+    if failure in {"enqueue", "delete"}:
+        with pytest.raises(RuntimeError, match="failed"):
+            await files._rm(resource_uri, request_context)
+        assert resource_uri in fs.store and fs.store[memory_uri] == raw
+        if failure == "enqueue":
+            fs.rm.assert_not_awaited()
+        else:
+            await _drain_cleanup(ResourceMemoryLinkService(viking_fs=fs), cleanup_queue)
+        return
+
+    result = await files._rm(resource_uri, request_context)
+    assert result["memory_cleanup"]["status"] == "pending"
+    assert resource_uri not in fs.store
+    tracker = SimpleNamespace(
+        list_tasks=AsyncMock(return_value=[]),
+        get=AsyncMock(return_value=SimpleNamespace(status=TaskStatus.RUNNING)),
+        has_work=lambda _: False,
+    )
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
+    if failure == "task_store":
+        tracker.list_tasks.side_effect = RuntimeError("task store unavailable")
+    else:
+        tracker.list_tasks.return_value = [
+            SimpleNamespace(
+                task_id="old-reason",
+                resource_id=_RESOURCE_REASON_SESSION_ID,
+                status=TaskStatus.RUNNING,
+            )
+        ]
+    await links.resume_cleanup(cleanup_queue.pop(0))
+    assert cleanup_queue and fs.store[memory_uri] == raw
+    tracker.list_tasks.side_effect = None
+    if failure == "replacement":
+        fs.store[resource_uri] = "replacement"
+        fs.store[memory_uri] = raw.replace("A report", "Replacement report")
+    if failure == "pending":
+        tracker.get.return_value.status = TaskStatus.COMPLETED
+    # Replay through a fresh service to exercise persisted ownership, not local callbacks.
+    await _drain_cleanup(ResourceMemoryLinkService(viking_fs=fs), cleanup_queue)
+    assert (resource_uri in fs.store) == (failure == "replacement")
+    assert ("resource_refs" in MemoryFileUtils.read(fs.store[memory_uri]).extra_fields) == (
+        failure == "replacement"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_commit_processor_dispatches_resource_cleanup(wrapped):
+    payload = {"resource_memory_cleanup": True}
+    links = SimpleNamespace(resume_cleanup=AsyncMock(return_value=ProcessResult.success()))
+    processor = SessionCommitProcessor(SimpleNamespace(), links)
+
+    result = await processor.on_dequeue({"data": json.dumps(payload)} if wrapped else payload)
+
+    assert result.outcome == "success"
+    links.resume_cleanup.assert_awaited_once_with(payload)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_finishes_when_checkpointed_memory_is_deleted(request_context, cleanup_queue):
+    resource_uri = "viking://resources/report"
+    memory_uri = "viking://user/alice/memories/entities/report.md"
+    fs = _FakeVikingFS({memory_uri: f"A report [saved]({resource_uri})"})
+    links = ResourceMemoryLinkService(viking_fs=fs)
+    await links.prepare_resource_delete(ctx=request_context, resource_uri=resource_uri)
+    await links.resume_cleanup(cleanup_queue.pop(0))
+    assert cleanup_queue[0]["memory_uris"] == [memory_uri]
+    del fs.store[memory_uri]
+
+    result = await links.resume_cleanup(cleanup_queue.pop(0))
+
+    assert result.outcome == "success"
+    assert not cleanup_queue and memory_uri not in fs.store
+
+
+@pytest.mark.asyncio
+async def test_namespace_cleanup_borrows_parent_lock_without_recreating_resources(
+    tmp_path, request_context
+):
+    from openviking.storage.viking_fs import VikingFS
+    from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
+    from openviking_cli.utils.config.agfs_config import AGFSConfig
+
+    fs = VikingFS(
+        create_agfs_client(
+            RagfsBindingConfig(
+                agfs=AGFSConfig(path=str(tmp_path), backend="memory"),
+            )
+        )
+    )
+    memory_uri = "viking://user/alice/memories/entities/report.md"
+    resource_uri = "viking://resources/report"
+    raw = MemoryFileUtils.write(
+        MemoryFile(
+            uri=memory_uri,
+            content=f"A report [saved]({resource_uri})",
+            extra_fields={"resource_refs": [{"resource_uri": resource_uri}]},
+        )
+    )
+    await fs.write_file(memory_uri, raw, ctx=request_context)
+    links = ResourceMemoryLinkService(viking_fs=fs)
+    async with links.resource_deletion_guard(request_context, "viking://resources") as guard:
+        assert guard is not None and guard[1]
+        await links._unlink_memory_reference(
+            ctx=request_context,
+            memory_uri=memory_uri,
+            resource_uri="viking://resources",
+            recursive=True,
+            lease_ref=guard[0],
+        )
+    assert not await fs.exists("viking://resources", ctx=request_context)
+    assert (
+        "resource_refs"
+        not in MemoryFileUtils.read(
+            await fs.read_file(memory_uri, ctx=request_context)
+        ).extra_fields
+    )

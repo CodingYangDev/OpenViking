@@ -40,14 +40,11 @@ class _FakeVikingFS:
         self.rm_error = rm_error
         self.events = events
         self.parent_exists = parent_exists
-        self.stat = AsyncMock(return_value={"isDir": True})
-        self._uri_to_path = lambda uri, ctx=None: uri
-        self._collect_uris = AsyncMock(return_value=[])
 
     async def exists(self, uri, ctx=None):
         return self.parent_exists
 
-    async def rm(self, uri, recursive=False, ctx=None):
+    async def rm(self, uri, recursive=False, ctx=None, lease_ref=None):
         self.rm_calls.append({"uri": uri, "recursive": recursive, "ctx": ctx})
         if self.rm_error:
             raise self.rm_error
@@ -254,8 +251,12 @@ class _FakeResourceMemoryLinkService:
         self.result = result
         self.calls = []
 
-    async def before_resource_delete(self, **kwargs):
-        self.calls.append(kwargs)
+    @asynccontextmanager
+    async def resource_deletion_lock(self, ctx, uri):
+        yield {"lease_ref": "delete-lock"}, False
+
+    async def prepare_resource_delete(self, *, ctx, resource_uri, recursive=False):
+        self.calls.append({"ctx": ctx, "resource_uri": resource_uri, "recursive": recursive})
         return self.result
 
 
@@ -1467,21 +1468,15 @@ async def test_resource_rm_does_not_cleanup_memory_if_resource_delete_fails(requ
             recursive=True,
         )
 
-    assert link_service.calls == []
+    assert len(link_service.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_resource_rm_refreshes_memory_overview_for_cleaned_memories(
+async def test_resource_rm_returns_pending_memory_cleanup(
     request_context,
     monkeypatch,
 ):
-    cleanup = {
-        "status": "success",
-        "memory_uris": ["viking://user/ryoma/memories/entities/动漫角色/不二周助-write-test.md"],
-        "deleted_memory_uris": [
-            "viking://user/ryoma/memories/entities/动漫角色/不二周助-link-test2.md"
-        ],
-    }
+    cleanup = {"status": "pending", "memory_uris": []}
     viking_fs = _FakeVikingFS()
     link_service = _FakeResourceMemoryLinkService(cleanup)
     service = FSService(
@@ -1501,17 +1496,8 @@ async def test_resource_rm_refreshes_memory_overview_for_cleaned_memories(
     )
 
     uri = "viking://resources/images/2026/06/11/不二周助_jpeg"
-    viking_fs._collect_uris.return_value = [f"{uri}/photo.jpg"]
     result = await service.rm(uri, ctx=request_context, recursive=True)
 
-    call = link_service.calls.pop()
-    assert call.pop("reason_resource_uris") == [uri, f"{uri}/photo.jpg"]
-    assert call == {"ctx": request_context, "resource_uri": uri, "recursive": True}
-    assert refreshed == [
-        {
-            "viking_fs": viking_fs,
-            "directory_uri": "viking://user/ryoma/memories/entities/动漫角色",
-            "ctx": request_context,
-        }
-    ]
+    assert link_service.calls == [{"ctx": request_context, "resource_uri": uri, "recursive": True}]
+    assert refreshed == []
     assert result["memory_cleanup"] == cleanup

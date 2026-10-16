@@ -8,11 +8,10 @@ files' MEMORY_FIELDS metadata.
 
 from __future__ import annotations
 
-import hashlib
 import re
-import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional
 
 from openviking.concurrency import AsyncSemaphore
 from openviking.core.namespace import (
@@ -23,7 +22,9 @@ from openviking.core.namespace import (
 )
 from openviking.core.peer_id import normalize_peer_id
 from openviking.message.part import TextPart
+from openviking.pyagfs.exceptions import AGFSMountPointNotFoundError
 from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
+from openviking.server.error_mapping import is_not_found_error
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_work_index import detach_task_context
 from openviking.session.memory.memory_updater import MemoryUpdater, MemoryUpdateResult
@@ -50,8 +51,6 @@ logger = get_logger(__name__)
 _RESOURCE_REASON_SESSION_ID = "__openviking_resource_reason__"
 _RESOURCE_REASON_SESSION_PREFIX = "__reason__"
 _RESOURCE_REASON_MEMORY_TYPES = ["entities", "events", "preferences"]
-_RESOURCE_DELETION_MEMORY_TYPES = ["entities", "preferences"]
-_RESOURCE_REASON_COMMIT_TIMEOUT_SECONDS = 1800.0
 _RESOURCE_ABSTRACT_MAX_CHARS = 200
 _ABSTRACT_NOT_READY_MARKERS = (
     "[.abstract.md is not ready]",
@@ -59,39 +58,14 @@ _ABSTRACT_NOT_READY_MARKERS = (
 )
 
 
-def _resource_reason_session_id(resource_uri: str) -> str:
-    """Return the stable reason session ID for a normalized resource URI."""
-    canonical_uri = "viking://" + "/".join(uri_parts(resource_uri))
-    digest = hashlib.sha256(canonical_uri.encode("utf-8")).hexdigest()[:32]
-    return f"{_RESOURCE_REASON_SESSION_PREFIX}{digest}"
-
-
-def _resource_memory_policy(
-    *,
-    memory_types: Sequence[str],
-    target_peer_id: Optional[str] = None,
-) -> Dict[str, Any]:
+def _resource_reason_memory_policy(target_peer_id: Optional[str] = None) -> Dict[str, Any]:
+    """Limit reason extraction to resource-related memories owned by the user or target peer."""
     peer_targeted = bool(target_peer_id)
     return {
         "self": {"enabled": not peer_targeted},
         "peer": {"enabled": peer_targeted},
-        "memory_types": list(memory_types),
+        "memory_types": list(_RESOURCE_REASON_MEMORY_TYPES),
     }
-
-
-def _resource_reason_memory_policy(target_peer_id: Optional[str] = None) -> Dict[str, Any]:
-    return _resource_memory_policy(
-        memory_types=_RESOURCE_REASON_MEMORY_TYPES,
-        target_peer_id=target_peer_id,
-    )
-
-
-def _resource_deletion_memory_policy(target_peer_id: Optional[str] = None) -> Dict[str, Any]:
-    # Events are append-only, so deletion commits update only mutable memory types.
-    return _resource_memory_policy(
-        memory_types=_RESOURCE_DELETION_MEMORY_TYPES,
-        target_peer_id=target_peer_id,
-    )
 
 
 def _resource_reason_peer_id(ctx: RequestContext, resource_uri: str) -> Optional[str]:
@@ -171,7 +145,7 @@ class ResourceMemoryLinkService:
 
         added_at = datetime.now(timezone.utc).isoformat()
         resource_uri = "viking://" + "/".join(uri_parts(resource_uri))
-        session_id = _resource_reason_session_id(resource_uri)
+        session_id = _RESOURCE_REASON_SESSION_ID
         target_peer_id = _resource_reason_peer_id(ctx, resource_uri)
         commit_result: Dict[str, Any] = {}
 
@@ -187,7 +161,6 @@ class ResourceMemoryLinkService:
                 ctx,
                 auto_create=True,
             )
-            session.meta.memory_policy = _resource_reason_memory_policy(target_peer_id)
             message_spec: Dict[str, Any] = {
                 "role": "user",
                 "parts": [
@@ -210,6 +183,7 @@ class ResourceMemoryLinkService:
                 session_id,
                 ctx,
                 keep_recent_count=0,
+                memory_policy=_resource_reason_memory_policy(target_peer_id),
             )
 
         task_id = commit_result.get("task_id")
@@ -219,76 +193,6 @@ class ResourceMemoryLinkService:
             "commit_task_id": task_id,
             "archive_uri": commit_result.get("archive_uri"),
             "commit_task": None,
-        }
-
-    async def on_resource_deleted(
-        self,
-        *,
-        ctx: RequestContext,
-        resource_uri: str,
-        memory_uris: Sequence[str],
-        recursive: bool = False,
-        wait: bool = True,
-    ) -> Dict[str, Any]:
-        """Commit mutable memory updates; wait=False defers completion to the cleanup consumer."""
-        if not resource_uri:
-            return {"status": "skipped", "reason": "empty_resource_uri"}
-        if not self._session_service:
-            return {"status": "skipped", "reason": "session_service_unavailable"}
-
-        deleted_at = datetime.now(timezone.utc).isoformat()
-        session_id = _resource_reason_session_id(resource_uri)
-        target_peer_id = _resource_reason_peer_id(ctx, resource_uri)
-        commit_result: Dict[str, Any] = {}
-        task_result: Optional[Dict[str, Any]] = None
-
-        async with self._reason_session_lock:
-            session = await self._session_service.get(
-                session_id,
-                ctx,
-                auto_create=True,
-            )
-            session.meta.memory_policy = _resource_deletion_memory_policy(target_peer_id)
-            message_spec: Dict[str, Any] = {
-                "role": "user",
-                "parts": [
-                    TextPart(
-                        text=self._build_resource_deletion_message(
-                            resource_uri=resource_uri,
-                            deleted_at=deleted_at,
-                            memory_uris=memory_uris,
-                            recursive=recursive,
-                        )
-                    )
-                ],
-                "created_at": deleted_at,
-            }
-            if target_peer_id:
-                message_spec["peer_id"] = target_peer_id
-            await session.add_messages_async([message_spec])
-            commit_result = await self._session_service.commit_async(
-                session_id,
-                ctx,
-                keep_recent_count=0,
-            )
-
-        task_id = commit_result.get("task_id")
-        pending = bool(task_id) and not wait
-        if task_id and wait:
-            try:
-                task_result = await self._wait_for_commit_task(
-                    task_id=str(task_id),
-                    ctx=ctx,
-                )
-            except TimeoutError:
-                pending = True
-        return {
-            "status": "pending" if pending else "success",
-            "session_id": session_id,
-            "commit_task_id": task_id,
-            "archive_uri": commit_result.get("archive_uri"),
-            "commit_task": task_result,
-            **({"pending_task_ids": [str(task_id)]} if pending else {}),
         }
 
     @staticmethod
@@ -309,178 +213,21 @@ class ResourceMemoryLinkService:
             f"User reason: {reason}"
         )
 
-    @staticmethod
-    def _build_resource_deletion_message(
-        *,
-        resource_uri: str,
-        deleted_at: str,
-        memory_uris: Sequence[str],
-        recursive: bool,
-    ) -> str:
-        affected = "\n".join(f"- {uri}" for uri in dict.fromkeys(memory_uris))
-        if not affected:
-            affected = "- N/A"
-        recursive_text = "true" if recursive else "false"
-        return (
-            "## Resource Deletion\n"
-            f"Resource URI: {resource_uri}\n"
-            f"Deleted at: {deleted_at or 'N/A'}\n"
-            f"Recursive delete: {recursive_text}\n"
-            "Affected memory URIs:\n"
-            f"{affected}\n\n"
-            "Update existing mutable memories that mention or depend on this resource."
-        )
-
-    async def _wait_for_commit_task(
-        self,
-        *,
-        task_id: str,
-        ctx: RequestContext,
-    ) -> Dict[str, Any]:
-        from openviking.service.task_tracker import TaskStatus, get_task_tracker
-
-        task = await get_task_tracker().wait(
-            task_id,
-            account_id=ctx.account_id,
-            user_id=ctx.user.user_id,
-            timeout=_RESOURCE_REASON_COMMIT_TIMEOUT_SECONDS,
-            poll_interval=0.1,
-        )
-        if task.status == TaskStatus.COMPLETED:
-            return task.to_dict()
-        if task.status == TaskStatus.FAILED:
-            raise RuntimeError(task.error)
-        raise RuntimeError(f"session commit task cancelled: {task_id}")
-
-    async def before_resource_delete(
+    async def prepare_resource_delete(
         self,
         *,
         ctx: RequestContext,
         resource_uri: str,
         recursive: bool = False,
-        reason_resource_uris: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
-        """Wait for reason commits; persist cleanup and return pending on timeout or I/O errors.
+        """Persist cleanup before deletion; enqueue failure prevents the caller from deleting.
 
-        A missing recursive snapshot includes all of the user's reason sessions.
+        The caller holds the resource mutation lease until deletion finishes.
+        Consumers leave memories untouched when the resource still exists.
         """
         if context_type_for_uri(resource_uri) != "resource":
             return {"status": "skipped", "reason": "not_resource"}
 
-        pending_ids = await self._wait_for_pending_reason_commits(
-            ctx=ctx,
-            resource_uri=resource_uri,
-            recursive=recursive,
-            reason_resource_uris=reason_resource_uris,
-        )
-        if pending_ids:
-            await self._defer_cleanup(ctx, resource_uri, recursive, pending_task_ids=pending_ids)
-            return {"status": "pending", "pending_task_ids": pending_ids, "memory_uris": []}
-
-        try:
-            matches = await self._find_referencing_memories(
-                ctx=ctx, resource_uri=resource_uri, recursive=recursive
-            )
-        except Exception:
-            await self._defer_cleanup(ctx, resource_uri, recursive, pending_task_ids=[])
-            return {"status": "pending", "pending_task_ids": [], "memory_uris": []}
-        if not matches:
-            return {"status": "no_references", "memory_uris": []}
-
-        try:
-            commit_result = await self.on_resource_deleted(
-                ctx=ctx,
-                resource_uri=resource_uri,
-                memory_uris=matches,
-                recursive=recursive,
-            )
-        except Exception as exc:
-            logger.warning("Resource deletion memory commit failed for %s: %s", resource_uri, exc)
-            commit_result = {"status": "failed", "error": str(exc)}
-        if commit_result.get("status") == "pending":
-            await self._defer_cleanup(
-                ctx,
-                resource_uri,
-                recursive,
-                pending_task_ids=commit_result["pending_task_ids"],
-                commit_submitted=True,
-            )
-            return {
-                "status": "pending",
-                "pending_task_ids": commit_result["pending_task_ids"],
-                "memory_uris": [],
-                "memory_commit": commit_result,
-            }
-
-        state: Dict[str, Any] = {"pending_task_ids": [], "commit_submitted": True}
-        try:
-            state["memory_uris"] = await self._find_referencing_memories(
-                ctx=ctx, resource_uri=resource_uri, recursive=recursive
-            )
-            result = await self._unlink_resource_memories(
-                ctx=ctx,
-                resource_uri=resource_uri,
-                recursive=recursive,
-                memory_uris=state["memory_uris"],
-            )
-        except Exception:
-            await self._defer_cleanup(ctx, resource_uri, recursive, **state)
-            return {"status": "pending", "pending_task_ids": [], "memory_uris": []}
-        return {
-            **result,
-            "status": "failed" if commit_result.get("status") == "failed" else "success",
-            "memory_commit": commit_result,
-        }
-
-    async def _unlink_resource_memories(
-        self,
-        *,
-        ctx: RequestContext,
-        resource_uri: str,
-        recursive: bool,
-        memory_uris: Sequence[str],
-    ) -> Dict[str, Any]:
-        """Clean the post-commit URI checkpoint; raise if any memory cannot be unlinked."""
-
-        cleaned: List[str] = []
-        deleted: List[str] = []
-        errors: List[str] = []
-        for memory_uri in memory_uris:
-            try:
-                cleanup_result = await self._unlink_memory_reference(
-                    ctx=ctx,
-                    memory_uri=memory_uri,
-                    resource_uri=resource_uri,
-                    recursive=recursive,
-                )
-                cleaned.extend(cleanup_result.written_uris + cleanup_result.edited_uris)
-                deleted.extend(cleanup_result.deleted_uris)
-                if memory_uri in cleanup_result.deleted_uris:
-                    continue
-                await self._assert_resource_unlinked(
-                    memory_uri,
-                    resource_uri,
-                    ctx,
-                    recursive=recursive,
-                )
-            except NotFoundError:
-                deleted.append(memory_uri)
-            except Exception as exc:
-                errors.append(f"{memory_uri}: {exc}")
-
-        if errors:
-            raise RuntimeError(
-                "resource memory cleanup failed before deleting resource: " + "; ".join(errors)
-            )
-        return {
-            "memory_uris": list(dict.fromkeys(cleaned)),
-            "deleted_memory_uris": list(dict.fromkeys(deleted)),
-        }
-
-    async def _defer_cleanup(
-        self, ctx: RequestContext, resource_uri: str, recursive: bool, **state: Any
-    ) -> None:
-        """Persist cleanup ownership and its current phase outside the deleting Task's lifecycle."""
         with detach_task_context():
             await get_queue_manager().enqueue(
                 QueueManager.SESSION_COMMIT,
@@ -493,149 +240,9 @@ class ResourceMemoryLinkService:
                     "bypass_acl": ctx.bypass_acl,
                     "resource_uri": resource_uri,
                     "recursive": recursive,
-                    **state,
                 },
             )
-
-    async def resume_cleanup(self, payload: Dict[str, Any]) -> ProcessResult:
-        """Resume durable cleanup without waiting for commits in a SessionCommit worker.
-
-        Unsettled dependencies and cleanup errors requeue the current phase.
-        commit_submitted marks submission; memory_uris checkpoints the final scan
-        so index refresh work survives an interrupted unlink.
-        """
-        from openviking.service.task_tracker import TaskStatus, get_task_tracker
-
-        ctx = RequestContext(
-            user=UserIdentifier.from_dict(payload["user"]),
-            role=Role(payload["role"]),
-            group_ids=tuple(payload["group_ids"]),
-            actor_peer_id=payload["actor_peer_id"],
-            bypass_acl=payload["bypass_acl"],
-        )
-        args = {
-            "ctx": ctx,
-            "resource_uri": payload["resource_uri"],
-            "recursive": payload["recursive"],
-        }
-        try:
-            tracker = get_task_tracker()
-            pending_ids = []
-            for task_id in payload["pending_task_ids"]:
-                task = await tracker.get(
-                    task_id, account_id=ctx.account_id, user_id=ctx.user.user_id
-                )
-                # Terminal records expire; durable or active work still fences a missing record.
-                if task is None:
-                    pending = tracker.has_work(task_id)
-                else:
-                    pending = task.status not in (
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                        TaskStatus.CANCELLED,
-                    )
-                if pending:
-                    pending_ids.append(task_id)
-            payload["pending_task_ids"] = pending_ids
-
-            if not pending_ids:
-                if "memory_uris" not in payload:
-                    matches = await self._find_referencing_memories(**args)
-                    if not payload.get("commit_submitted"):
-                        if not matches:
-                            return ProcessResult.success()
-                        # shortcut: QueueFS can replay submission; add an idempotency key if duplicate extraction is costly.
-                        commit_result = await self.on_resource_deleted(
-                            **args, memory_uris=matches, wait=False
-                        )
-                        payload.update(
-                            pending_task_ids=commit_result.get("pending_task_ids", []),
-                            commit_submitted=True,
-                        )
-                    else:
-                        payload["memory_uris"] = matches
-                else:
-                    await self._unlink_resource_memories(**args, memory_uris=payload["memory_uris"])
-                    viking_fs = self._get_viking_fs()
-                    for uri in payload["memory_uris"]:
-                        if await viking_fs.exists(uri, ctx=ctx):
-                            await MemoryUpdater.refresh_file_embedding(
-                                viking_fs=viking_fs,
-                                vikingdb=self._vikingdb,
-                                uri=uri,
-                                memory_type=MemoryUpdater.memory_type_from_uri(uri),
-                                ctx=ctx,
-                                strict=True,
-                            )
-                    for directory_uri in {uri.rsplit("/", 1)[0] for uri in payload["memory_uris"]}:
-                        if await viking_fs.exists(directory_uri, ctx=ctx):
-                            await MemoryUpdater.refresh_schema_overview(
-                                viking_fs=viking_fs,
-                                directory_uri=directory_uri,
-                                ctx=ctx,
-                                strict=True,
-                            )
-                    return ProcessResult.success()
-        except Exception as exc:
-            logger.warning(
-                "Deferred resource memory cleanup failed for %s: %s", payload["resource_uri"], exc
-            )
-        with detach_task_context():
-            await get_queue_manager().enqueue(QueueManager.SESSION_COMMIT, payload)
-        return ProcessResult.requeued()
-
-    async def _wait_for_pending_reason_commits(
-        self,
-        *,
-        ctx: RequestContext,
-        resource_uri: str,
-        recursive: bool,
-        reason_resource_uris: Optional[Sequence[str]],
-    ) -> List[str]:
-        """Wait without changing tasks; return IDs not observed terminal before timeout.
-
-        All legacy commits participate because their task records have no resource URI.
-        """
-        from openviking.service.task_tracker import TaskStatus, get_task_tracker
-
-        session_ids = {
-            _RESOURCE_REASON_SESSION_ID,
-            _resource_reason_session_id(resource_uri),
-            *(_resource_reason_session_id(uri) for uri in reason_resource_uris or ()),
-        }
-        include_all_reasons = recursive and reason_resource_uris is None
-        tracker = get_task_tracker()
-        deadline = time.monotonic() + _RESOURCE_REASON_COMMIT_TIMEOUT_SECONDS
-        tasks = await tracker.list_tasks(
-            task_type="session_commit",
-            account_id=ctx.account_id,
-            user_id=ctx.user.user_id,
-            limit=None,
-        )
-        pending = [
-            task
-            for task in tasks
-            if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
-            and (
-                task.resource_id in session_ids
-                or (
-                    include_all_reasons
-                    and (task.resource_id or "").startswith(_RESOURCE_REASON_SESSION_PREFIX)
-                )
-            )
-        ]
-        for index, task in enumerate(pending):
-            try:
-                await tracker.wait(
-                    task.task_id,
-                    account_id=ctx.account_id,
-                    user_id=ctx.user.user_id,
-                    timeout=max(0.0, deadline - time.monotonic()),
-                    poll_interval=0.1,
-                )
-            except TimeoutError:
-                return [unsettled.task_id for unsettled in pending[index:]]
-        return []
+        return {"status": "pending", "memory_uris": []}
 
     async def _unlink_memory_reference(
         self,
@@ -644,29 +251,40 @@ class ResourceMemoryLinkService:
         memory_uri: str,
         resource_uri: str,
         recursive: bool = False,
+        lease_ref: Optional[Dict[str, Any]] = None,
     ) -> MemoryUpdateResult:
-        """Remove matching references from the current file, recording missing files as deleted."""
+        """Atomically unlink current references; borrow a covering namespace lease when supplied."""
         viking_fs = self._get_viking_fs()
-        try:
-            raw = await viking_fs.read_file(memory_uri, ctx=ctx)
-            current = MemoryFileUtils.read(raw, uri=memory_uri)
-        except (NotFoundError, FileNotFoundError):
-            result = MemoryUpdateResult()
-            result.add_deleted(memory_uri)
-            return result
-
-        changed = unlink_resource_references_from_memory(
-            current,
-            resource_uri,
-            recursive=recursive,
+        memory_lease = await viking_fs._async_agfs.pathlock_acquire_exact(
+            viking_fs._uri_to_path(memory_uri, ctx=ctx), owner_lease_ref=lease_ref
         )
-        result = MemoryUpdateResult()
-        if not changed:
-            return result
+        try:
+            if await viking_fs.exists(resource_uri, ctx=ctx):
+                return MemoryUpdateResult()
+            try:
+                raw = await viking_fs.read_file(memory_uri, ctx=ctx)
+                current = MemoryFileUtils.read(raw, uri=memory_uri)
+            except (NotFoundError, FileNotFoundError):
+                result = MemoryUpdateResult()
+                result.add_deleted(memory_uri)
+                return result
 
-        await viking_fs.write_file(memory_uri, MemoryFileUtils.write(current), ctx=ctx)
-        result.add_edited(memory_uri)
-        return result
+            changed = unlink_resource_references_from_memory(
+                current,
+                resource_uri,
+                recursive=recursive,
+            )
+            result = MemoryUpdateResult()
+            if not changed:
+                return result
+
+            await viking_fs.write_file(
+                memory_uri, MemoryFileUtils.write(current), ctx=ctx, lease_ref=memory_lease
+            )
+            result.add_edited(memory_uri)
+            return result
+        finally:
+            await viking_fs._async_agfs.pathlock_release(memory_lease)
 
     async def _find_referencing_memories(
         self,
@@ -675,26 +293,39 @@ class ResourceMemoryLinkService:
         resource_uri: str,
         recursive: bool,
     ) -> List[str]:
-        """Return unique memory URIs referencing the resource; propagate scan failures."""
+        """Return unique memory URIs matching the resource in metadata or visible content."""
         candidate_uris = await self._grep_candidate_memory_uris(
             ctx=ctx,
             resource_uri=resource_uri,
         )
-        return await self._read_referencing_memory_matches(
-            candidate_uris,
-            ctx=ctx,
-            resource_uri=resource_uri,
-            recursive=recursive,
-        )
+        if candidate_uris is None:
+            raise RuntimeError("Resource memory reference scan is unavailable")
+        viking_fs = self._get_viking_fs()
+        matches = []
+        for uri in candidate_uris:
+            try:
+                raw = await viking_fs.read_file(uri, ctx=ctx)
+            except (NotFoundError, FileNotFoundError):
+                continue
+            mf = MemoryFileUtils.read(raw, uri=uri)
+            if any(
+                resource_ref_matches(ref.get("resource_uri"), resource_uri, recursive=recursive)
+                for ref in self._coerce_resource_refs(mf.extra_fields.get("resource_refs"))
+            ) or content_references_resource(mf.content, resource_uri, recursive=recursive):
+                matches.append(uri)
+        return matches
 
     async def _grep_candidate_memory_uris(
         self,
         *,
         ctx: RequestContext,
         resource_uri: str,
-    ) -> List[str]:
-        """Use backend grep for candidates; ignore missing memory roots and propagate other errors."""
+    ) -> Optional[List[str]]:
+        """Use backend grep to avoid reading every memory file when supported."""
         viking_fs = self._get_viking_fs()
+        if not hasattr(viking_fs, "grep"):
+            return None
+
         search_needle = self._resource_uri_search_needle(resource_uri)
         if not search_needle:
             return []
@@ -718,39 +349,6 @@ class ResourceMemoryLinkService:
                     candidate_uris.append(uri)
 
         return list(dict.fromkeys(candidate_uris))
-
-    async def _read_referencing_memory_matches(
-        self,
-        candidate_uris: Sequence[str],
-        *,
-        ctx: RequestContext,
-        resource_uri: str,
-        recursive: bool,
-    ) -> List[str]:
-        """Return unique matching URIs; ignore removed candidates and propagate other read errors."""
-        viking_fs = self._get_viking_fs()
-        matches: List[str] = []
-        search_needle = self._resource_uri_search_needle(resource_uri)
-        for uri in dict.fromkeys(candidate_uris):
-            try:
-                raw = await viking_fs.read_file(uri, ctx=ctx)
-                raw_text = raw if isinstance(raw, str) else str(raw or "")
-            except (NotFoundError, FileNotFoundError):
-                continue
-            if search_needle and search_needle not in raw_text:
-                continue
-
-            mf = MemoryFileUtils.read(raw_text, uri=uri)
-            if any(
-                resource_ref_matches(ref.get("resource_uri"), resource_uri, recursive=recursive)
-                for ref in self._coerce_resource_refs(mf.extra_fields.get("resource_refs"))
-            ) or content_references_resource(
-                mf.content,
-                resource_uri,
-                recursive=recursive,
-            ):
-                matches.append(uri)
-        return matches
 
     @staticmethod
     def _resource_uri_search_needle(resource_uri: str) -> str:
@@ -821,10 +419,11 @@ class ResourceMemoryLinkService:
         *,
         recursive: bool = True,
     ) -> None:
+        """Verify remaining files have no stale reference; missing files are already unlinked."""
         try:
             raw = await self._get_viking_fs().read_file(memory_uri, ctx=ctx)
-        except (NotFoundError, FileNotFoundError) as exc:
-            raise NotFoundError(memory_uri, "memory") from exc
+        except (NotFoundError, FileNotFoundError):
+            return
         mf = MemoryFileUtils.read(raw, uri=memory_uri)
         if content_references_resource(mf.content, resource_uri, recursive=recursive):
             raise RuntimeError(f"memory content still contains deleted resource URI: {memory_uri}")
@@ -843,3 +442,176 @@ class ResourceMemoryLinkService:
         if isinstance(value, dict):
             return [dict(value)]
         return []
+
+    @asynccontextmanager
+    async def resource_deletion_lock(
+        self, ctx: RequestContext, resource_uri: str
+    ) -> AsyncIterator[tuple[Dict[str, Any], bool]]:
+        """Hold an existing parent's tree lease across resource deletion or cleanup.
+
+        Yield the lease and whether its scope covers the affected memory roots.
+        Memory writes inside the parent scope must borrow this lease.
+        Missing ancestors are skipped so acquiring the lease does not recreate
+        the deleted resource. Storage and lock errors propagate to the caller.
+        """
+        viking_fs = self._get_viking_fs()
+        agfs = viking_fs._async_agfs
+        parent_path = viking_fs._uri_to_path(resource_uri, ctx=ctx).rsplit("/", 1)[0]
+        while parent_path:
+            try:
+                await agfs.stat(parent_path)
+                break
+            except Exception as exc:
+                if isinstance(exc, AGFSMountPointNotFoundError) or not is_not_found_error(exc):
+                    raise
+                parent_path = parent_path.rsplit("/", 1)[0]
+        if not parent_path:
+            raise NotFoundError(resource_uri)
+        lease = await agfs.pathlock_acquire_tree(parent_path)
+        try:
+            memory_paths = [
+                viking_fs._uri_to_path(uri, ctx=ctx)
+                for uri in _memory_roots_for_resource_refs(ctx, resource_uri)
+            ]
+            covers_memories = any(
+                path == parent_path or path.startswith(parent_path + "/") for path in memory_paths
+            )
+            yield lease, covers_memories
+        finally:
+            await agfs.pathlock_release(lease)
+
+    @asynccontextmanager
+    async def resource_deletion_guard(
+        self, ctx: RequestContext, resource_uri: str
+    ) -> AsyncIterator[Optional[tuple[Dict[str, Any], bool]]]:
+        """Fence cleanup against replacement uploads; yield None while the resource exists.
+
+        The URI lease orders consumers after a prepared deletion in this process.
+        The parent tree lease also excludes writes from other workers and processes.
+        """
+        async with (
+            self._uri_mutation_coordinator.mutation(ctx.account_id, [resource_uri]),
+            self.resource_deletion_lock(ctx, resource_uri) as guard,
+        ):
+            yield None if await self._get_viking_fs().exists(resource_uri, ctx=ctx) else guard
+
+    async def resume_cleanup(self, payload: Dict[str, Any]) -> ProcessResult:
+        """Resume durable cleanup without waiting for commits in a SessionCommit worker.
+
+        Unsettled dependencies and cleanup errors requeue the current phase.
+        memory_uris checkpoints the final scan so index refresh work survives
+        an interrupted unlink.
+        """
+        from openviking.service.task_tracker import TaskStatus, get_task_tracker
+
+        ctx = RequestContext(
+            user=UserIdentifier.from_dict(payload["user"]),
+            role=Role(payload["role"]),
+            group_ids=tuple(payload["group_ids"]),
+            actor_peer_id=payload["actor_peer_id"],
+            bypass_acl=payload["bypass_acl"],
+        )
+        args = {
+            "ctx": ctx,
+            "resource_uri": payload["resource_uri"],
+            "recursive": payload["recursive"],
+        }
+        try:
+            if "pending_task_ids" not in payload:
+                payload["pending_task_ids"] = await self._pending_reason_task_ids(ctx)
+            tracker = get_task_tracker()
+            pending_ids = []
+            for task_id in payload["pending_task_ids"]:
+                task = await tracker.get(
+                    task_id, account_id=ctx.account_id, user_id=ctx.user.user_id
+                )
+                # Terminal records expire; durable or active work still fences a missing record.
+                pending = (
+                    tracker.has_work(task_id)
+                    if task is None
+                    else task.status
+                    not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+                )
+                if pending:
+                    pending_ids.append(task_id)
+            payload["pending_task_ids"] = pending_ids
+            refresh_ready = False
+            async with self.resource_deletion_guard(ctx, payload["resource_uri"]) as guard:
+                if guard is None:
+                    if "memory_uris" not in payload:
+                        return ProcessResult.success()
+                    # Index retries read the current file and never unlink a replacement resource.
+                    refresh_ready = True
+                else:
+                    if not pending_ids:
+                        if "memory_uris" not in payload:
+                            payload["memory_uris"] = await self._find_referencing_memories(**args)
+                            if not payload["memory_uris"]:
+                                return ProcessResult.success()
+                        else:
+                            lease_ref, covers_memories = guard
+                            for memory_uri in payload["memory_uris"]:
+                                await self._unlink_memory_reference(
+                                    **args,
+                                    memory_uri=memory_uri,
+                                    lease_ref=lease_ref if covers_memories else None,
+                                )
+                                if not await self._get_viking_fs().exists(
+                                    payload["resource_uri"], ctx=ctx
+                                ):
+                                    await self._assert_resource_unlinked(
+                                        memory_uri,
+                                        payload["resource_uri"],
+                                        ctx,
+                                        recursive=payload["recursive"],
+                                    )
+                            refresh_ready = True
+
+            if refresh_ready:
+                viking_fs = self._get_viking_fs()
+                for uri in payload["memory_uris"]:
+                    if await viking_fs.exists(uri, ctx=ctx):
+                        await MemoryUpdater.refresh_file_embedding(
+                            viking_fs=viking_fs,
+                            vikingdb=self._vikingdb,
+                            uri=uri,
+                            memory_type=MemoryUpdater.memory_type_from_uri(uri),
+                            ctx=ctx,
+                            strict=True,
+                        )
+                for directory_uri in {uri.rsplit("/", 1)[0] for uri in payload["memory_uris"]}:
+                    if await viking_fs.exists(directory_uri, ctx=ctx):
+                        await MemoryUpdater.refresh_schema_overview(
+                            viking_fs=viking_fs,
+                            directory_uri=directory_uri,
+                            ctx=ctx,
+                            strict=True,
+                        )
+                return ProcessResult.success()
+        except Exception as exc:
+            logger.warning(
+                "Deferred resource memory cleanup failed for %s: %s", payload["resource_uri"], exc
+            )
+        with detach_task_context():
+            await get_queue_manager().enqueue(QueueManager.SESSION_COMMIT, payload)
+        return ProcessResult.requeued()
+
+    async def _pending_reason_task_ids(self, ctx: RequestContext) -> List[str]:
+        """Return this user's unsettled resource reason tasks without waiting for extraction."""
+        from openviking.service.task_tracker import TaskStatus, get_task_tracker
+
+        tasks = await get_task_tracker().list_tasks(
+            task_type="session_commit",
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            limit=None,
+        )
+        return [
+            task.task_id
+            for task in tasks
+            if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+            and (
+                task.resource_id == _RESOURCE_REASON_SESSION_ID
+                or (task.resource_id or "").startswith(_RESOURCE_REASON_SESSION_PREFIX)
+            )
+        ]

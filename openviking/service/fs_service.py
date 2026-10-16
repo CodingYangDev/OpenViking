@@ -488,13 +488,21 @@ class FSService:
         context_type = context_type_for_uri(uri)
         refresh_parent_uri = self._semantic_refresh_parent_uri(uri, context_type)
         memory_overview_uri = self._memory_overview_parent_uri(uri, context_type)
-        reason_resource_uris = None
         async with self._uri_mutation_coordinator.mutation(ctx.account_id, [uri]):
             if self._resource_memory_link_service and context_type == "resource":
-                reason_resource_uris = await self._reason_resource_uris_for_delete(
-                    uri, ctx, recursive=recursive
-                )
-            result = await viking_fs.rm(uri, recursive=recursive, ctx=ctx)
+                async with self._resource_memory_link_service.resource_deletion_lock(
+                    ctx, uri
+                ) as guard:
+                    cleanup_result = (
+                        await self._resource_memory_link_service.prepare_resource_delete(
+                            ctx=ctx, resource_uri=uri, recursive=recursive
+                        )
+                    )
+                    result = await viking_fs.rm(
+                        uri, recursive=recursive, ctx=ctx, lease_ref=guard[0]
+                    )
+            else:
+                result = await viking_fs.rm(uri, recursive=recursive, ctx=ctx)
         await self._sync_watch_after_rm(uri, account_id=ctx.account_id, context_type=context_type)
         # A refresh on a parent that no longer exists would lock its sidecar
         # paths and thereby recreate the deleted directory. Nothing to
@@ -503,40 +511,22 @@ class FSService:
             refresh_parent_uri = None
         queue_status = None
         refresh_action: Optional[FreshnessAction] = None
-        try:
-            if refresh_parent_uri:
-                refresh_action = await self._enqueue_delete_refresh(
-                    root_uri=refresh_parent_uri,
-                    deleted_uri=uri,
-                    context_type=context_type,
-                    ctx=ctx,
-                    force_refresh=wait,
-                )
-            if self._resource_memory_link_service and context_type == "resource":
-                cleanup_result = await self._resource_memory_link_service.before_resource_delete(
-                    ctx=ctx,
-                    resource_uri=uri,
-                    recursive=recursive,
-                    reason_resource_uris=reason_resource_uris,
-                )
-            if memory_overview_uri:
-                await MemoryUpdater.refresh_schema_overview(
-                    viking_fs=viking_fs,
-                    directory_uri=memory_overview_uri,
-                    ctx=ctx,
-                )
-            for cleanup_overview_uri in self._memory_overview_parent_uris_from_cleanup(
-                cleanup_result
-            ):
-                await MemoryUpdater.refresh_schema_overview(
-                    viking_fs=viking_fs,
-                    directory_uri=cleanup_overview_uri,
-                    ctx=ctx,
-                )
-            if refresh_parent_uri and wait and refresh_action is not FreshnessAction.MARK_PENDING:
-                queue_status = await self._wait_for_refresh()
-        finally:
-            pass
+        if refresh_parent_uri:
+            refresh_action = await self._enqueue_delete_refresh(
+                root_uri=refresh_parent_uri,
+                deleted_uri=uri,
+                context_type=context_type,
+                ctx=ctx,
+                force_refresh=wait,
+            )
+        if memory_overview_uri:
+            await MemoryUpdater.refresh_schema_overview(
+                viking_fs=viking_fs,
+                directory_uri=memory_overview_uri,
+                ctx=ctx,
+            )
+        if refresh_parent_uri and wait and refresh_action is not FreshnessAction.MARK_PENDING:
+            queue_status = await self._wait_for_refresh()
         if cleanup_result is not None and isinstance(result, dict):
             result["memory_cleanup"] = cleanup_result
         if refresh_parent_uri and isinstance(result, dict):
@@ -549,24 +539,6 @@ class FSService:
             if queue_status is not None:
                 result["queue_status"] = queue_status
         return result
-
-    async def _reason_resource_uris_for_delete(
-        self, uri: str, ctx: RequestContext, *, recursive: bool
-    ) -> Optional[List[str]]:
-        """Snapshot URIs under the mutation lease; return None for a missing subtree."""
-        if not recursive:
-            return [uri]
-        viking_fs = self._ensure_initialized()
-        try:
-            stat = await viking_fs.stat(uri, ctx=ctx, skip_count=True)
-        except (NotFoundError, FileNotFoundError):
-            return None
-        if not stat.get("isDir"):
-            return [uri]
-        descendants = await viking_fs._collect_uris(
-            viking_fs._uri_to_path(uri, ctx=ctx), recursive=True, ctx=ctx, strict=True
-        )
-        return list(dict.fromkeys([uri, *descendants]))
 
     @staticmethod
     def _semantic_refresh_status(
@@ -621,30 +593,6 @@ class FSService:
         if not MemoryUpdater.memory_type_from_uri(parent.uri):
             return None
         return parent.uri
-
-    @classmethod
-    def _memory_overview_parent_uris_from_cleanup(
-        cls,
-        cleanup_result: Optional[Dict[str, Any]],
-    ) -> List[str]:
-        if not isinstance(cleanup_result, dict):
-            return []
-
-        overview_uris: List[str] = []
-        for field in ("memory_uris", "deleted_memory_uris"):
-            values = cleanup_result.get(field)
-            if not isinstance(values, list):
-                continue
-            for memory_uri in values:
-                if not isinstance(memory_uri, str):
-                    continue
-                overview_uri = cls._memory_overview_parent_uri(
-                    memory_uri,
-                    context_type_for_uri(memory_uri),
-                )
-                if overview_uri:
-                    overview_uris.append(overview_uri)
-        return list(dict.fromkeys(overview_uris))
 
     async def _enqueue_delete_refresh(
         self,

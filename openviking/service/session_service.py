@@ -446,6 +446,7 @@ class SessionService:
         ctx: RequestContext,
         keep_recent_count: int = 0,
         *,
+        memory_policy: Optional[Dict[str, Any]] = None,
         enable_working_memory: Optional[bool] = None,
         retention_mode: Optional[str] = None,
         keep_recent_turn_count: Optional[int] = None,
@@ -461,8 +462,12 @@ class SessionService:
 
         Args:
             session_id: Session ID to commit
+            ctx: Identity and scope used to load and commit the session.
             keep_recent_count: Number of most-recent messages to keep in the
                 live session after commit. ``0`` archives everything.
+            memory_policy: Extraction policy for this commit only. ``None``
+                resolves the persisted session or user default. Invalid policies
+                raise before messages are archived.
 
         Returns:
             Commit result with keys: session_id, status, task_id,
@@ -471,6 +476,8 @@ class SessionService:
         self._ensure_initialized()
         session = await self.get(session_id, ctx)
         commit_kwargs: Dict[str, Any] = {"keep_recent_count": keep_recent_count}
+        if memory_policy is not None:
+            commit_kwargs["memory_policy"] = memory_policy
         optional_retention = {
             "enable_working_memory": enable_working_memory,
             "retention_mode": retention_mode,

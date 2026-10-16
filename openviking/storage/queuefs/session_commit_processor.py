@@ -123,16 +123,17 @@ class SessionCommitProcessor(DequeueHandlerBase):
         if not data:
             return ProcessResult.success()
 
-        try:
-            payload = data.get("data", data)
-            if isinstance(payload, str):
+        payload = data.get("data", data)
+        if isinstance(payload, str):
+            try:
                 payload = json.loads(payload)
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            return ProcessResult.failed(str(exc))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                return ProcessResult.failed(str(exc))
         if isinstance(payload, dict) and payload.get("resource_memory_cleanup"):
             if self._resource_memory_link_service is None:
                 raise RuntimeError("Resource memory cleanup service is unavailable")
             return await self._resource_memory_link_service.resume_cleanup(payload)
+
         try:
             msg, ctx = self._parse_message(data)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
