@@ -352,12 +352,12 @@ class SessionService:
         self._ensure_initialized()
 
         session_uri = canonical_session_uri(ctx, session_id)
-        session = await self.get(session_id, ctx)
+        session = self.session(ctx, session_id)
         if not await session.exists():
             self._record_lifecycle_metric("delete", "error")
             raise NotFoundError(session_id, "session")
 
-        await self._viking_fs.rm(session_uri, recursive=True, ctx=ctx)
+        await self._viking_fs.rm(session_uri, recursive=True, ctx=ctx, no_vector=True)
         logger.info(f"Deleted session: {session_id}")
         self._record_lifecycle_metric("delete", "ok")
         return True
