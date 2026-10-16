@@ -106,6 +106,10 @@ class ModelCallError(OSError):
     """A failed model request or stalled read loop; output validation errors remain separate."""
 
 
+class ModelCallLimitError(ModelCallError):
+    """A local deadline or no-progress limit allows direct generation to use the pipeline."""
+
+
 class TaskFiles:
     """Small independently replaced shards, accessed through the sandbox's file API.
 
@@ -228,10 +232,16 @@ class JsonModel:
         self.identity.update(
             batch_target_chars=self.budget, output_reserve_tokens=self.output_tokens
         )
+        self.identity["thinking"] = {
+            "map": False,
+            "route": False,
+            "reduce": False,
+            "combine": False,
+        }
         underlying = getattr(provider, "_provider", provider)
         backend = getattr(underlying, "_vlm", underlying)
         backend = getattr(backend, "primary", backend)
-        self.timeout = getattr(backend, "timeout", None)
+        self.timeout = getattr(backend, "timeout", 600.0)
         self.identity["backend_settings"] = {
             name: getattr(backend, name, None)
             for name in ("model", "thinking", "temperature", "max_tokens", "reasoning_effort")
@@ -270,12 +280,15 @@ class JsonModel:
         self.metrics[f"{stage}_calls"] += 1
         number = self.metrics[f"{stage}_calls"]
         started = time.monotonic()
+        thinking = self.identity["thinking"].get(stage.split("_", 1)[0])
         report = {
             "stage": stage,
             "call": number,
             "max_tokens": max_tokens,
             "timeout_seconds": self.timeout,
-            "thinking": self.identity["backend_settings"]["thinking"],
+            "thinking": thinking
+            if thinking is not None
+            else self.identity["backend_settings"]["thinking"],
             "reasoning_effort": self.identity["backend_settings"]["reasoning_effort"],
             "message_chars": sum(len(json.dumps(m, ensure_ascii=False)) for m in messages),
             "tool_schema_chars": len(json.dumps(tools, ensure_ascii=False)),
@@ -290,13 +303,15 @@ class JsonModel:
             json.dumps([messages, tools], ensure_ascii=False), text_type="mixed"
         )
         try:
-            response = await self.provider.chat(
-                messages=messages,
-                tools=tools,
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=max_tokens,
-            )
+            async with asyncio.timeout(self.timeout):
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=tools,
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=max_tokens,
+                    thinking=thinking,
+                )
             report.update(
                 finish_reason=response.finish_reason,
                 usage={k: v for k, v in (response.usage or {}).items() if isinstance(v, int)},
@@ -319,8 +334,8 @@ class JsonModel:
             return response
         except TimeoutError as exc:
             report["error"] = "TimeoutError"
-            raise ModelCallError(
-                f"{stage}: configured model request timeout exceeded ({self.timeout}s)"
+            raise ModelCallLimitError(
+                f"{stage}: model call wall-clock budget exhausted ({self.timeout:g}s)"
             ) from exc
         except Exception as exc:
             report["error"] = type(exc).__name__
@@ -344,7 +359,20 @@ class JsonModel:
         agent=False,
         readers=None,
     ) -> R:
-        """Run an assignment with scoped readers and inherited model settings."""
+        """Bound planning/review to two model timeouts and execution assignments to one."""
+        seconds = self.timeout * (2 if stage in {"plan", "review"} else 1)
+        try:
+            async with asyncio.timeout(seconds):
+                return await self._ask(
+                    stage, system, data, schema, validate, agent=agent, readers=readers
+                )
+        except TimeoutError as exc:
+            raise ModelCallLimitError(
+                f"{stage}: assignment wall-clock budget exhausted ({seconds:g}s)"
+            ) from exc
+
+    async def _ask(self, stage, system, data, schema, validate, *, agent, readers):
+        """Run a stage with scoped readers; return validated output and cache eligible results."""
         if schema is FileResponse and stage != "skill_repair":
             # Inline original excerpts when located; unlocated records retain full shards.
             # The scoped reader can expand partial evidence without catalog access.
@@ -403,7 +431,7 @@ class JsonModel:
         return result
 
     async def direct(self, stage, system, data, schema, validate, key, *, readers=None):
-        """Return validated output; raise ModelCallError when reader calls make no progress."""
+        """Return validated output; reject three consecutive rounds of repeated tool results."""
         tools = [
             {
                 "type": "function",
@@ -451,7 +479,8 @@ class JsonModel:
         ]
         failures = 0
         retries = Counter()
-        seen_reads = set()
+        seen_results = set()
+        stalled_rounds = 0
         while True:
             response = await self.call(stage, messages, tools, max_tokens=self.max_tokens)
             raw = None
@@ -493,12 +522,21 @@ class JsonModel:
                                     f"{stage}: reader {call.name} failed repeatedly"
                                 ) from exc
                             value = "Error: " + str(exc)[:800]
-                        fingerprint = digest([call.name, call.arguments, value])
-                        progress = progress or fingerprint not in seen_reads
-                        seen_reads.add(fingerprint)
+                        try:
+                            content = json.loads(
+                                value, object_hook=lambda v: v.get("text", v.get("excerpts", v))
+                            )
+                        except (json.JSONDecodeError, TypeError):
+                            content = value
+                        fingerprint = digest([call.name, content])
+                        progress = progress or fingerprint not in seen_results
+                        if fingerprint in seen_results:
+                            value = "Unchanged: same tool result. Use previous results or submit."
+                        seen_results.add(fingerprint)
                         messages.append({"role": "tool", "tool_call_id": call.id, "content": value})
-                    if not progress:
-                        raise ModelCallError(f"{stage}: read-only tools made no progress")
+                    stalled_rounds = 0 if progress else stalled_rounds + 1
+                    if stalled_rounds >= 3:
+                        raise ModelCallLimitError(f"{stage}: tool calls made no progress")
                     continue
                 if calls:
                     if len(calls) != 1 or calls[0].name != "emit":

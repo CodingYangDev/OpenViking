@@ -80,24 +80,27 @@ def response(name, arguments):
 
 @pytest.mark.parametrize("case", ["repeat", "progress", "error"])
 async def test_direct_reads_stop_repetition_but_allow_progress(case):
-    offsets = list(range(51)) if case == "progress" else [0] * 4
+    offsets = [n // 2 for n in range(102)] if case == "progress" else list(range(4))
     files = SimpleNamespace(put=AsyncMock())
-    model = JsonModel(None, "test", 0, files, CompileLimits(), {}, Counter())
     responses = [response("read", {"offset": n}) for n in offsets]
     responses.append(response("emit", {"action": "continue"}))
-    model.call = AsyncMock(side_effect=responses)
+    provider = SimpleNamespace(thinking=True, chat=AsyncMock(side_effect=responses))
+    model = JsonModel(provider, "test", 0, files, CompileLimits(), {}, Counter())
     reader = SimpleNamespace(
         name="read", description="", parameters={}, execute=AsyncMock(return_value="x")
     )
+    if case == "progress":
+        reader.execute.side_effect = [f"chunk{n}" for n in offsets]
     if case == "error":
         reader.execute.side_effect = [
             error(f"request_id={i}")
             for i, error in enumerate((OSError, ValueError, TimeoutError, PermissionError))
         ]
-    result = model.direct("review", "", {}, ReviewDecision, None, "test", readers={"read": reader})
+    result = model.direct("map", "", {}, ReviewDecision, None, "test", readers={"read": reader})
     if case == "progress":
         assert (await result).action == "continue"
     else:
         with pytest.raises(ModelCallError, match="made no progress|failed repeatedly"):
             await result
-    assert model.call.await_count == {"repeat": 2, "progress": 52, "error": 4}[case]
+    assert provider.chat.await_count == (len(offsets) + 1 if case == "progress" else 4)
+    assert provider.chat.await_args.kwargs["thinking"] is False

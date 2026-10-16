@@ -408,7 +408,7 @@ async def test_volcengine_stream_uses_unique_default_client_request_ids():
 async def test_volcengine_request_settings_and_ids(monkeypatch, thinking, effort, expected):
     calls: list[dict] = []
 
-    async def create(**kwargs):
+    def create(**kwargs):
         calls.append(kwargs)
         return SimpleNamespace(
             choices=[
@@ -433,14 +433,20 @@ async def test_volcengine_request_settings_and_ids(monkeypatch, thinking, effort
     monkeypatch.setattr(
         vlm,
         "get_async_client",
-        lambda: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))),
+        lambda: SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(side_effect=create)))
+        ),
     )
+    vlm._sync_client = vlm.get_async_client()
+    vlm._sync_client.chat.completions.create = create
 
     for _ in range(2):
         assert await vlm.get_completion_async("hi", reasoning_effort=effort) == "ok"
+        if effort is None:
+            assert vlm.get_completion("hi") == "ok"
 
     request_ids = [kwargs["extra_headers"][VOLCENGINE_CLIENT_REQUEST_ID_HEADER] for kwargs in calls]
-    assert len(set(request_ids)) == 2
+    assert len(set(request_ids)) == len(calls)
     assert all(value.startswith(f"{VOLCENGINE_CLIENT_REQUEST_ID},") for value in request_ids)
     assert all(kwargs.get("reasoning_effort") == expected for kwargs in calls)
     assert all(("reasoning_effort" in kwargs) == thinking for kwargs in calls)
