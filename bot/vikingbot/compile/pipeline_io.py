@@ -360,8 +360,8 @@ class JsonModel:
         agent=False,
         readers=None,
     ) -> R:
-        """Bound plan/review to 2x timeout (minimum 1200s), execution to 1x (minimum 600s)."""
-        seconds = max(600, self.timeout) * (2 if stage in {"plan", "review"} else 1)
+        """Bound each assignment to twice the model timeout, with a 1200-second minimum."""
+        seconds = max(1200, 2 * self.timeout)
         try:
             async with asyncio.timeout(seconds):
                 return await self._ask(
