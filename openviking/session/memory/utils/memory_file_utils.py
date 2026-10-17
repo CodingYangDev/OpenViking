@@ -1,5 +1,4 @@
 import json
-import logging
 import re
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -8,10 +7,8 @@ from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.utils.content_template import render_content_template
 from openviking.session.memory.utils.link_renderer import LinkRenderer
 from openviking.session.memory.utils.messages import parse_memory_file_with_fields
-from openviking.session.memory.utils.uri import render_template
+from openviking.session.memory.utils.template_utils import TemplateUtils
 from openviking.utils.time_utils import parse_iso_datetime
-
-logger = logging.getLogger(__name__)
 
 # Regex patterns for MEMORY_FIELDS HTML comment
 _MEMORY_FIELDS_PATTERN = re.compile(r"\n\n<!--\s*MEMORY_FIELDS\s*\n(.*?)\n-->", re.DOTALL)
@@ -88,21 +85,24 @@ def _serialize_with_metadata(
             content_template, account_content_template_type, metadata, extract_context
         )
     elif content_template:
-        try:
-            template_vars = metadata.copy()
-            template_vars["content"] = content
-            template_vars.setdefault("links", [])
-            template_vars.setdefault("backlinks", [])
-            template_vars["source_uri"] = source_uri or ""
-            template_vars["uri_basename"] = _uri_basename
-            template_vars["link_target"] = lambda target_uri: _template_link_target(
-                source_uri, target_uri
-            )
-            content = render_template(content_template, template_vars, extract_context)
-        except Exception:
-            logger.exception(
-                "Failed to render memory content template; using plain content fallback"
-            )
+        template_vars = metadata.copy()
+        template_vars["content"] = content
+        template_vars.setdefault("links", [])
+        template_vars.setdefault("backlinks", [])
+        template_vars["source_uri"] = source_uri or ""
+        template_vars["uri_basename"] = _uri_basename
+        template_vars["link_target"] = lambda target_uri: _template_link_target(
+            source_uri, target_uri
+        )
+        # Trim template source, not interpolated evidence. Render errors must propagate:
+        # silently falling back to the raw body can lose required fields and diagnostics.
+        content = TemplateUtils.render(
+            content_template.strip(),
+            template_vars,
+            extract_context,
+            debug_undefined=True,
+            strip=False,
+        )
 
     clean_metadata = {k: v for k, v in metadata.items() if v is not None}
 

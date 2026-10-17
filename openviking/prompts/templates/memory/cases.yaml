@@ -13,12 +13,17 @@ description: |
   add genuinely new domain-wide criteria, edit changed criteria, and remove obsolete ones only with
   supporting evidence. A failed run does not justify weakening a rule. Do not promote one task
   answer, evaluator literal, entity ID or local failure into a domain-wide requirement.
-  When the rubric is unchanged, explicitly select each matching existing Case: in Python use
-  sdk.commit(cases=[loaded_case]); in JSON return its page_id in selected_case_ids.
+  For each execution, increment execution_count once on every matched existing Case, even when
+  its rubric and domain context are unchanged. In Python, use matched_case.update(execution_count=1)
+  on the loaded Case; sdk.commit(cases=[...]) and sdk.commit() are not required. In JSON, include
+  a Case update with its page_id, unchanged identity fields, and execution_count: 1.
+  This update associates the execution with the Case so it can contribute a Trajectory;
+  do not return an empty operation for a match.
   Update a changed rubric on the loaded Case using the normal edit/drop/overwrite field operations.
-  Select only matched Cases, not all search results. No content change is required for a new
-  execution to contribute a Trajectory. Newly created Cases are associated through creation.
-  Use sdk.create_cases only for a new domain target, never for an existing one.
+  Count only matched Cases, not all search results. Use sdk.create_cases only for a new domain
+  target, never for an existing one, and set execution_count=1 for its first execution.
+  When merging Case patches, sum their execution_count deltas once for each final Case rather
+  than submitting 1 or a historical total. Case merging still requires its explicit case_sources mapping.
   Concrete task inputs, expected values, execution facts and scores belong to each Trajectory,
   not this memory. The Case describes the business scope; its Experience describes how to handle it.
 
@@ -91,6 +96,15 @@ fields:
       Use concise prose or Markdown bullets, not JSON. Do not repeat task_signature or include
       task-specific identifiers, dates, amounts, membership tiers or other instance values.
     merge_op: immutable
+
+  - name: execution_count
+    type: int64
+    description: |
+      Number of executions associated with this Case. Submit a delta of 1 per matched execution,
+      including the first execution when creating a Case, even if no other fields change.
+      Do not count unmatched search candidates. Submit only the increment, never the historical
+      total. When merging patches, sum the contributing execution_count deltas once.
+    merge_op: sum
 
   - name: rubric
     type: string

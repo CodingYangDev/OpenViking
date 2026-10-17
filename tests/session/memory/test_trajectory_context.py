@@ -17,14 +17,17 @@ def message(text: str, role: str = "user") -> Message:
     return Message(id="m", role=role, parts=[TextPart(text=text)])
 
 
-def operations(content: str, *, count: int = 1, memory_type: str = "trajectories"):
+def operations(
+    content: str, *, context_rules: str = "", count: int = 1, memory_type: str = "trajectories"
+):
     return ResolvedOperations(
         upsert_operations=[
             ResolvedOperation(
                 memory_type=memory_type,
                 uris=["viking://user/u/memories/trajectories/model_case/model_name.md"],
                 memory_fields={
-                    "content": content,
+                    "steps": content,
+                    "context_rules": context_rules,
                     "trajectory_name": "model_name",
                     "case_name": "model_case",
                     "outcome": "success",
@@ -35,6 +38,71 @@ def operations(content: str, *, count: int = 1, memory_type: str = "trajectories
         delete_file_contents=[],
         errors=[],
     )
+
+
+@pytest.mark.parametrize("language", ["en", "zh-CN"])
+@pytest.mark.parametrize("source_steps", [None, []])
+def test_trajectory_instruction_keeps_the_target_language(language, source_steps):
+    provider = AgentTrajectoryContextProvider(messages=[], source_steps=source_steps)
+    provider._output_language = language
+
+    instruction = provider.instruction()
+
+    assert provider.get_output_language() == language
+    assert instruction.startswith(f"Write new prose in {language}.\n")
+    if source_steps is not None:
+        assert "ASD-STE100 writing principles for new prose" in instruction
+        assert "short sentences, direct wording" in instruction
+        assert "consistent terms" in instruction
+        assert "Keep source quotes and code unchanged" in instruction
+        assert "Copy complete original clauses verbatim" in instruction
+        assert "800 characters" in instruction
+
+
+def test_trajectory_prompt_keeps_effect_evidence_without_domain_specific_examples():
+    instruction = " ".join(
+        AgentTrajectoryContextProvider(messages=[], source_steps=[]).instruction().split()
+    )
+
+    assert "state changes, side effects, and important facts that did not change" in instruction
+    assert "Compare supplied values only for the same entity" in instruction
+    assert "Do not infer results from missing evidence" in instruction
+    assert "not the Case's entire business scope" in instruction
+    assert "minimum complete evidence" in instruction
+    assert "both successful and failed runs" in instruction
+    assert "facts the agent ignored or misused" in instruction
+    assert "source values and relevant candidate alternatives" in instruction
+    assert "entity, unit, time and scope" in instruction
+    assert "keep original and updated values distinct" in instruction
+    assert "If scope is ambiguous, retain evidence for the supported interpretations" in instruction
+    assert "Do not add unobserved totals, corrected answers or causes" in instruction
+    assert "Omit unrelated fields, wrappers, and full histories" in instruction
+    assert "Do not copy raw JSON" in instruction
+    for example in ("payment_history", "refund", "baggage"):
+        assert example not in instruction
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["en", "zh-CN"])
+async def test_trajectory_style_does_not_rewrite_source_evidence_or_content(language):
+    source = '原文 "yes"; code `state["count"] = 0`; ID A-123; value 50.00.'
+    steps = [{"type": "user", "content": source}]
+    provider = AgentTrajectoryContextProvider(
+        messages=[message(source)],
+        source_steps=steps,
+        trajectory_name="trial",
+        case_name="case",
+        outcome="failure",
+    )
+    provider._output_language = language
+    payload = json.loads((await provider.prefetch())[0]["content"])
+    assert payload["source_steps"] == steps
+
+    label = "The user supplied" if language == "en" else "用户提供"
+    content = f"# Trajectory\n1. `user` {label}: {source}"
+    result = operations(content)
+    assert provider.validate_resolved_operations(result) == []
+    assert result.upsert_operations[0].memory_fields["steps"] == content
 
 
 @pytest.mark.parametrize(
@@ -69,12 +137,13 @@ def test_content_is_kept_without_heading_numbering_count_or_type_binding(content
 
     operation = result.upsert_operations[0]
     assert operation.memory_fields == {
-        "content": content,
+        "steps": content,
+        "context_rules": "",
         "trajectory_name": "server_fixed",
         "case_name": "case",
         "outcome": "failure",
-        "experience_effects": {"positive_ids": [], "negative_ids": [], "weak_ids": []},
-        "experience_effect_sources": {},
+        "action_scores": [],
+        "action_score_sources": {},
         "evaluation_criteria": [],
     }
     assert operation.uris == [provider.target_uri]
@@ -171,7 +240,7 @@ async def test_system_rules_reach_model_once_through_source_steps():
         "case",
         "task_spec",
         "source_steps",
-        "injected_experiences",
+        "injected_actions",
         "external_evaluation",
     }
     assert payload["source_steps"] == steps
@@ -183,12 +252,13 @@ async def test_system_rules_reach_model_once_through_source_steps():
     prompt = provider.instruction()
     assert "session_context" not in prompt
     assert "All source messages are supplied once in source_steps" in prompt
-    assert "# Session Context" in prompt
+    assert "context_rules" in prompt
+    assert "template adds the Session Context heading" in prompt
     assert "training metadata, not execution-time rules or actions" in prompt
     content = "Confirmation precedes cancellation.\nThe user asked to cancel."
     result = operations(content)
     assert provider.validate_resolved_operations(result) == []
-    assert result.upsert_operations[0].memory_fields["content"] == content
+    assert result.upsert_operations[0].memory_fields["steps"] == content
 
 
 @pytest.mark.parametrize("role", ["user", "assistant"])
@@ -300,7 +370,10 @@ async def test_system_rules_are_context_in_single_source_input_not_output_steps(
         "Correct the saved passenger's date of birth.",
     ],
 )
-async def test_tool_summary_selection_is_task_guidance_not_input_field_filtering(user_request):
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+async def test_tool_summary_selection_is_task_guidance_not_input_field_filtering(
+    user_request, outcome
+):
     from copy import deepcopy
 
     from openviking.message import ToolPart
@@ -336,15 +409,19 @@ async def test_tool_summary_selection_is_task_guidance_not_input_field_filtering
     provider = AgentTrajectoryContextProvider(
         messages=messages,
         source_steps=trajectory_source_steps(messages),
+        outcome=outcome,
     )
     prompt = " ".join(provider.instruction().split())
     for requirement in (
-        "this execution's concrete user request",
+        "Select facts for this execution",
         "not the Case's entire business scope",
-        "Keep the exact relevant values, not a list of field names",
-        "retain enough candidate values to check the choice",
-        "Keep evidence needed to expose an error even when the agent ignored it",
-        "do not invent values missing from the supplied tool evidence",
+        "Keep exact task-relevant values",
+        "source values and relevant candidate alternatives",
+        "not just selected results, totals or differences",
+        "both successful and failed runs",
+        "facts the agent ignored or misused",
+        "keep original and updated values distinct",
+        "Do not infer results from missing evidence",
     ):
         assert requirement in prompt
     assert "Rewrite only what happened" in prompt
@@ -363,6 +440,19 @@ async def test_tool_summary_selection_is_task_guidance_not_input_field_filtering
 
     # The new wording does not add a semantic validator or rewrite model-produced text.
     result = operations("1. `tool:get_user_details` observed profile facts.")
-    content = result.upsert_operations[0].memory_fields["content"]
+    content = result.upsert_operations[0].memory_fields["steps"]
     assert provider.validate_resolved_operations(result) == []
-    assert result.upsert_operations[0].memory_fields["content"] == content
+    assert result.upsert_operations[0].memory_fields["steps"] == content
+
+
+@pytest.mark.asyncio
+async def test_named_reminders_reach_extraction_with_copy_header_guidance():
+    note = "[Experience Reminder] require_chinese, ask_reason\n\n**建议**\nKeep the full guidance."
+    steps = trajectory_source_steps([message(note)])
+    provider = AgentTrajectoryContextProvider(messages=[], source_steps=steps)
+    instruction = provider.instruction()
+    assert "copy its first line exactly" in instruction
+    assert "[Experience Reminder] advice_a, advice_b" in instruction
+    assert "Do not translate or invent advice names" in instruction
+    payload = json.loads((await provider.prefetch())[0]["content"])
+    assert payload["source_steps"] == [{"type": "experience_reminder", "content": note}]

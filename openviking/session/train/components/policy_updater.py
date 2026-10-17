@@ -277,7 +277,7 @@ def _plan_to_resolved_operations(
                     **{
                         key: value
                         for key, value in updated.metadata.items()
-                        if key != "feedback_stats"
+                        if key not in {"feedback_stats", "action_feedback"}
                     },
                     "memory_type": item.memory_type or "experiences",
                     "experience_name": updated.name,

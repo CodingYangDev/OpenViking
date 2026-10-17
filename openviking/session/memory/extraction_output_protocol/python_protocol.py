@@ -37,6 +37,8 @@ from openviking.session.memory.utils.line_numbers import (
 _PYTHON_FENCE_RE = re.compile(r"```python[ \t]*\r?\n(?P<code>[\s\S]*?)```", re.IGNORECASE)
 _PYTHON_FENCE_START_RE = re.compile(r"```python[ \t]*\r?\n", re.IGNORECASE)
 _HIDDEN_MEMORY_FIELDS = {
+    "action_feedback",
+    "action_score_sources",
     "feedback_stats",
     "experience_effect_sources",
     "trajectory_format",
@@ -95,21 +97,21 @@ _NESTED_STRING_GUIDANCE = (
     "```"
 )
 
-_JSON_STRING_GUIDANCE = r"""For fields defined as JSON strings, use sdk.json_dumps(value): it returns a JSON string,
-not a new array/object field type. Write Python data with True/False/None and
-triple-single-quoted text values, not hand-escaped JSON. Pass the returned string directly to a
-listed create/set method, obj.update(), or a string field's overwrite(); do not quote the
-helper call or use str(list_or_dict) as JSON.
+_JSON_STRING_GUIDANCE = r"""For fields defined as JSON strings, use a raw triple-single-quoted string (r'''...''').
+For these fields only, follow the JSON escaping rules here instead of the ordinary-string
+escaping rules above. The field remains a string, not a Python list or dict.
+Inside it, write valid JSON with double-quoted keys/strings and true/false/null. Escape once
+for JSON: \" for a quote inside a JSON string, \n for a newline, and \\ for a backslash.
+Do not escape those backslashes again for Python. If the JSON text contains literal ''',
+encode an apostrophe as \u0027 so it cannot close the outer string; \' is not a JSON escape.
 Syntax-only example; use the actual keys and IDs required by the target field:
 ```python
-json_text = sdk.json_dumps([
-    {"text": '''The user said "yes".''', "ok": True, "missing": None}
-])
+json_text = r'''[
+    {"text": "The user said \"yes\".\nNext line.", "ok": true, "missing": null}
+]'''
 ```
-Use json_text as the JSON-string field value in a write call. The helper takes exactly one
-positional argument, no encoder options or callbacks. It supports JSON-serializable data,
-not memory objects or field handles; non-finite numbers and oversized results are rejected.
-This is a local helper in the final output program, not a read-only eval tool call."""
+Pass json_text directly to the JSON-string field in a listed write method. Do not use
+str(list_or_dict) as JSON. This convention does not change field validation or enable imports."""
 
 _CONTRACT_PREAMBLE = (
     "## Output Format: restricted Python memory SDK",
@@ -274,11 +276,15 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         lines = list(_CONTRACT_PREAMBLE)
         for schema in context.schemas:
             lines.extend(self._render_schema_contract(context, schema))
-        if "selected_case_ids" in context.operations_model.model_fields:
+        if (
+            "selected_case_ids" in context.operations_model.model_fields
+            and "case_sources" not in context.operations_model.model_fields
+        ):
             lines.append(
-                "To associate this execution with existing Cases without writing them, end with "
-                "sdk.commit(cases=[case_object, ...]). Use only explicitly matched, loaded Case "
-                "objects or aliases, never URIs or all search hits. New Cases need no selection."
+                "Binding a matched, loaded Case to a local variable selects it without a write. "
+                "sdk.commit() is optional; use sdk.commit(cases=[...]) to override implicit "
+                "selections, or cases=[] to clear them. Unbound search hits are not selected. "
+                "New or changed Cases use the normal write path."
             )
         if "case_sources" in context.operations_model.model_fields:
             lines.append(
@@ -423,8 +429,8 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
                 "unchanged existing Cases. Output only Python code."
             )
         selection = (
-            " Include matched existing Cases in sdk.commit(cases=[...]) even when no memory "
-            "content changes are needed."
+            " Select matched existing Cases by assigning them to local variables "
+            "or passing cases= to sdk.commit()."
             if "selected_case_ids" in context.operations_model.model_fields
             else ""
         )
@@ -479,6 +485,7 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             "quote delimiter closed the surrounding string early; check its escaping rather than "
             "deleting or rewriting valid content to avoid the reported character."
             f"\n\n{_NESTED_STRING_GUIDANCE}"
+            f"\n\n{_JSON_STRING_GUIDANCE}"
             f"{_format_retry_source_excerpt(failed_content, error)}"
         )
 
@@ -694,6 +701,7 @@ class _PythonProgramCompiler:
         self.values: dict[str, Any] = {}
         self.links: list[dict[str, Any]] = []
         self.selected_cases: list[_MemoryObject] = []
+        self._explicit_case_selection = False
         self.case_sources: list[dict[str, Any]] = []
         self._singleton_identities: set[tuple[str, tuple[tuple[str, Any], ...]]] = set()
         self._next_new_page_id = self._find_next_new_page_id(100)
@@ -719,9 +727,8 @@ class _PythonProgramCompiler:
                 f"Line {exc.lineno or 1}: invalid Python syntax: {exc.msg}"
                 + _format_syntax_error_source(exc)
             ) from exc
-        # sdk.commit() is optional: an empty program (or one without commit) simply
-        # means "no changes". When present, commit() still acts as a terminator and
-        # must be the final statement.
+        # sdk.commit() is optional: collect writes and Case selections from the program.
+        # When present, commit() is a terminator and must be the final statement.
         for index, statement in enumerate(module.body):
             if self._committed:
                 self._error(statement, "sdk.commit() must be the final statement")
@@ -784,6 +791,13 @@ class _PythonProgramCompiler:
                 else:
                     value.name = name
                     self.objects[name] = value
+                if (
+                    value.existing
+                    and value.memory_type == "cases"
+                    and "selected_case_ids" in self.context.operations_model.model_fields
+                    and "case_sources" not in self.context.operations_model.model_fields
+                ):
+                    self.selected_cases.append(value)
             elif isinstance(value, _FieldHandle):
                 self._error(
                     node,
@@ -979,26 +993,6 @@ class _PythonProgramCompiler:
 
     def _call_sdk(self, node: ast.Call, *, statement: bool) -> Any:
         method = node.func.attr
-        if method == "json_dumps":
-            if len(node.args) != 1 or node.keywords:
-                self._error(node, "sdk.json_dumps() accepts exactly one positional argument")
-            value = self._eval(node.args[0])
-            chunks = []
-            size = 0
-            try:
-                # Bound output while encoding: nested containers or escaped strings can
-                # be much larger than their input expressions. Never build it all first.
-                encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False)
-                for chunk in encoder.iterencode(value):
-                    size += len(chunk.encode("utf-8"))
-                    if size > _MAX_EXPRESSION_SIZE:
-                        raise ValueError(
-                            f"serialized JSON exceeds the {_MAX_EXPRESSION_SIZE:,}-byte size limit"
-                        )
-                    chunks.append(chunk)
-            except (TypeError, ValueError, OverflowError, RecursionError) as exc:
-                self._error(node, f"sdk.json_dumps() cannot serialize this value: {exc}")
-            return "".join(chunks)
         if method.startswith(("create_", "set_")):
             verb, type_alias = method.split("_", 1)
             if node.args:
@@ -1092,7 +1086,9 @@ class _PythonProgramCompiler:
                 self._error(
                     node, "cases= must contain only loaded, non-deleted existing Case objects"
                 )
-            self.selected_cases = selected
+            if "cases" in kwargs:
+                self.selected_cases = selected
+                self._explicit_case_selection = True
             bindings = kwargs.get("case_sources", [])
             if not isinstance(bindings, list):
                 self._error(node, "case_sources= must be a list of (Case object, patch IDs) tuples")
@@ -1398,8 +1394,13 @@ class _PythonProgramCompiler:
                 if not skip and remapped["f"] != remapped["t"]:
                     payload["links"].append(remapped)
         if "selected_case_ids" in payload:
+            # Changed Cases use the normal write path; deleted aliases must not reselect them.
             payload["selected_case_ids"] = list(
-                dict.fromkeys(obj.page_id for obj in self.selected_cases)
+                dict.fromkeys(
+                    obj.page_id
+                    for obj in self.selected_cases
+                    if self._explicit_case_selection or (not obj.deleted and not obj.changed_fields)
+                )
             )
         if "case_sources" in payload:
             payload["case_sources"] = self.case_sources

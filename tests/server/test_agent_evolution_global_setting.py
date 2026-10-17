@@ -166,9 +166,8 @@ def test_agent_evolution_can_be_enabled_as_account_default():
     assert config.agent_evolution.enabled is True
 
 
-def test_experience_gate_is_disabled_by_default_and_can_be_enabled():
-    assert AgentEvolutionConfig().experience_gate_enabled is False
-    assert AgentEvolutionConfig(experience_gate_enabled=True).experience_gate_enabled is True
+def test_experience_gate_switch_is_not_runtime_configuration():
+    assert "experience_gate_enabled" not in AgentEvolutionConfig.model_fields
 
 
 def test_server_agent_evolution_seeds_runtime_cluster_baseline():

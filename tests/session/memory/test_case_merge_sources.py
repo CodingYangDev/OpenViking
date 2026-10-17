@@ -192,6 +192,7 @@ async def test_sources_can_target_a_new_case_without_selecting_existing_candidat
     env = merge_loop(monkeypatch, output_format=output_format)
     fields = {
         "case_name": "new",
+        "execution_count": 2,
         "task_signature": "New domain",
         "input": "context",
         "rubric": '[{"id":"scope","description":"Respect scope."}]',
@@ -286,3 +287,24 @@ def test_unchanged_case_patch_keeps_its_identity_but_hides_system_source_ids(mon
     assert "(no changes)" in rendered
     assert 'proposed_case: "first"' in rendered
     assert "private-source" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_case_merge_bindings_do_not_implicitly_select_inspected_candidates(monkeypatch):
+    env = merge_loop(monkeypatch)
+    env.model.get_completion_async.return_value = (
+        "inspected = second\nselected = first\nsdk.commit(case_sources=[(selected, [1, 2])])"
+    )
+    operations, _ = await env.loop.run()
+    assert [ref.uris for ref in operations.case_references] == [[env.memories[0].uri]]
+    assert not operations.upsert_operations
+    env.fs.write_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_case_merge_binding_without_source_mapping_is_still_invalid(monkeypatch):
+    env = merge_loop(monkeypatch)
+    env.model.get_completion_async.return_value = "selected = first"
+    with pytest.raises(RuntimeError, match="could not be parsed"):
+        await env.loop.run()
+    env.fs.write_file.assert_not_awaited()

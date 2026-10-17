@@ -20,6 +20,8 @@ DEFAULT_NATIVE_THREAD_WORKERS = 128
 DEFAULT_MAX_ROLLOUT_CONCURRENCY = 200
 DEFAULT_ROLLOUT_THREAD_WORKERS = 200
 TAU2_SERVICE_LOG_LEVEL = "WARNING"
+DEFAULT_ROLLOUT_LOG_DIR = "result/tau2/service_logs/rollouts"
+_service_log_sink_id: int | None = None
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -36,27 +38,32 @@ from openviking.session.train.components.dataset_service import create_dataset_s
 
 def configure_tau2_service_logging() -> None:
     """Keep third-party tau2/loguru service output at warning and above."""
+    global _service_log_sink_id
     logging.getLogger("tau2").setLevel(logging.WARNING)
     try:
         from loguru import logger as loguru_logger
     except Exception:
         return
 
-    loguru_logger.remove()
-    loguru_logger.add(sys.stderr, level=TAU2_SERVICE_LOG_LEVEL)
+    if _service_log_sink_id is None:
+        try:
+            loguru_logger.remove(0)  # Replace only Loguru's default stderr sink.
+        except ValueError:
+            pass
+        _service_log_sink_id = loguru_logger.add(
+            sys.stderr, level=TAU2_SERVICE_LOG_LEVEL, diagnose=False
+        )
 
 
 def create_app(
     *,
     data_root: str | None = None,
     config_path: str | None = None,
-    rollout_language: str = "default",
     rollout_backend: str | None = None,
     max_rollout_concurrency: int | None = None,
     rollout_thread_workers: int | None = None,
+    rollout_log_dir: str | Path | None = DEFAULT_ROLLOUT_LOG_DIR,
 ):
-    if rollout_language not in {"default", "zh"}:
-        raise ValueError("rollout_language must be 'default' or 'zh'")
     default_backend = normalize_tau2_rollout_backend(
         rollout_backend or os.getenv("TAU2_ROLLOUT_BACKEND") or DEFAULT_TAU2_ROLLOUT_BACKEND
     )
@@ -89,7 +96,6 @@ def create_app(
             },
             config_path=config_path,
             concurrency=1,
-            rollout_language=rollout_language,
         )
 
     return create_dataset_service_app(
@@ -98,6 +104,7 @@ def create_app(
         make_rollout_executor=make_rollout_executor,
         max_rollout_concurrency=max_rollout_concurrency,
         rollout_thread_workers=rollout_thread_workers,
+        rollout_log_dir=rollout_log_dir,
     )
 
 
@@ -122,7 +129,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=1944)
     parser.add_argument("--data-root", default=os.getenv("TAU2_DATA_ROOT"))
     parser.add_argument("--config", default=os.getenv("OPENVIKING_CONFIG_FILE"))
-    parser.add_argument("--rollout-language", choices=["default", "zh"], default="default")
+    parser.add_argument(
+        "--rollout-log-dir",
+        default=os.getenv("TAU2_ROLLOUT_LOG_DIR", DEFAULT_ROLLOUT_LOG_DIR),
+        help="Server-owned per-rollout log directory (not a client filesystem path).",
+    )
     parser.add_argument(
         "--rollout-backend",
         choices=["native", "vikingbot"],
@@ -195,7 +206,7 @@ def main() -> None:
     app = create_app(
         data_root=args.data_root,
         config_path=args.config,
-        rollout_language=args.rollout_language,
+        rollout_log_dir=args.rollout_log_dir,
         rollout_backend=args.rollout_backend,
         max_rollout_concurrency=args.max_rollout_concurrency,
         rollout_thread_workers=(

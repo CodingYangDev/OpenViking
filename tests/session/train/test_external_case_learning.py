@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from test_case_experience_pipeline import observe, presented_trajectories
 from test_case_experience_pipeline import setup_observation as setup_observation
-from test_gradient_estimator_component import ROOT, analysis, operations
+from test_gradient_estimator_component import ROOT, analysis, operations, validated_operations
 
 from openviking.session.compressor_v3 import SessionCompressorV3
 from openviking.session.memory.dataclass import MemoryFile
@@ -166,7 +166,7 @@ async def cases(setup_observation, monkeypatch, request):
     monkeypatch.setattr(
         "openviking.session.compressor_v3.get_openviking_config",
         lambda: SimpleNamespace(
-            agent_evolution=SimpleNamespace(experience_gate_enabled=False, dag_decider=None),
+            agent_evolution=SimpleNamespace(dag_decider=None),
             jev=None,
         ),
     )
@@ -396,9 +396,12 @@ async def test_external_learning_reuses_streaming_trainer_and_serializes_finaliz
             await asyncio.wait_for(ready.wait(), timeout=1)
         finally:
             active -= 1
-        return operations(
-            name=provider.case.name,
-            content='dag = workflow("case")\nc = check("user asks")\nr = tell("verify")\nc.then(r)',
+        return await validated_operations(
+            provider,
+            operations(
+                name=provider.case.name,
+                content='dag = workflow("case")\nc = check("user asks")\nr = tell("verify")\nc.then(r)',
+            ),
         )
 
     async def commit(**kwargs):
@@ -566,7 +569,10 @@ async def test_later_chunk_failure_preserves_completed_state_and_snapshot_source
         if len(selected) == 1:
             assert selected[-1] == {first.uri}
             return (
-                operations(name="case_0", content='dag = workflow("case")\nr = tell("verify")')
+                await validated_operations(
+                    provider,
+                    operations(name="case_0", content='dag = workflow("case")\nr = tell("verify")'),
+                )
                 if first_state == "applied"
                 else None
             )
@@ -614,7 +620,10 @@ async def test_chunk_noop_is_not_overwritten_by_later_chunk_apply(cases, monkeyp
         if calls == 1:
             return None
         assert states(cases)[0]["state"] == "no_op"
-        return operations(name="case_0", content='dag = workflow("case")\nr = tell("verify")')
+        return await validated_operations(
+            provider,
+            operations(name="case_0", content='dag = workflow("case")\nr = tell("verify")'),
+        )
 
     monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", synthesize)
     result = await asyncio.wait_for(learn(cases), timeout=2)
@@ -649,9 +658,12 @@ async def test_large_case_uses_old_count_chunks_and_retains_every_trajectory(cas
                 in {"applied", "no_op"}
                 for uri in batch
             )
-        return operations(
-            name="case_0",
-            content=f'dag = workflow("case")\nr = tell("verify step {len(current_batches)}")',
+        return await validated_operations(
+            provider,
+            operations(
+                name="case_0",
+                content=f'dag = workflow("case")\nr = tell("verify step {len(current_batches)}")',
+            ),
         )
 
     monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", synthesize)
@@ -663,3 +675,35 @@ async def test_large_case_uses_old_count_chunks_and_retains_every_trajectory(cas
     assert all(s["state"] == "applied" and s["attempts"] == 1 for s in states(cases))
     assert cases.fs.commit.await_count == 4
     assert result["written_experience_uris"] == [f"{ROOT}/case_0.md"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cases", [1], indirect=True)
+async def test_rejected_candidate_marks_case_failed_and_can_be_retried(cases, monkeypatch):
+    async def rejected(estimator, provider, context):
+        provider.case.input["reservation"] = "XEHM4B"
+        return await validated_operations(
+            provider,
+            operations(name="case_0", content='dag = workflow("case")\nr = tell("Cancel XEHM4B")'),
+        )
+
+    monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", rejected)
+    result = await asyncio.wait_for(learn(cases), timeout=2)
+    assert result["failed_count"] == 1 and result["no_op_count"] == 0
+    assert {s["state"] for s in states(cases)} == {"failed"}
+    assert "ExperienceIdentifierGate" in str(result)
+    assert f"{ROOT}/case_0.md" not in cases.fs.files
+
+    async def corrected(estimator, provider, context):
+        return await validated_operations(
+            provider,
+            operations(
+                name="case_0",
+                content='dag = workflow("case")\nr = tell("Verify the selected reservation")',
+            ),
+        )
+
+    monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", corrected)
+    result = await asyncio.wait_for(learn(cases, retry_failed=True), timeout=2)
+    assert result["applied_count"] == 1 and result["failed_count"] == 0
+    assert {s["state"] for s in states(cases)} == {"applied"}

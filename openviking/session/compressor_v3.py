@@ -1278,23 +1278,18 @@ class SessionCompressorV3:
             )
 
         runtime_config = get_openviking_config()
-        experience_gate = (
-            ExperienceImprovementGate(
-                config=runtime_config.agent_evolution.dag_decider
-                or DagDeciderConfig(provider="jev"),
-                jev_config=runtime_config.jev,
-            )
-            if runtime_config.agent_evolution.experience_gate_enabled
-            else None
+        experience_gate = ExperienceImprovementGate(
+            config=runtime_config.agent_evolution.dag_decider or DagDeciderConfig(provider="jev"),
+            jev_config=runtime_config.jev,
         )
         optimizer = TrajectoryExperienceOptimizer(
             viking_fs=viking_fs,
             estimator=ExperienceGradientEstimator(
                 viking_fs=viking_fs,
                 vlm_resolver=self.vlm_resolver,
+                gates=[experience_gate],
             ),
             memory_registry=registry,
-            proposal_gate=experience_gate,
         )
 
         async def finalize(training_result: RolloutTrainingResult) -> None:

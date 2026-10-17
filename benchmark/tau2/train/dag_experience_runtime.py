@@ -210,11 +210,16 @@ class Tau2DagExperienceRuntime:
         )
         return note
 
-    async def record_injected(self, note: str) -> None:
+    async def record_injected(
+        self, note: str, *, captured_message: dict[str, Any] | None = None
+    ) -> None:
+        """Record insertion and annotate its export copy without changing online guidance."""
         if self._pending is None or self._pending[0] != note:
             return
         _, instructions = self._pending
         self._pending = None
+        if captured_message is not None and captured_message.get("content") == note:
+            captured_message["advice_names"] = [item["slot_name"] for item in instructions]
         for item in instructions:
             self._delivered.add((item["experience_uri"], item["slot_name"], item["instruction"]))
         for uri in dict.fromkeys(item["experience_uri"] for item in instructions):

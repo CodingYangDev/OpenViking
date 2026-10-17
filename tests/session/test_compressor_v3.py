@@ -674,7 +674,7 @@ async def test_train_from_extracted_cases_persists_only_trajectory_phase(monkeyp
         )
     )
     monkeypatch.setattr(
-        "openviking.session.compressor_v3.ExperienceImprovementGate.validate_proposals",
+        "openviking.session.compressor_v3.ExperienceImprovementGate.validate",
         proposal_gate,
     )
 

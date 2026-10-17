@@ -36,6 +36,106 @@ What the launcher does:
 6. runs `benchmark/tau2/train/run_batch_train_eval.sh` with the matching
    `--config`, `--server-url`, `--benchmark-service-url`, and result directory.
 
+### Optional code checkpoint and run metadata
+
+Pass `--auto-commit` to checkpoint the checkout before either service is restarted:
+
+```bash
+bash benchmark/tau2/train/restart_vikingbot_train_eval.sh --auto-commit
+```
+
+The flag is **off by default**. When enabled, the launcher runs `git add -A` and commits
+pending changes; a clean checkout does not get an empty commit. This includes all staged,
+unstaged, untracked and deleted files visible to Git, not only training code. Git ignore rules
+still apply, so review unrelated changes and ensure private configuration/generated output
+are ignored before enabling it. Git hooks run normally. A Git or commit-hook failure aborts
+before services start; staged changes may remain after a failed commit. The launcher never
+pushes and does not forward this launcher-only flag to the batch CLI. It exports the checkpoint
+commit and a credential-redacted launch command so the batch runner can append local Git notes.
+
+Every batch run records `run_metadata.json` in its run directory, whether or not automatic
+commit is enabled. `report.json` and the `run_start` / `run_result` events include the same
+`git` metadata and the metadata-file path. The record contains a safe allowlist of training
+parameters plus commit, branch, dirty status, changed paths and a working-tree fingerprint.
+Credentials, server URLs and configuration-file contents are not included.
+
+The fingerprint combines HEAD, the tracked working diff and Git-visible untracked file
+contents; ignored files are excluded and symlinks are hashed without following their targets.
+It identifies the **launcher checkout at capture time**, not a restorable or atomic code
+snapshot, loaded remote-service code, external dependencies, model configuration or Experience
+data. It does not identify the code that originally produced reused rollout caches or change
+cache keys. When Git/files cannot be inspected, the record reports an error with unknown fields
+rather than pretending the checkout is clean.
+
+### Local Git notes for automatic checkpoints
+
+With `--auto-commit`, the batch runner appends run-start, baseline/train/evaluation, final-summary
+and failure records to the checkpoint commit's **local** Git note. Entries include run identity,
+accuracy/pass counts, duration, error counts and result/event paths. Cached baseline entries are
+marked as cache hits and do not reuse the original evaluation duration. A later HEAD change does
+not move the note target. Clean checkouts also get notes on their existing commit.
+
+```bash
+git notes show HEAD
+# If HEAD has moved, replace HEAD with the checkpoint SHA printed by the launcher.
+```
+
+Neither code branches nor notes are pushed. Concurrent note writers share a lock in Git's common
+directory, including across worktrees. A note-write failure emits a warning without failing the
+training run. Exception messages are not copied into failure notes; only their exception type is
+recorded. Credential-bearing options and service URL values are redacted from the launch command.
+
+Without `--auto-commit`, the launcher clears inherited `OPENVIKING_TRAIN_GIT_NOTES_COMMIT` and
+`OPENVIKING_TRAIN_LAUNCH_COMMAND` values, so ordinary launcher runs do not write notes. The generic
+batch CLI consumes these environment variables; it never makes the code commit itself.
+
+### Per-rollout service logs
+
+The Tau2 service writes a separate log for each hosted rollout (both `vikingbot`
+and `native`). The restart launcher places these under `${LOG_DIR}/rollouts`,
+alongside the existing aggregate service logs. In manual service mode, use
+`--rollout-log-dir` or `TAU2_ROLLOUT_LOG_DIR`; the default is
+`result/tau2/service_logs/rollouts`. Only service configuration controls this
+location: client request options cannot select a server write directory.
+
+Filenames contain sanitized stage/epoch/case labels and a server-generated execution
+ID, so parallel trials and retries never append to one another's files. The
+`rollout_log_path` field in execution responses, rollout metadata, `status.json`, and
+`rollouts_index.json` points to the **service host's filesystem**, not a downloaded
+client-side file. Remote failures and local timeouts include the path in their error
+message. Cached rollouts retain the original execution's path, not a new log file.
+
+Routing copies emitted Python logs (including configured non-propagating loggers)
+and Loguru DEBUG-and-above messages. Existing Python logger levels, aggregate
+outputs, traces, and structured artifacts are preserved. Context follows async tasks,
+the hosted worker pool, and `asyncio.to_thread`; unrelated processes and SDK-owned
+threads that do not propagate context are not captured. Files close on completion,
+failure, timeout, or cancellation; late logs from cancelled synchronous work are
+dropped rather than assigned to the next rollout.
+
+Per-rollout copies redact known credential patterns and disable Loguru variable dumps;
+this is **not** general PII anonymization, and aggregate outputs keep their existing
+redaction behavior. New files are owner-only (`0600`). Logging is best-effort: I/O
+errors do not fail a rollout, so a reported destination may be missing or incomplete.
+These logs persist with the slot's service logs; no automatic retention, rotation,
+download API, or remote-log copying is added. Archive/remove them with the slot's
+other service logs when no longer needed.
+
+### Evaluation task selection
+
+An explicit `--eval-index` always takes precedence. With `--eval-split train`, omitting
+`--eval-index` reuses `--train-index`: for example, `--train-index 5,6 --eval-split train`
+trains and evaluates only train tasks 5 and 6. This applies to baseline, per-epoch and final
+evaluation. Omitting both index options still evaluates the whole selected split.
+`--eval-split test` never inherits train indices; without `--eval-index`, it evaluates the
+whole test split.
+
+The baseline cache key/payload and `report.json` use the effective evaluation indices.
+`run_start` retains the requested `eval_index` and also records `effective_eval_index`;
+`run_metadata.json` likewise keeps the original parameters and a separate effective selection.
+Existing all-train caches are not reused for an inherited subset and are not deleted.
+No random-seed, first-user-message cache or train-rollout-cache behavior changes are involved.
+
 Every fresh VikingBot rollout (baseline, train, per-epoch evaluation, and final evaluation)
 uses exactly the tools from `Tau2BenchToolProvider.list_openai_tools()`. The setup removes
 all inherited VikingBot tools before registering that allowlist, so removed tools are neither
@@ -255,9 +355,9 @@ result/tau2/<result-dir-name>/service_logs/
 | `--slot N` | `0` | Run an isolated experiment slot. Must appear before train/eval args. |
 | `--enable-agent-evolution` | off | Enable Case, Trajectory, and Experience learning for the selected account. |
 
-The launcher maps `output_language_override: "zh-CN"` in the selected `ov.conf`
-to Tau2 `--rollout-language zh`. Set `TAU2_ROLLOUT_LANGUAGE=default` or `zh` to
-override this mapping for one run.
+Tau2 does not add a forced response language; the task policy and conversation determine
+how the agent communicates. OpenViking's `output_language_override` still controls memory
+extraction output and does not impose Chinese on rollout replies.
 
 ### Common train/eval options
 
@@ -310,11 +410,25 @@ Service options:
 | `--port` | `1944` | Service listen port |
 | `--data-root` | auto-detect / `$TAU2_DATA_ROOT` | Path to `tau2-bench/data/tau2` |
 | `--config` | `~/.openviking/ov.conf` | ov.conf for VikingBot / OpenViking access |
-| `--rollout-language` | `default` | Rollout response language. Use `zh` for Chinese user-facing replies. |
 | `--rollout-backend` | `vikingbot` | Rollout implementation backend. `native` for fast Python executor, `vikingbot` for full VikingBot AgentLoop. |
 | `--native-thread-workers` | `128` | Thread pool size for native rollout executor. |
-| `--rollout-thread-workers` | `200` | Worker threads used to host rollout executions off the uvicorn event loop. Use `0` to disable threaded hosting. |
+| `--rollout-thread-workers` | `200` | Maximum workers in each of the separate outer and shared inner rollout pools. Use `0` to disable threaded hosting. |
 | `--max-rollout-concurrency` | `200` | Maximum concurrent rollout executions accepted by the service. |
+
+With threaded hosting enabled, each service owns two separate bounded executors: the outer
+pool hosts rollout event loops, and one shared inner pool runs their `asyncio.to_thread()`
+work (such as reset, synchronous tools and reward calculation). Each pool uses the configured
+`--rollout-thread-workers` limit; this is not a limit on the process's total thread count.
+The pools must remain separate so occupied outer workers can wait for inner jobs without
+starving those jobs. Non-threaded hosting keeps the ASGI loop's existing default executor.
+
+Existing execution deadlines and cancellation remain in effect. Service shutdown first
+cancels active rollout coroutines and waits for their cleanup, then closes both pools and
+cancels queued jobs. This does not forcibly stop synchronous I/O that is already running.
+Cleanup queued behind running inner I/O must wait for that I/O to release a worker; the
+execution is not reported terminal before its coroutine cleanup finishes.
+Sharing the inner pool bounds resources but can introduce queueing; it is not a model-latency
+or blocking-I/O timeout fix.
 | `--no-kill-existing` | off | Don't kill existing process on the same port. |
 
 Then run the lower-level Tau2 wrapper:
@@ -358,6 +472,13 @@ rollout has its own subdirectory with `memory_context.md`, `messages.json`,
 plus `rollouts_index.json`, are written as soon as each remote rollout finishes.
 Train rollouts are enriched later with `commit_result.json` and
 `memory_diff.json` as commit progress becomes available.
+
+Communication-tool calls stay compact in exported dialogue: assistant text starts with
+`[via communicate_with_user]`, followed by the original text and a separate user reply.
+VikingBot's automatic plain-text forwarding uses `[auto-forwarded via communicate_with_user]`
+instead; plain assistant replies are not labeled as tool calls. These code-derived markers
+survive Session commits into trajectory extraction input without adding duplicate tool steps
+or full argument/result JSON. They identify the call source, not success or advice usefulness.
 
 Streaming JSONL events are written to
 `result/tau2/<result-dir-name>/run_<domain>_<timestamp>/events.jsonl`; train

@@ -15,6 +15,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -24,6 +25,11 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from openviking.session.train.components.session_logging import (
+    install_session_log_routing,
+    rollout_log_session,
+    rollout_session_log_path,
+)
 from openviking.session.train.context import ExecutionContext
 from openviking.session.train.domain import (
     Case,
@@ -165,6 +171,7 @@ class RolloutExecution:
     # soon as the caller returns.
     rollout: Rollout | None = None
     error: str | None = None
+    rollout_log_path: str | None = None
 
 
 class RolloutExecutionStore:
@@ -220,17 +227,30 @@ class RolloutExecutionStore:
         except (OSError, json.JSONDecodeError):
             return None
 
-    async def create(self, *, case_name: str) -> RolloutExecution:
+    async def create(
+        self, *, case_name: str, log_dir: Path | None = None, metadata: dict | None = None
+    ) -> RolloutExecution:
         # File creation is the single source of truth. Use a lock-free
         # atomic-write pattern; POSIX rename is atomic for same-directory files.
         now = time.time()
         execution_id = f"rollout_exec_{uuid4().hex}"
+        log_path = (
+            rollout_session_log_path(
+                log_dir,
+                execution_id=execution_id,
+                case_name=redact_sensitive(case_name),
+                metadata=redact_sensitive(metadata or {}),
+            )
+            if log_dir is not None
+            else None
+        )
         meta = {
             "execution_id": execution_id,
             "status": self._RUNNING,
             "created_at": now,
             "updated_at": now,
             "case_name": case_name,
+            "rollout_log_path": log_path,
         }
         target = self._path(self._RUNNING, execution_id)
         _atomic_write_json(target, meta)
@@ -240,6 +260,7 @@ class RolloutExecutionStore:
             created_at=now,
             updated_at=now,
             case_name=case_name,
+            rollout_log_path=log_path,
         )
 
     async def get(self, execution_id: str) -> RolloutExecution | None:
@@ -263,6 +284,7 @@ class RolloutExecutionStore:
                 ),
                 rollout=rollout,
                 error=data.get("error"),
+                rollout_log_path=data.get("rollout_log_path"),
             )
         return None
 
@@ -292,6 +314,7 @@ class RolloutExecutionStore:
                 "created_at": existing.get("created_at", now),
                 "updated_at": existing.get("updated_at", now),
                 "case_name": existing.get("case_name", ""),
+                "rollout_log_path": existing.get("rollout_log_path"),
             }
         payload = {
             **meta,
@@ -367,6 +390,7 @@ def create_dataset_service_app(
     make_rollout_executor: RolloutExecutorFactory,
     max_rollout_concurrency: int | None = None,
     rollout_thread_workers: int | None = None,
+    rollout_log_dir: str | Path | None = None,
 ) -> FastAPI:
     """Create a generic remote dataset service from train framework components."""
 
@@ -380,6 +404,11 @@ def create_dataset_service_app(
     app.state.make_case_loader = make_case_loader
     app.state.make_rollout_executor = make_rollout_executor
     app.state.rollout_executions = RolloutExecutionStore()
+    app.state.rollout_log_dir = (
+        Path(rollout_log_dir).expanduser().absolute() if rollout_log_dir is not None else None
+    )
+    if app.state.rollout_log_dir is not None:
+        install_session_log_routing()
     app.state.rollout_tasks = {}
     app.state.rollout_controls = {}
     app.state.max_rollout_concurrency = max_rollout_concurrency
@@ -396,15 +425,26 @@ def create_dataset_service_app(
         else None
     )
 
+    # Share one inner executor across hosted worker loops. Reusing the outer pool
+    # would deadlock when all its workers are waiting for asyncio.to_thread().
+    app.state.rollout_inner_thread_pool = (
+        ThreadPoolExecutor(
+            max_workers=rollout_thread_workers,
+            thread_name_prefix=f"{service_name}-rollout-inner",
+        )
+        if rollout_thread_workers is not None
+        else None
+    )
+
     @app.on_event("shutdown")
     async def shutdown_rollout_thread_pool() -> None:
         for execution_id in list(app.state.rollout_controls):
             _cancel_rollout_execution(app, execution_id, "shutdown")
         if app.state.rollout_tasks:
             await asyncio.gather(*list(app.state.rollout_tasks.values()), return_exceptions=True)
-        pool = app.state.rollout_thread_pool
-        if pool is not None:
-            pool.shutdown(wait=False, cancel_futures=True)
+        for pool in (app.state.rollout_thread_pool, app.state.rollout_inner_thread_pool):
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -439,11 +479,17 @@ def create_dataset_service_app(
     @app.post("/v1/rollouts/execute")
     async def execute_rollout(request: RolloutExecuteRequest) -> dict[str, Any]:
         case = case_from_dict(request.case)
-        execution = await app.state.rollout_executions.create(case_name=case.name)
+        execution = await app.state.rollout_executions.create(
+            case_name=case.name,
+            log_dir=app.state.rollout_log_dir,
+            metadata=request.execution_context.get("metadata"),
+        )
         control = _RolloutControl(time.monotonic() + request.execution_timeout_seconds)
         app.state.rollout_controls[execution.execution_id] = control
         task = asyncio.create_task(
-            _run_rollout_execution(app, execution.execution_id, request, control)
+            _run_rollout_execution(
+                app, execution.execution_id, request, control, execution.rollout_log_path
+            )
         )
         app.state.rollout_tasks[execution.execution_id] = task
         return execution_to_dict(execution)
@@ -485,49 +531,59 @@ async def _run_rollout_execution(
     execution_id: str,
     request: RolloutExecuteRequest,
     control: _RolloutControl,
+    log_path: str | None = None,
 ) -> None:
-    case = case_from_dict(request.case)
-    timer = asyncio.get_running_loop().call_later(
-        max(0.0, control.deadline - time.monotonic()),
-        _cancel_rollout_execution,
-        app,
-        execution_id,
-        "deadline",
-    )
-    try:
-        semaphore = app.state.rollout_semaphore
-        if semaphore is None:
-            rollout = await _execute_rollout_request_hosted(app, request, case, control)
-        else:
-            async with semaphore:
-                rollout = await _execute_rollout_request_hosted(app, request, case, control)
-        await app.state.rollout_executions.mark_completed(execution_id, rollout)
-    except (Exception, asyncio.CancelledError) as exc:
-        error = exc
-        if control.reason == "deadline":
-            error = TimeoutError(f"rollout exceeded {request.execution_timeout_seconds}s")
-        elif isinstance(exc, asyncio.CancelledError):
-            error = asyncio.CancelledError(control.reason or "cancelled")
-        error_text = str(redact_sensitive({"error": f"{type(error).__name__}: {error}"})["error"])
-        logger.error(
-            "rollout execution failed execution_id=%s case=%s error=%s",
+    with rollout_log_session(log_path, redact=redact_sensitive) as session_log:
+        case = case_from_dict(request.case)
+        timer = asyncio.get_running_loop().call_later(
+            max(0.0, control.deadline - time.monotonic()),
+            _cancel_rollout_execution,
+            app,
             execution_id,
-            case.name,
-            error_text,
+            "deadline",
         )
         try:
-            await app.state.rollout_executions.mark_failed(execution_id, error_text)
-        except Exception:
-            # Last-ditch: do not let failures in the failure-recording path
-            # raise into the event loop (the task was already fire-and-forget).
-            logger.exception(
-                "rollout execution mark_failed itself failed execution_id=%s",
-                execution_id,
+            if session_log is not None:
+                session_log.write(f"rollout started execution_id={execution_id} case={case.name}")
+            semaphore = app.state.rollout_semaphore
+            if semaphore is None:
+                rollout = await _execute_rollout_request_hosted(app, request, case, control)
+            else:
+                async with semaphore:
+                    rollout = await _execute_rollout_request_hosted(app, request, case, control)
+            if log_path is not None:
+                rollout.metadata["rollout_log_path"] = log_path
+            if session_log is not None:
+                session_log.write(f"rollout completed execution_id={execution_id} case={case.name}")
+            await app.state.rollout_executions.mark_completed(execution_id, rollout)
+        except (Exception, asyncio.CancelledError) as exc:
+            error = exc
+            if control.reason == "deadline":
+                error = TimeoutError(f"rollout exceeded {request.execution_timeout_seconds}s")
+            elif isinstance(exc, asyncio.CancelledError):
+                error = asyncio.CancelledError(control.reason or "cancelled")
+            error_text = str(
+                redact_sensitive({"error": f"{type(error).__name__}: {error}"})["error"]
             )
-    finally:
-        timer.cancel()
-        app.state.rollout_tasks.pop(execution_id, None)
-        app.state.rollout_controls.pop(execution_id, None)
+            logger.error(
+                "rollout execution failed execution_id=%s case=%s error=%s",
+                execution_id,
+                case.name,
+                error_text,
+            )
+            try:
+                await app.state.rollout_executions.mark_failed(execution_id, error_text)
+            except Exception:
+                # Last-ditch: do not let failures in the failure-recording path
+                # raise into the event loop (the task was already fire-and-forget).
+                logger.exception(
+                    "rollout execution mark_failed itself failed execution_id=%s",
+                    execution_id,
+                )
+        finally:
+            timer.cancel()
+            app.state.rollout_tasks.pop(execution_id, None)
+            app.state.rollout_controls.pop(execution_id, None)
 
 
 async def _execute_rollout_request_hosted(
@@ -541,7 +597,7 @@ async def _execute_rollout_request_hosted(
         return await _execute_rollout_request_scoped(app, request, case, control)
     loop = asyncio.get_running_loop()
     future = loop.run_in_executor(
-        pool, _execute_rollout_request_in_thread, app, request, case, control
+        pool, copy_context().run, _execute_rollout_request_in_thread, app, request, case, control
     )
     try:
         # Cancelling the asyncio wrapper alone cannot stop its worker thread.
@@ -589,6 +645,7 @@ def _execute_rollout_request_in_thread(
     loop = getattr(_rollout_worker_state, "loop", None)
     if loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
+        loop.set_default_executor(app.state.rollout_inner_thread_pool)
         _rollout_worker_state.loop = loop
         asyncio.set_event_loop(loop)
     try:
@@ -608,6 +665,9 @@ async def _execute_rollout_request(
 ) -> Rollout:
     options = dict(request.options or {})
     executor = app.state.make_rollout_executor(options)
+    if app.state.rollout_log_dir is not None:
+        # Factories can lazily import/configure non-propagating benchmark loggers.
+        install_session_log_routing()
     rollouts = await executor.execute(
         [case],
         policy_set_from_dict(request.policy_set),
@@ -638,6 +698,7 @@ async def _load_case_page(loader: Any, *, cursor: str | None, limit: int) -> lis
 def execution_to_dict(execution: RolloutExecution) -> dict[str, Any]:
     data: dict[str, Any] = {
         "execution_id": execution.execution_id,
+        "rollout_log_path": execution.rollout_log_path,
         "status": execution.status,
         "case_name": execution.case_name,
         "created_at": execution.created_at,

@@ -50,13 +50,17 @@ def _is_communicate_with_user(tool_name: str) -> bool:
     return tool_name == "communicate_with_user"
 
 
-def _communicate_text_from_tool_input(tool_input: dict[str, Any] | None) -> str:
+def _communicate_text_from_tool_input(
+    tool_input: dict[str, Any] | None, *, auto_forwarded: bool = False
+) -> str:
+    """Keep tool-call provenance in compact exported dialogue, not a duplicate tool step."""
     if not isinstance(tool_input, dict):
         return ""
     content = tool_input.get("content")
-    if content is None:
+    if content is None or not str(content).strip():
         return ""
-    return str(content)
+    origin = "auto-forwarded via" if auto_forwarded else "via"
+    return f"[{origin} communicate_with_user]\n{content}"
 
 
 def _case_trial(case: Case) -> Any:

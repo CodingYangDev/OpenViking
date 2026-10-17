@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
@@ -20,6 +22,7 @@ from openviking.session.train.components.event_recorder import (
     JsonlPipelineEventHook,
 )
 from openviking.session.train.components.experience_learner import RemoteExperienceLearner
+from openviking.session.train.components.git_notes import GitNotesPipelineReporter
 from openviking.session.train.components.progress import format_label, label_style
 from openviking.session.train.components.remote import RemoteCaseLoader, RemoteRolloutExecutor
 from openviking.session.train.components.report_builder import PipelineReportBuilder
@@ -84,6 +87,8 @@ class BatchTrainEvalConfig:
     keep_recent_results: int = 5
     events_path: str | None = None
     result_dir_name: str = "train"
+    git_notes_commit: str | None = None
+    git_notes_launch_command: str | None = None
     run_timestamp: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S"))
 
     def __post_init__(self) -> None:
@@ -161,6 +166,15 @@ def _normalize_index_filter(value: Any, *, label: str) -> list[int] | None:
     return result
 
 
+def _effective_eval_index(config: BatchTrainEvalConfig) -> list[int] | None:
+    """Honor an explicit eval selection; otherwise align train-split eval with training."""
+    if config.eval_index is not None:
+        return config.eval_index
+    if config.eval_split == "train":
+        return config.train_index
+    return None
+
+
 @dataclass(slots=True)
 class BatchTrainEvalReport:
     """Serializable report for remote benchmark batch train/eval."""
@@ -202,6 +216,8 @@ class BatchTrainEvalReport:
     baseline_force_recompute: bool = False
     skip_final_eval: bool = False
     final_eval_source: str | None = None
+    git: dict[str, Any] = field(default_factory=dict)
+    run_metadata_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -242,6 +258,8 @@ class BatchTrainEvalReport:
             "baseline_force_recompute": self.baseline_force_recompute,
             "skip_final_eval": self.skip_final_eval,
             "final_eval_source": self.final_eval_source,
+            "git": self.git,
+            "run_metadata_path": self.run_metadata_path,
         }
 
 
@@ -249,18 +267,26 @@ class BatchTrainEvalReport:
 async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalReport:
     """Run baseline eval, commit-based train epochs, and final eval for one dataset/domain."""
 
-    _configure_openviking_config(config.config_path)
-    _clean_result_dir(config)
-    client = _build_http_client(config)
-    await client.initialize()
+    git_notes_reporter = _git_notes_reporter(config)
+    git_notes_hooks = [git_notes_reporter] if git_notes_reporter is not None else []
+    client: AsyncHTTPClient | None = None
     try:
+        if git_notes_reporter is not None:
+            git_notes_reporter.record_run_start(dataset=config.dataset, domain=config.domain)
+        _configure_openviking_config(config.config_path)
+        _clean_result_dir(config)
+        run_dir = _run_output_dir(config)
+        git_metadata = _git_metadata()
+        effective_eval_index = _effective_eval_index(config)
+        run_metadata_path = str(_write_run_metadata(run_dir, config, git_metadata))
+        client = _build_http_client(config)
+        await client.initialize()
         policy_root_uri = f"viking://user/{config.user_id}/memories/experiences"
         policy_set = ExperienceSet(
             root_uri=policy_root_uri,
             policies=[],
             metadata=_policy_set_metadata(config, client),
         )
-        run_dir = _run_output_dir(config)
         event_recorder = JsonlEventRecorder(
             path=_events_path(config),
             default_fields={
@@ -272,11 +298,14 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
         await event_recorder.record(
             "run_start",
             stage="run_start",
+            git=git_metadata,
+            run_metadata_path=run_metadata_path,
             epochs=config.epochs,
             concurrency=config.concurrency,
             commit_concurrency=config.commit_concurrency,
             train_index=_index_payload(config.train_index),
             eval_index=_index_payload(config.eval_index),
+            effective_eval_index=_index_payload(effective_eval_index),
             trials=config.trials,
             train_trials=config.train_trials,
             reuse_train_rollout_cache=config.reuse_train_rollout_cache,
@@ -337,7 +366,7 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
             else _case_loader(
                 config,
                 split=config.eval_split,
-                sample_index=config.eval_index,
+                sample_index=effective_eval_index,
             )
         )
         if (
@@ -345,6 +374,8 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
             and not config.skip_baseline_eval
             and await eval_loader.split_exists()
         ):
+            if git_notes_reporter is not None:
+                git_notes_reporter.mark_stage(_eval_rollout_stage("baseline", config.eval_split))
             baseline_result, baseline_cache_hit = await _load_or_run_baseline_eval(
                 config=config,
                 pipeline=pipeline,
@@ -352,6 +383,7 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
                 policy_set=policy_set,
                 report_builder=report_builder,
                 event_recorder=event_recorder,
+                additional_lifecycle_hooks=git_notes_hooks,
             )
             if baseline_result is not None:
                 rollout_artifact_recorder.record_eval(
@@ -365,6 +397,18 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
                 baseline_eval = _load_baseline_cache(baseline_cache_path)
                 if baseline_eval is not None:
                     _print_baseline_cache_hit(baseline_eval, baseline_cache_path)
+                    if git_notes_reporter is not None:
+                        git_notes_reporter.on_eval_report(
+                            label=_eval_rollout_stage("baseline", config.eval_split),
+                            report={
+                                **baseline_eval,
+                                "epoch": -1,
+                                "cache_hit": True,
+                                "cost_seconds": 0.0,
+                                "result_path": str(baseline_cache_path),
+                            },
+                            context=None,
+                        )
 
         train_loader = _case_loader(
             config,
@@ -396,6 +440,7 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
             trial_index_key="eval_trial",
             report_builder=report_builder,
             event_recorder=event_recorder,
+            additional_lifecycle_hooks=git_notes_hooks,
         )
         # Register rollout artifact recorder as a lifecycle hook so rollouts
         # are written incrementally after each epoch/eval, instead of waiting
@@ -403,6 +448,8 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
         train_context.lifecycle_hooks = list(train_context.lifecycle_hooks) + [
             rollout_artifact_recorder
         ]
+        if git_notes_reporter is not None:
+            git_notes_reporter.mark_stage("train epoch 0", epoch=0)
         train_result = await pipeline.train(
             case_loader=train_loader,
             policy_set=policy_set,
@@ -419,6 +466,10 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
                 final_eval = dict(epoch_eval_reports[-1])
                 final_eval_source = "last_epoch_eval"
         elif eval_loader is not None and await eval_loader.split_exists():
+            if git_notes_reporter is not None:
+                git_notes_reporter.mark_stage(
+                    _eval_rollout_stage("final", config.eval_split), epoch=config.epochs
+                )
             final_result = await pipeline.eval(
                 case_loader=eval_loader,
                 policy_set=policy_set,
@@ -432,6 +483,7 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
                     trial_index_key="eval_trial",
                     report_builder=report_builder,
                     event_recorder=event_recorder,
+                    additional_lifecycle_hooks=git_notes_hooks,
                 ),
             )
             rollout_artifact_recorder.record_eval(
@@ -444,6 +496,8 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
 
         accuracy_delta = report_builder.accuracy_delta(baseline_eval, final_eval)
         rollout_artifact_index = rollout_artifact_recorder.finalize()
+        train_epoch_reports = list(train_result.metadata.get("train_reports", []))
+        train_error_count = sum(len(report.get("errors") or []) for report in train_epoch_reports)
         report = BatchTrainEvalReport(
             dataset=config.dataset,
             domain=config.domain,
@@ -452,10 +506,10 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
             concurrency=config.concurrency,
             commit_concurrency=config.commit_concurrency,
             train_index=_index_payload(config.train_index),
-            eval_index=_index_payload(config.eval_index),
+            eval_index=_index_payload(effective_eval_index),
             policy_root_uri=policy_root_uri,
             baseline_eval=baseline_eval,
-            train_epochs=list(train_result.metadata.get("train_reports", [])),
+            train_epochs=train_epoch_reports,
             epoch_evals=epoch_eval_reports,
             final_eval=final_eval,
             accuracy_delta=accuracy_delta,
@@ -484,11 +538,16 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
             baseline_force_recompute=config.baseline_force_recompute,
             skip_final_eval=config.skip_final_eval,
             final_eval_source=final_eval_source,
+            git=git_metadata,
+            run_metadata_path=run_metadata_path,
         )
         _write_report(report, config)
         await event_recorder.record(
             "run_result",
             stage="run_result",
+            effective_eval_index=_index_payload(effective_eval_index),
+            git=git_metadata,
+            run_metadata_path=run_metadata_path,
             trace_id=report.trace_id,
             output_path=report.output_path,
             rollouts_root=report.rollouts_root,
@@ -515,6 +574,7 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
                 "eval_split": report.eval_split,
                 "skip_final_eval": report.skip_final_eval,
                 "final_eval_source": report.final_eval_source,
+                "error_count": train_error_count,
             },
             baseline_eval=baseline_eval,
             final_eval=final_eval,
@@ -525,8 +585,13 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
             latest_failed_rollout=report.latest_failed_rollout,
         )
         return report
+    except BaseException as error:
+        if git_notes_reporter is not None:
+            git_notes_reporter.record_failure(error)
+        raise
     finally:
-        await client.close()
+        if client is not None:
+            await client.close()
 
 
 def _configure_openviking_config(config_path: str | None) -> None:
@@ -593,6 +658,7 @@ async def _load_or_run_baseline_eval(
     policy_set: ExperienceSet,
     report_builder: PipelineReportBuilder,
     event_recorder: JsonlEventRecorder,
+    additional_lifecycle_hooks: list[Any] | None = None,
 ) -> tuple[Any | None, bool]:
     cache_path = _baseline_cache_path(config)
     if not config.baseline_force_recompute:
@@ -625,6 +691,7 @@ async def _load_or_run_baseline_eval(
             trial_index_key="eval_trial",
             report_builder=report_builder,
             event_recorder=event_recorder,
+            additional_lifecycle_hooks=additional_lifecycle_hooks,
         ),
     )
     _write_baseline_cache(cache_path, baseline_result.metadata["report"], config=config)
@@ -649,7 +716,7 @@ def _write_baseline_cache(
         "dataset": config.dataset,
         "domain": config.domain,
         "split": config.eval_split,
-        "eval_index": _index_payload(config.eval_index),
+        "eval_index": _index_payload(_effective_eval_index(config)),
         "trials": config.trials,
         "max_iterations": config.max_iterations,
         "keep_default_tools": config.keep_default_tools,
@@ -741,6 +808,7 @@ def _pipeline_context(
     trial_index_key: str = "trial",
     report_builder: Any = None,
     event_recorder: JsonlEventRecorder | None = None,
+    additional_lifecycle_hooks: list[Any] | None = None,
 ) -> PipelineContext:
     execution_metadata = {"epoch": epoch, "training": training}
     if rollout_stage is not None:
@@ -748,15 +816,14 @@ def _pipeline_context(
     if eval_split is not None:
         execution_metadata["eval_split"] = eval_split
     hooks = None
-    if event_recorder is not None:
+    if event_recorder is not None or additional_lifecycle_hooks:
         from openviking.session.train.components.report_builder import PipelineReportHook
         from openviking.session.train.components.reporter import ConsolePipelineReporter
 
-        hooks = [
-            PipelineReportHook(),
-            JsonlPipelineEventHook(event_recorder),
-            ConsolePipelineReporter(),
-        ]
+        hooks = [PipelineReportHook(), ConsolePipelineReporter()]
+        if event_recorder is not None:
+            hooks.insert(1, JsonlPipelineEventHook(event_recorder))
+        hooks.extend(additional_lifecycle_hooks or [])
     return PipelineContext(
         analysis_context={"epoch": epoch},
         execution_metadata=execution_metadata,
@@ -767,6 +834,22 @@ def _pipeline_context(
         trial_index_key=trial_index_key,
         report_builder=report_builder,
         **({"lifecycle_hooks": hooks} if hooks is not None else {}),
+    )
+
+
+def _git_notes_reporter(
+    config: BatchTrainEvalConfig, *, run_id: str | None = None
+) -> GitNotesPipelineReporter | None:
+    commit = str(config.git_notes_commit or "").strip()
+    if not commit:
+        return None
+    return GitNotesPipelineReporter(
+        repo_root=_repo_root(),
+        commit=commit,
+        run_id=run_id or config.run_timestamp,
+        launch_command=str(config.git_notes_launch_command or ""),
+        output_path=_default_output_path(config),
+        events_path=str(_events_path(config)),
     )
 
 
@@ -913,6 +996,104 @@ def _write_report(report: BatchTrainEvalReport, config: BatchTrainEvalConfig) ->
     report.output_path = str(output_path)
 
 
+def _git_metadata() -> dict[str, Any]:
+    """Identify the launcher's Git-visible code, not remote processes or external data."""
+    repo_root = _repo_root()
+
+    def run_git(*args: str) -> bytes:
+        return subprocess.check_output(
+            ["git", "-c", "core.quotepath=true", "-C", str(repo_root), *args],
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            timeout=15,
+        )
+
+    metadata: dict[str, Any] = {
+        "capture_scope": "launcher_checkout",
+        "commit": None,
+        "branch": None,
+        "dirty": None,
+        "status_porcelain": None,
+        "worktree_fingerprint": None,
+    }
+    try:
+        commit = run_git("rev-parse", "HEAD").decode().strip()
+        branch = run_git("rev-parse", "--abbrev-ref", "HEAD").decode().strip()
+        status = run_git("status", "--porcelain", "--untracked-files=all").decode().rstrip()
+        fingerprint = sha256(commit.encode())
+        fingerprint.update(
+            run_git(
+                "diff", "--no-ext-diff", "--no-textconv", "--binary", "--no-renames", "HEAD", "--"
+            )
+        )
+        untracked = run_git("ls-files", "--others", "--exclude-standard", "-z")
+        for name in sorted(filter(None, untracked.split(b"\0"))):
+            path = repo_root / os.fsdecode(name)
+            mode = path.lstat().st_mode
+            content_hash = sha256()
+            if stat.S_ISLNK(mode):
+                content_hash.update(os.fsencode(os.readlink(path)))
+            elif stat.S_ISREG(mode):
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        content_hash.update(chunk)
+            else:
+                raise OSError(f"Unsupported untracked file type: {path.name}")
+            fingerprint.update(name + b"\0" + str(mode).encode() + b"\0")
+            fingerprint.update(content_hash.digest())
+        metadata.update(
+            commit=commit,
+            branch=branch,
+            dirty=bool(status),
+            status_porcelain=status,
+            worktree_fingerprint=fingerprint.hexdigest(),
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        # Missing Git or unreadable/changing files must never look like a clean checkout.
+        metadata["error"] = str(exc)
+    return metadata
+
+
+def _write_run_metadata(
+    run_dir: Path, config: BatchTrainEvalConfig, git_metadata: dict[str, Any]
+) -> Path:
+    """Persist an explicit safe parameter subset; connection credentials stay out."""
+    parameter_names = (
+        "epochs",
+        "batch_size",
+        "concurrency",
+        "commit_concurrency",
+        "max_iterations",
+        "train_index",
+        "eval_index",
+        "eval_split",
+        "trials",
+        "train_trials",
+        "eval_each_epoch",
+        "reuse_train_rollout_cache",
+        "baseline_force_recompute",
+        "skip_baseline_eval",
+        "skip_final_eval",
+        "keep_default_tools",
+    )
+    payload = {
+        "dataset": config.dataset,
+        "domain": config.domain,
+        "run_timestamp": config.run_timestamp,
+        "result_dir_name": config.result_dir_name,
+        "parameters": {name: getattr(config, name) for name in parameter_names},
+        "effective_eval_index": _index_payload(_effective_eval_index(config)),
+        "git": git_metadata,
+    }
+    path = run_dir / "run_metadata.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def _events_path(config: BatchTrainEvalConfig) -> Path:
     if config.events_path:
         return Path(config.events_path).expanduser()
@@ -955,18 +1136,19 @@ def _train_rollout_cache_key_prefix(config: BatchTrainEvalConfig) -> str:
 
 
 def _baseline_cache_key(config: BatchTrainEvalConfig) -> str:
+    effective_eval_index = _effective_eval_index(config)
     payload = {
         "dataset": config.dataset,
         "domain": config.domain,
         "split": config.eval_split,
-        "eval_index": _index_payload(config.eval_index),
+        "eval_index": _index_payload(effective_eval_index),
         "trials": config.trials,
         "max_iterations": config.max_iterations,
         "keep_default_tools": config.keep_default_tools,
     }
     stable = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     digest = sha256(stable.encode("utf-8")).hexdigest()[:16]
-    index = _index_label(config.eval_index)
+    index = _index_label(effective_eval_index)
     split = _cache_slug(str(config.eval_split or "none"))
     return f"{_cache_slug(config.domain)}_{split}_index-{index}_trials-{config.trials}_{digest}"
 

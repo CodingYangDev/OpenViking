@@ -4,10 +4,23 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Iterable, Mapping
 
 import jinja2
+import yaml
 from jinja2 import meta
+
+
+def _to_yaml(value: Any) -> str:
+    normalized = json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    return yaml.safe_dump(normalized, allow_unicode=True, sort_keys=False).rstrip()
+
+
+def _template_environment(**kwargs: Any) -> jinja2.Environment:
+    env = jinja2.Environment(autoescape=False, **kwargs)
+    env.filters["to_yaml"] = _to_yaml
+    return env
 
 
 class TemplateUtils:
@@ -21,8 +34,7 @@ class TemplateUtils:
         keep_trailing_newline: bool = False,
         strip: bool = True,
     ) -> str:
-        env = jinja2.Environment(
-            autoescape=False,
+        env = _template_environment(
             undefined=jinja2.DebugUndefined if debug_undefined else jinja2.Undefined,
             keep_trailing_newline=keep_trailing_newline,
         )
@@ -38,7 +50,7 @@ class TemplateUtils:
         *,
         ignored_variables: Iterable[str] | None = None,
     ) -> set[str]:
-        parsed_template = jinja2.Environment(autoescape=False).parse(template)
+        parsed_template = _template_environment().parse(template)
         ignored = set(ignored_variables or ())
         return (
             meta.find_undeclared_variables(parsed_template)
@@ -56,5 +68,5 @@ class TemplateUtils:
         ``{{ extract_context.get_year(ranges) }}``) are never mistaken for
         variables the way a plain substring/regex scan would.
         """
-        parsed_template = jinja2.Environment(autoescape=False).parse(template)
+        parsed_template = _template_environment().parse(template)
         return meta.find_undeclared_variables(parsed_template)

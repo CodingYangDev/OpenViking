@@ -37,6 +37,7 @@ from openviking.session.memory.merge_policy import MEMORY_MERGE_POLICY
 from openviking.session.memory.page_id_map import PageIdMap
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
 from openviking.session.memory.tools import add_tool_call_pair_to_messages
+from tests.session.train.test_fakes import render_trajectory_template
 
 
 def _assert_native_pair(messages, *, call_id, tool_name, params, result, python_result=False):
@@ -786,7 +787,6 @@ async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
     from openviking.session.train import Case, Rubric, Trajectory
     from openviking.session.train.components.trajectory_observation import (
         TRAJECTORY_FORMAT,
-        render_trajectory_content,
     )
 
     registry = MemoryTypeRegistry(load_schemas=False)
@@ -826,7 +826,7 @@ async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
     )
     for trajectory in provider.trajectories:
         trajectory.metadata["trajectory_format"] = TRAJECTORY_FORMAT
-        trajectory.content = render_trajectory_content(trajectory)
+        trajectory.content = render_trajectory_template(trajectory)
     provider._eval_memory = AsyncMock(
         return_value={
             "experience": (
@@ -862,24 +862,26 @@ async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
     }
     assert messages[3]["content"].startswith("Use exactly one SDK template")
     assert len(messages) == 4
-    # Only edit/overwrite are full SDK examples. The simple DAG is explicitly read-only
-    # input, and create supplies that source through the compact inline call form.
+    # Create/edit/overwrite are complete, directly parseable SDK examples.
+    # The separate raw DAG remains explicitly read-only input for the edit example.
     sources = re.findall(r"```text\n(.*?)\n```", instruction, re.DOTALL)
     assert sources == [_EXPERIENCE_DAG_EXAMPLE]
-    assert instruction.count(_EXPERIENCE_DAG_EXAMPLE) == 1
+    assert instruction.count(_EXPERIENCE_DAG_EXAMPLE) == 2
     assert "read-only context, not the SDK reply" in instruction
     examples = re.findall(r"```python\n(.*?)\n```", instruction, re.DOTALL)
-    assert len(examples) == 2
-    create_form = re.search(r"`(sdk\.create_experiences\([^\n]+\))`", instruction).group(1)
-    assert "content='''<complete DAG source>'''" in create_form
-    assert "search='''" in examples[0] and "replace='''" in examples[0]
-    assert "experience.content.overwrite('''" in examples[1]
+    assert len(examples) == 3
+    assert "<complete DAG source>" not in instruction
+    assert "sdk.create_experiences(" in examples[0]
+    assert "content='''" in examples[0]
+    assert 'dag = workflow("""' in examples[0]
+    assert "search='''" in examples[1] and "replace='''" in examples[1]
+    assert "experience.content.overwrite('''" in examples[2]
     assert sources[0].startswith('dag = workflow("""')
     assert "For no change, return only `sdk.commit()`." in instruction
     programs = {
-        "create": create_form.replace("<complete DAG source>", sources[0]) + "\nsdk.commit()",
-        "edit": examples[0],
-        "overwrite": examples[1],
+        "create": examples[0],
+        "edit": examples[1],
+        "overwrite": examples[2],
         "noop": "sdk.commit()",
     }
     program = programs[method]
@@ -927,11 +929,7 @@ async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
             assert 'classify_state.case("needs_change", review_change_scope)' in dag_source
         assert "Before any mutation, retrieve every reservation" not in dag_source
         assert "include reservations that the user also plans to modify" not in dag_source
-    assert (
-        "Ground information requests, tool-step suggestions and reminders in that evidence"
-        in instruction
-    )
-    assert "using check/ask/call/choose/tell/any_of nodes" in instruction
+    assert "Identify the trigger, minimal rule change, changed action or output" in instruction
     assert "Either graph shape can be used for creation or updates" in instruction
     assert "Do not add node types just to match an example" in instruction
     assert "Do not repeat questions or tool calls already satisfied" not in instruction
@@ -1142,7 +1140,7 @@ def test_experience_evidence_rules_are_shared_by_synthesis_and_merge(phase):
     assert "never for missing or uncertain evidence" in contract
 
 
-def test_python_create_populates_hidden_trajectory_fields_from_schema_defaults():
+def test_python_trajectory_output_exposes_only_extracted_fields():
     registry = MemoryTypeRegistry(load_schemas=False)
     registry.load_from_yaml(str(resolve_memory_templates_dir() / "trajectories.yaml"))
     schema = registry.get("trajectories")
@@ -1151,21 +1149,38 @@ def test_python_create_populates_hidden_trajectory_fields_from_schema_defaults()
 
     contract = protocol.render_contract(context)
     operations, error = protocol.parse(
-        "sdk.create_trajectories("
-        "trajectory_name='cancel_booking', outcome='success', "
-        "case_name='cancel_booking', content='{}')\n"
-        "sdk.commit()",
+        "sdk.create_trajectories(context_rules='', steps='Observed steps')\nsdk.commit()",
         context,
     )
 
     assert error is None
     assert operations is not None
-    assert "trajectory_format: str" not in contract
-    assert "experience_execution: str" not in contract
-    assert "experience_update: str" not in contract
-    assert operations.model_dump()["trajectories"][0]["trajectory_format"] == "ordered_markdown_v3"
-    assert operations.model_dump()["trajectories"][0]["experience_execution"] == "{}"
-    assert operations.model_dump()["trajectories"][0]["experience_update"] == "{}"
+    assert {field.name for field in schema.fields} == {
+        "context_rules",
+        "steps",
+        "evaluation_criteria",
+        "action_scores",
+    }
+    for name in [
+        "trajectory_name",
+        "case_name",
+        "task_spec",
+        "outcome",
+        "trajectory_format",
+        "evaluation",
+        "experience_execution",
+        "experience_update",
+    ]:
+        assert f"{name}: str" not in contract
+    item = operations.model_dump()["trajectories"][0]
+    assert set(item) == {
+        "page_id",
+        "context_rules",
+        "steps",
+        "evaluation_criteria",
+        "action_scores",
+    }
+    assert item["steps"] == "Observed steps"
 
 
 def test_json_protocol_uses_native_tool_messages():
@@ -3461,24 +3476,19 @@ def test_trajectory_prompt_template_uses_outer_triple_single_quotes():
     )
     instruction = provider.instruction()
     program = instruction.split("Use:\n", 1)[1].split("\nthen sdk.commit().", 1)[0]
-    for field, value in [
-        ("trajectory_name", "trial"),
-        ("case_name", "case"),
-        ("outcome", "failure"),
-    ]:
-        program = program.replace(f"{field}=...", f"{field}={value!r}")
-    program = program.replace("<JSON list>", "[]").replace("<JSON object>", "{}")
-    assert "content='''# Session Context" in program
+    program = program.replace("<YAML list>", "[]")
+    assert "context_rules='''" in program
+    assert "steps='''" in program
+    assert "# Session Context" not in program and "# Trajectory" not in program
     operations, error = create_extraction_output_protocol("python").parse(
         program + "\nsdk.commit()",
         _context([registry.get("trajectories")], template_context={"language": "en"}),
     )
 
     assert error is None
-    assert operations.model_dump()["trajectories"][0]["content"] == (
-        "# Session Context\n<relevant verbatim rules, or empty>\n\n"
-        "# Trajectory\n1. `user` factual step\n..."
-    )
+    item = operations.model_dump()["trajectories"][0]
+    assert item["context_rules"] == "<relevant verbatim rules, or empty>"
+    assert item["steps"] == "1. `user` factual step\n..."
     assert "triple-single-quoted string ('''...''')" in provider.render_operation_repair([])
 
 
@@ -3819,46 +3829,58 @@ def test_staged_experience_example_routes_without_repeating_satisfied_steps(bran
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("json_text", "expected"),
     [
-        None,
-        True,
-        17,
-        1.25,
-        '用户回复 "yes"。\n路径 C:\\tmp\\file；代码包含 """引号"""。',
-        [True, False, None, {"中文": '引号"和反斜杠\\'}],
-        {"items": [], "details": {"value": None}},
+        ("null", None),
+        ("true", True),
+        ("false", False),
+        ("[]", []),
+        (
+            r'{"text":"用户说了 \"yes\"。\n路径 C:\\tmp\\file","missing":null}',
+            {"text": '用户说了 "yes"。\n路径 C:\\tmp\\file', "missing": None},
+        ),
+        (
+            r'{"text":"\u0027\u0027\u0027","braces":"{value}","escape":"\\n","trailing":"\\"}',
+            {"text": "'''", "braces": "{value}", "escape": "\\n", "trailing": "\\"},
+        ),
     ],
 )
-def test_sdk_json_dumps_returns_a_json_string_without_changing_field_types(value):
+def test_raw_json_strings_preserve_json_escapes_without_changing_field_types(json_text, expected):
     context = _context([_profile_schema()])
-    program = f"payload = sdk.json_dumps({value!r})\nsdk.set_profile(content=payload)"
+    program = f"payload = r'''{json_text}'''\nsdk.set_profile(content=payload)"
     operations, error = create_extraction_output_protocol("python").parse(program, context)
     assert error is None
     content = operations.model_dump()["profile"][0]["content"]
-    assert isinstance(content, str)
-    assert json.loads(content) == value
+    assert content == json_text
+    assert json.loads(content) == expected
     assert context.schemas[0].fields[0].field_type == FieldType.STRING
 
 
-def test_sdk_json_dumps_handles_rubric_quotes_with_only_python_string_escaping():
+def test_yaml_rubric_and_action_scores_preserve_string_fields():
     from openviking.session.memory.experience.rubric import snapshot_rubric_results
 
     registry = MemoryTypeRegistry(load_schemas=False)
     registry.load_from_yaml(str(resolve_memory_templates_dir() / "trajectories.yaml"))
     schema = registry.get("trajectories")
     context = _context([schema], template_context={"language": "en"})
-    program = r'''sdk.create_trajectories(
-        trajectory_name="trial", case_name="case", outcome="failure", content="""Observed steps""",
-        evaluation_criteria=sdk.json_dumps([
-            {"id": "confirmation", "passed": True,
-             "evidence": """用户先说了 "yes"。
-然后执行操作；路径 C:\\tmp\\file。"""},
-            {"id": "eligibility", "passed": None, "evidence": """No result was observed."""}
-        ]),
-        experience_effects=sdk.json_dumps({"positive_ids": [], "negative_ids": [], "weak_ids": []})
+    program = r"""sdk.create_trajectories(
+        context_rules='', steps='''Observed steps''',
+        evaluation_criteria=r'''
+- id: confirmation
+  passed: true
+  evidence: |-
+    用户先说了 "yes"。
+    然后执行操作；路径 C:\tmp\file。
+- id: eligibility
+  passed: null
+  evidence: No result was observed.
+- id: completion
+  passed: false
+  evidence: The update failed.
+''',
+        action_scores=r'''[{"id": "A1", "score": 1, "evidence": "Corrected the selected value."}]'''
 )
-sdk.commit()'''
+sdk.commit()"""
     operations, error = create_extraction_output_protocol("python").parse(program, context)
     assert error is None
     result = operations.model_dump()["trajectories"][0]
@@ -3866,27 +3888,30 @@ sdk.commit()'''
     definitions = [
         {"id": "confirmation", "description": "Obtain confirmation before the action."},
         {"id": "eligibility", "description": "Check eligibility."},
+        {"id": "completion", "description": "Complete the update."},
     ]
     snapshot = snapshot_rubric_results(result["evaluation_criteria"], definitions)
-    assert len(snapshot) == 2
+    assert len(snapshot) == 3
     assert snapshot[0] == {
         **definitions[0],
         "passed": True,
         "evidence": '用户先说了 "yes"。\n然后执行操作；路径 C:\\tmp\\file。',
     }
     assert snapshot[1]["passed"] is None
-    assert json.loads(result["experience_effects"]) == {
-        "positive_ids": [],
-        "negative_ids": [],
-        "weak_ids": [],
-    }
+    assert snapshot[2]["passed"] is False
+    assert json.loads(result["action_scores"]) == [
+        {"id": "A1", "score": 1, "evidence": "Corrected the selected value."}
+    ]
     assert (
         next(f for f in schema.fields if f.name == "evaluation_criteria").field_type
         == FieldType.STRING
     )
 
 
-def test_sdk_json_dumps_can_overwrite_an_existing_json_string_field():
+@pytest.mark.parametrize(
+    "write", ["preferences_1.content.overwrite(payload)", "preferences_1.update(content=payload)"]
+)
+def test_raw_json_strings_can_update_an_existing_field(write):
     uri = "viking://user/u/memories/preferences/options.md"
     context = _context(
         [_preference_schema()],
@@ -3894,132 +3919,38 @@ def test_sdk_json_dumps_can_overwrite_an_existing_json_string_field():
     )
     protocol = create_extraction_output_protocol("python")
     _bind(protocol, context)
-    operations, error = protocol.parse(
-        'preferences_1.content.overwrite(sdk.json_dumps({"new": True, "quote": """Say "yes"."""}))',
-        context,
-    )
+    program = r"""payload = r'''{"new": true, "quote": "Say \"yes\"."}'''"""
+    operations, error = protocol.parse(program + "\n" + write, context)
     assert error is None
     content = operations.model_dump()["preferences"][0]["content"]
     assert json.loads(content) == {"new": True, "quote": 'Say "yes".'}
 
 
-@pytest.mark.parametrize(
-    "expression",
-    [
-        "sdk.json_dumps()",
-        "sdk.json_dumps([], {})",
-        "sdk.json_dumps(value=[])",
-        "sdk.json_dumps([], ensure_ascii=False)",
-        "sdk.json_dumps([], default=str)",
-        "sdk.json_dumps([], **{})",
-    ],
-)
-def test_sdk_json_dumps_does_not_expose_encoder_options_or_callbacks(expression):
-    operations, error = create_extraction_output_protocol("python").parse(
-        f"sdk.set_profile(content={expression})", _context([_profile_schema()])
-    )
-    assert operations is None
-    assert error
-
-
-@pytest.mark.parametrize("value", ['float("nan")', 'float("inf")', "-1e309", 'b"bytes"'])
-def test_sdk_json_dumps_rejects_values_that_cannot_form_strict_json(value):
-    operations, error = create_extraction_output_protocol("python").parse(
-        f"sdk.set_profile(content=sdk.json_dumps({value}))", _context([_profile_schema()])
-    )
-    assert operations is None
-    assert "sdk.json_dumps" in error
-
-
-@pytest.mark.parametrize(
-    "value", ["preferences_1", "preferences_1.content", '{"memory": preferences_1}']
-)
-def test_sdk_json_dumps_cannot_serialize_memory_objects_or_write_handles(value):
-    uri = "viking://user/u/memories/preferences/options.md"
-    context = _context(
-        [_preference_schema()], files=[_existing_preference(uri, "options", "original")]
-    )
-    protocol = create_extraction_output_protocol("python")
-    _bind(protocol, context)
-    operations, error = protocol.parse(f"data = sdk.json_dumps({value})\nsdk.commit()", context)
-    assert operations is None
-    assert "sdk.json_dumps" in error
-    assert context.read_file_contents[uri].content == "original"
-
-
-@pytest.mark.parametrize("expression", ['"x" * 63', '"界" * 21', r'"\x00" * 12', "[None] * 20"])
-def test_sdk_json_dumps_bounds_encoded_bytes_not_just_input_length(monkeypatch, expression):
-    monkeypatch.setattr(
-        "openviking.session.memory.extraction_output_protocol.python_protocol._MAX_EXPRESSION_SIZE",
-        64,
-    )
-    operations, error = create_extraction_output_protocol("python").parse(
-        f"sdk.set_profile(content=sdk.json_dumps({expression}))", _context([_profile_schema()])
-    )
-    assert operations is None
-    assert "sdk.json_dumps" in error
-    assert "size limit" in error
-
-
-def test_sdk_json_dumps_accepts_output_at_the_existing_size_limit(monkeypatch):
-    monkeypatch.setattr(
-        "openviking.session.memory.extraction_output_protocol.python_protocol._MAX_EXPRESSION_SIZE",
-        64,
-    )
-    operations, error = create_extraction_output_protocol("python").parse(
-        'sdk.set_profile(content=sdk.json_dumps("x" * 62))', _context([_profile_schema()])
-    )
-    assert error is None
-    content = operations.model_dump()["profile"][0]["content"]
-    assert len(content.encode("utf-8")) == 64
-    assert json.loads(content) == "x" * 62
-
-
-def test_sdk_json_dumps_stops_consuming_encoder_chunks_when_over_budget(monkeypatch):
-    monkeypatch.setattr(
-        "openviking.session.memory.extraction_output_protocol.python_protocol._MAX_EXPRESSION_SIZE",
-        64,
-    )
-    chunks = []
-
-    def encode(self, value):
-        for chunk in ['"', "x" * 64]:
-            chunks.append(chunk)
-            yield chunk
-        raise AssertionError("must stop before encoding the rest of an oversized value")
-
-    monkeypatch.setattr(json.JSONEncoder, "iterencode", encode)
-    operations, error = create_extraction_output_protocol("python").parse(
-        'sdk.set_profile(content=sdk.json_dumps("x"))', _context([_profile_schema()])
-    )
-    assert operations is None
-    assert "size limit" in error
-    assert len(chunks) == 2
-
-
-def test_sdk_json_dumps_guidance_is_for_python_output_not_json_output():
+@pytest.mark.parametrize("repair", [False, True])
+def test_raw_json_string_guidance_and_example_use_existing_python_syntax(repair):
     context = _context([_profile_schema()])
-    python_contract = create_extraction_output_protocol("python").render_contract(context)
-    json_contract = create_extraction_output_protocol("json").render_contract(context)
-    assert "sdk.json_dumps(value)" in python_contract
-    assert "returns a JSON string" in python_contract
-    assert "True/False/None" in python_contract
-    assert "not hand-escaped JSON" in python_contract
-    assert "sdk.json_dumps" not in json_contract
-    assert context.schemas[0].fields[0].field_type == FieldType.STRING
-    examples = re.findall(r"```python\n(.*?)\n```", python_contract, re.DOTALL)
-    example = next(code for code in examples if code.startswith("json_text = sdk.json_dumps("))
-    assert "'''The user said \"yes\".'''" in example
-    operations, error = create_extraction_output_protocol("python").parse(
+    protocol = create_extraction_output_protocol("python")
+    contract = (
+        protocol.render_format_retry("invalid string")
+        if repair
+        else protocol.render_contract(context)
+    )
+    assert "r'''...'''" in contract
+    assert "true/false/null" in contract
+    assert "sdk.json_dumps" not in contract
+    assert "r'''...'''" not in create_extraction_output_protocol("json").render_contract(context)
+    examples = re.findall(r"```python\n(.*?)\n```", contract, re.DOTALL)
+    example = next(code for code in examples if code.startswith("json_text = r'''"))
+    operations, error = protocol.parse(
         example + "\nsdk.set_profile(content=json_text)\nsdk.commit()", context
     )
     assert error is None
     assert json.loads(operations.model_dump()["profile"][0]["content"]) == [
-        {"text": 'The user said "yes".', "ok": True, "missing": None}
+        {"text": 'The user said "yes".\nNext line.', "ok": True, "missing": None}
     ]
 
 
-def test_sdk_json_dumps_preserves_case_rubric_string_schema():
+def test_raw_json_strings_preserve_case_rubric_string_schema():
     from openviking.session.memory.experience.rubric import parse_case_rubric
 
     registry = MemoryTypeRegistry(load_schemas=False)
@@ -4027,10 +3958,10 @@ def test_sdk_json_dumps_preserves_case_rubric_string_schema():
     schema = registry.get("cases")
     context = _context([schema], template_context={"language": "en"})
     operations, error = create_extraction_output_protocol("python").parse(
-        '''sdk.create_cases(case_name="case", task_signature="Task", input="""Context""",
-            rubric=sdk.json_dumps([
-                {"id": "confirmation", "description": """Obtain an explicit "yes" before acting."""}
-            ]))''',
+        r"""sdk.create_cases(case_name="case", task_signature="Task", input='''Context''', execution_count=1,
+            rubric=r'''[
+                {"id": "confirmation", "description": "Obtain an explicit \"yes\" before acting."}
+            ]''')""",
         context,
     )
     assert error is None
@@ -4042,29 +3973,9 @@ def test_sdk_json_dumps_preserves_case_rubric_string_schema():
     assert next(f for f in schema.fields if f.name == "rubric").field_type == FieldType.STRING
 
 
-@pytest.mark.parametrize(
-    "expression",
-    ['__import__("json").dumps({})', "json.dumps({})", 'open("untrusted-file")'],
-)
-def test_sdk_json_dumps_does_not_enable_imports_modules_or_io(expression):
+def test_sdk_json_dumps_is_not_available():
     operations, error = create_extraction_output_protocol("python").parse(
-        f"sdk.set_profile(content=sdk.json_dumps({expression}))", _context([_profile_schema()])
+        "sdk.set_profile(content=sdk.json_dumps({}))", _context([_profile_schema()])
     )
     assert operations is None
-    assert "not allowed" in error or "unknown name" in error
-
-
-def test_sdk_json_dumps_rejects_a_lone_surrogate_instead_of_emitting_invalid_utf8():
-    operations, error = create_extraction_output_protocol("python").parse(
-        r'sdk.set_profile(content=sdk.json_dumps("\ud800"))', _context([_profile_schema()])
-    )
-    assert operations is None
-    assert "sdk.json_dumps" in error
-
-
-def test_sdk_json_dumps_is_a_value_expression_not_a_standalone_write():
-    operations, error = create_extraction_output_protocol("python").parse(
-        'sdk.json_dumps({"x": True})', _context([_profile_schema()])
-    )
-    assert operations is None
-    assert "standalone" in error
+    assert "unknown SDK method sdk.json_dumps()" in error

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -21,11 +22,11 @@ from openviking.session.train import (
 )
 from openviking.session.train.components.trajectory_observation import (
     TRAJECTORY_FORMAT,
-    render_trajectory_content,
 )
 from openviking.session.train.gates.experience import (
     EXPERIENCE_GATE_CONTEXTS_KEY,
 )
+from tests.session.train.test_fakes import render_trajectory_template
 
 ROOT = "viking://user/u/memories/experiences"
 SESSION = "viking://session/s1/archives/001"
@@ -86,7 +87,7 @@ def analysis(name="case_a", session=SESSION, passed=True):
 
     for trajectory in result.trajectories:
         trajectory.metadata["trajectory_format"] = TRAJECTORY_FORMAT
-        trajectory.content = render_trajectory_content(trajectory)
+        trajectory.content = render_trajectory_template(trajectory)
     return result
 
 
@@ -108,6 +109,21 @@ def operations(name="case_a", **fields):
     )
 
 
+async def validated_operations(provider, result):
+    """Simulate the validation hook in component-level extraction stubs."""
+    errors = await provider.validate_resolved_operations(result)
+    if errors:
+        raise ValueError(json.dumps(errors, ensure_ascii=False))
+    return result
+
+
+def mock_extract_loop(result):
+    async def run(provider, context):
+        return await validated_operations(provider, result)
+
+    return AsyncMock(side_effect=run)
+
+
 async def estimate(estimator, item):
     return await estimator.estimate(
         item,
@@ -118,7 +134,7 @@ async def estimate(estimator, item):
 
 @pytest.mark.asyncio
 async def test_direct_session_proposal_has_fixed_case_and_archive_provenance(monkeypatch):
-    run = AsyncMock(return_value=operations())
+    run = mock_extract_loop(operations())
     monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", run)
     item = analysis(passed=False)
     gradients = await estimate(ExperienceGradientEstimator(), item)
@@ -140,7 +156,7 @@ async def test_direct_session_proposal_has_fixed_case_and_archive_provenance(mon
 @pytest.mark.asyncio
 async def test_unknown_outcome_is_not_promoted_to_success(monkeypatch):
     monkeypatch.setattr(
-        ExperienceGradientEstimator, "_run_extract_loop", AsyncMock(return_value=operations())
+        ExperienceGradientEstimator, "_run_extract_loop", mock_extract_loop(operations())
     )
     (proposal,) = await estimate(ExperienceGradientEstimator(), analysis(passed=None))
     assert proposal.metadata[EXPERIENCE_GATE_CONTEXTS_KEY][0]["passed"] is None
@@ -161,8 +177,11 @@ async def test_candidate_can_generalize_evaluator_backed_success_value(monkeypat
     async def generalized_candidate(self, provider, context):
         provider.read_file = AsyncMock(return_value=None)
         await provider.prefetch()
-        return operations(
-            content='dag = workflow("total")\nr = tell("calculate the total from current records")'
+        return await validated_operations(
+            provider,
+            operations(
+                content='dag = workflow("total")\nr = tell("calculate the total from current records")'
+            ),
         )
 
     monkeypatch.setattr(
@@ -176,15 +195,15 @@ async def test_candidate_can_generalize_evaluator_backed_success_value(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_candidate_copying_session_entity_ids_into_reminder_becomes_noop(monkeypatch):
+async def test_candidate_copying_session_entity_ids_into_reminder_is_rejected(monkeypatch):
     item = analysis(passed=True)
     item.rollout.case.input = {"user_query": "Cancel the reservations XEHM4B and 59XX6W."}
 
     monkeypatch.setattr(
         ExperienceGradientEstimator,
         "_run_extract_loop",
-        AsyncMock(
-            return_value=operations(
+        mock_extract_loop(
+            operations(
                 content=(
                     'dag = workflow("scope")\n'
                     'a = check("A")\n'
@@ -197,11 +216,11 @@ async def test_candidate_copying_session_entity_ids_into_reminder_becomes_noop(m
         ),
     )
 
-    assert await estimate(ExperienceGradientEstimator(), item) == []
-    assert item.metadata["experience_synthesis_noop"] == {
-        "reason": "candidate copied session-specific identifiers into reminders",
-        "identifiers": ["59XX6W", "XEHM4B"],
-    }
+    with pytest.raises(ValueError, match="ExperienceIdentifierGate") as error:
+        await estimate(ExperienceGradientEstimator(), item)
+    assert "59XX6W" in str(error.value)
+    assert "XEHM4B" in str(error.value)
+    assert "experience_synthesis_noop" not in item.metadata
 
 
 @pytest.mark.asyncio
@@ -214,8 +233,8 @@ async def test_generalized_reminder_and_numeric_rule_value_are_accepted(monkeypa
     monkeypatch.setattr(
         ExperienceGradientEstimator,
         "_run_extract_loop",
-        AsyncMock(
-            return_value=operations(
+        mock_extract_loop(
+            operations(
                 content=(
                     'dag = workflow("scope")\n'
                     'r = tell("Only modify reservations explicitly selected in the current '
@@ -247,9 +266,7 @@ async def test_invalid_target_changes_fail_explicitly(monkeypatch, invalid):
         ops.upsert_operations[0].memory_fields["supersedes"] = "other"
     if invalid == "errors":
         ops.errors.append("invalid SDK")
-    monkeypatch.setattr(
-        ExperienceGradientEstimator, "_run_extract_loop", AsyncMock(return_value=ops)
-    )
+    monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", mock_extract_loop(ops))
     with pytest.raises(ValueError):
         await estimate(ExperienceGradientEstimator(), analysis())
 
@@ -265,7 +282,7 @@ async def test_concurrent_sessions_propose_same_case_without_waiting_for_trials(
         if entered == 2:
             ready.set()
         await asyncio.wait_for(ready.wait(), 1)
-        return operations()
+        return await validated_operations(provider, operations())
 
     monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", run)
     batches = await asyncio.gather(
@@ -291,7 +308,7 @@ async def test_estimator_wires_session_provider_into_extract_loop(monkeypatch):
             recorded.append(kwargs)
 
         async def run(self):
-            return operations(), []
+            return await validated_operations(recorded[0]["context_provider"], operations()), []
 
     monkeypatch.setattr(module, "ExtractLoop", Loop)
     fs = SimpleNamespace()
@@ -327,9 +344,7 @@ async def test_patch_proposal_materializes_valid_dag_and_retains_observed_base(
         extra_fields={"experience_name": "case_a", "version": 3},
     )
     ops.upsert_operations[0].old_memory_file_content = old
-    monkeypatch.setattr(
-        ExperienceGradientEstimator, "_run_extract_loop", AsyncMock(return_value=ops)
-    )
+    monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", mock_extract_loop(ops))
     (proposal,) = await estimate(ExperienceGradientEstimator(), analysis())
     expected = source.replace("old reminder", "new reminder")
     assert proposal.before_file.content == source

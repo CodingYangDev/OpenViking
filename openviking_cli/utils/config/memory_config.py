@@ -33,6 +33,15 @@ class SessionAutoCommitConfig(BaseModel):
     )
 
 
+class ActionFeedbackConfig(BaseModel):
+    """Compact feedback groups in Experience-update model input; storage is unchanged."""
+
+    min_samples: int = Field(default=10, ge=1, strict=True)
+    unchanged_min_ratio: float = Field(default=0.9, gt=0, le=1)
+    revise_min_ratio: float = Field(default=0.3, gt=0, le=1)
+    max_per_group: int = Field(default=3, ge=1, strict=True)
+
+
 class MemoryConfig(BaseModel):
     """Memory configuration for OpenViking."""
 
@@ -107,6 +116,13 @@ class MemoryConfig(BaseModel):
             "When enabled, memory extraction supports link extraction between "
             "memory items (page_id, links field, and link resolution). When disabled (default), "
             "no page_id or link fields are generated, and link resolution is skipped."
+        ),
+    )
+    action_feedback: ActionFeedbackConfig = Field(
+        default_factory=ActionFeedbackConfig,
+        description=(
+            "Experience-update feedback display thresholds. Ratios exclude unscored observations; "
+            "revision takes precedence if thresholds overlap. Counts remain cumulative by slot_name."
         ),
     )
     session_auto_commit: SessionAutoCommitConfig = Field(

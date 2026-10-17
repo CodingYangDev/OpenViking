@@ -5,8 +5,8 @@ from copy import deepcopy
 import pytest
 import yaml
 
-from openviking.session.train.components.trajectory_observation import render_trajectory_content
 from openviking.session.train.domain import Trajectory
+from tests.session.train.test_fakes import render_trajectory_template
 
 
 @pytest.mark.parametrize(
@@ -14,6 +14,9 @@ from openviking.session.train.domain import Trajectory
     [
         ("success", {"passed": True, "score": 1.0}),
         ("failure", {"passed": False, "score": 0.0}),
+        ("failure", {"passed": False, "score": 0.5}),
+        ("failure", {"passed": False, "score": 0.0, "details": {}}),
+        ("failure", {"passed": False, "score": 0.0, "details": None}),
         ("unknown", None),
     ],
 )
@@ -24,11 +27,27 @@ def test_complete_content_preserves_authoritative_evidence_and_exact_observation
         '# Session Context\n\n仅取消经确认的订单。\n\n# Trajectory\n\n1. `tool` {"amount": 123}\n'
     )
     metadata = {
+        "context_rules": "仅取消经确认的订单。",
+        "steps": '1. `tool` {"amount": 123}\n',
         "case_name": "cancel",
         "source_session_uri": "viking://session/s/archives/1",
-        "task_spec": {"name": "任务一", "input": {"booking_id": "ABC123"}},
+        "task_spec": {
+            "name": "PRIVATE_TASK_NAME",
+            "task_signature": "private:task:signature",
+            "input": {"booking_id": "ABC123"},
+            "rubric": {"name": "PRIVATE_RUBRIC_NAME", "criteria": [{"name": "task_reward"}]},
+            "metadata": {"marker": "PRIVATE_TASK_METADATA"},
+        },
         "evaluation": evaluation,
-        "evaluation_criteria": [{"id": "check:0", "passed": False, "summary": "缺少确认"}],
+        "evaluation_criteria": [
+            {"id": "check:0", "passed": False, "summary": "缺少确认"},
+            {"id": "passed", "passed": True},
+            {"id": "unknown", "passed": None},
+            {"id": "zero", "passed": 0},
+            {"id": "text_false", "passed": "false"},
+            {"id": "missing"},
+            {"id": "check:1", "passed": False, "summary": "遗漏信息"},
+        ],
         "experience_execution": {
             "cancel": {
                 "slot_values": {"eligible": True, "confirmed": False},
@@ -52,7 +71,7 @@ def test_complete_content_preserves_authoritative_evidence_and_exact_observation
     )
     before = deepcopy(trajectory)
 
-    content = render_trajectory_content(trajectory)
+    content = render_trajectory_template(trajectory)
     header, observed = content.split("\n```\n\n", 1)
     evidence = yaml.safe_load(header.split("```yaml\n", 1)[1])
 
@@ -60,21 +79,35 @@ def test_complete_content_preserves_authoritative_evidence_and_exact_observation
     assert observed == body
     assert content.startswith("# Trajectory Record\n\n```yaml\n")
     assert evidence == {
-        "trajectory_uri": trajectory.uri,
-        "source_session_uri": metadata["source_session_uri"],
         "case_name": "cancel",
-        "task_spec": metadata["task_spec"],
         "outcome": outcome,
-        "evaluation": evaluation,
-        "evaluation_criteria": metadata["evaluation_criteria"],
+        "evaluation_criteria": [
+            metadata["evaluation_criteria"][0],
+            metadata["evaluation_criteria"][-1],
+        ],
         "experience_execution": metadata["experience_execution"],
-        "experience_effects": metadata["experience_effects"],
-        "experience_effect_sources": metadata["experience_effect_sources"],
     }
+    assert "trajectory_uri" not in evidence
+    assert "source_session_uri" not in evidence
+    assert trajectory.uri not in content
+    assert metadata["source_session_uri"] not in content
+    assert "experience_effects" not in evidence
+    assert "experience_effect_sources" not in evidence
     assert "experience_update" not in content
     assert "gate_evidence" not in content
     assert "created_at" not in content
     assert "unexpected_field" not in content
+    assert "task_spec" not in evidence
+    assert "evaluation" not in evidence
+    assert metadata["task_spec"]["input"] == {"booking_id": "ABC123"}
+    for marker in [
+        "ABC123",
+        "PRIVATE_TASK_NAME",
+        "private:task:signature",
+        "PRIVATE_RUBRIC_NAME",
+        "PRIVATE_TASK_METADATA",
+    ]:
+        assert marker not in content
 
 
 def test_content_excludes_raw_evaluator_payload_and_keeps_empty_execution_explicit():
@@ -89,12 +122,18 @@ def test_content_excludes_raw_evaluator_payload_and_keeps_empty_execution_explic
             "evaluation": {"passed": False, "score": 0, "raw": "private evaluator payload"},
         },
     )
-    content = render_trajectory_content(trajectory)
+    content = render_trajectory_template(trajectory)
     evidence = yaml.safe_load(content.split("```yaml\n", 1)[1].split("\n```\n\n", 1)[0])
     assert evidence["experience_execution"] == {}
-    assert evidence["task_spec"] is None
-    assert evidence["experience_effect_sources"] == {}
-    assert evidence["evaluation"] == {"passed": False, "score": 0}
+    assert "task_spec" not in evidence
+    assert "experience_effects" not in evidence
+    assert "experience_effect_sources" not in evidence
+    assert "evaluation" not in evidence
+    assert trajectory.metadata["evaluation"] == {
+        "passed": False,
+        "score": 0,
+        "raw": "private evaluator payload",
+    }
     assert "private evaluator payload" not in content
     assert content.endswith(trajectory.content)
 
@@ -134,9 +173,10 @@ def test_evaluation_diagnostics_preserve_termination_without_copying_full_reward
             "evaluation": summary,
         },
     )
-    rendered = render_trajectory_content(trajectory)
+    rendered = render_trajectory_template(trajectory)
     evidence = yaml.safe_load(rendered.split("```yaml\n", 1)[1].split("\n```\n\n", 1)[0])
-    assert evidence["evaluation"] == summary
+    assert evidence["evaluation"] == {"details": expected}
+    assert trajectory.metadata["evaluation"] == summary
     assert note in rendered
     assert "action payload" not in rendered
 
@@ -168,3 +208,43 @@ def test_evaluation_summary_handles_unknown_empty_info_and_error_without_changin
         "score": 0.75,
         "details": {"type": "EvaluatorError", "error": "Could not inspect final state"},
     }
+
+
+@pytest.mark.parametrize(
+    "criteria",
+    [None, [], [{"passed": True}], [{"passed": None}], [{"passed": 0}], [{"id": "missing"}]],
+)
+def test_body_without_explicitly_failed_rubrics_keeps_an_empty_list(criteria):
+    trajectory = Trajectory(
+        name="run",
+        uri="trajectory:run",
+        outcome="unknown",
+        content="Observed dialogue.",
+        metadata={
+            "case_name": "case",
+            "source_session_uri": "viking://session/s/archives/1",
+            "evaluation_criteria": criteria,
+        },
+    )
+    before = deepcopy(trajectory)
+    content = render_trajectory_template(trajectory)
+    fields = yaml.safe_load(content.split("```yaml\n", 1)[1].split("\n```\n\n", 1)[0])
+    assert fields["evaluation_criteria"] == []
+    assert trajectory == before
+    assert content.endswith(trajectory.content)
+
+
+@pytest.mark.parametrize("execution", [None, {}, {"rule": {"executed_nodes": ["reminder"]}}])
+def test_template_preserves_explicit_execution_value(execution):
+    trajectory = Trajectory(
+        name="run",
+        uri="viking://user/u/memories/trajectories/case/run.md",
+        outcome="failure",
+        content="observed steps\n",
+        metadata={"case_name": "case", "experience_execution": execution},
+    )
+    rendered = render_trajectory_template(trajectory)
+    header = yaml.safe_load(rendered.split("```yaml\n", 1)[1].split("\n```", 1)[0])
+    assert header["experience_execution"] == execution
+    assert header["evaluation_criteria"] == []
+    assert rendered.endswith("observed steps\n")

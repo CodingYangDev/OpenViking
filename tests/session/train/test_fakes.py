@@ -233,3 +233,22 @@ def _parent(path: str) -> str | None:
         return "/" if path != "/" else None
     parent = path.rsplit("/", 1)[0]
     return parent or "/"
+
+
+def render_trajectory_template(trajectory):
+    """Render fixture evidence through the deployment schema, just like the writer."""
+    from openviking.session.memory.memory_type_registry import get_default_registry
+    from openviking.session.memory.utils.template_utils import TemplateUtils
+
+    schema = get_default_registry().get("trajectories")
+    assert schema is not None and schema.content_template
+    return TemplateUtils.render(
+        schema.content_template,
+        {
+            **trajectory.metadata,
+            "outcome": trajectory.outcome,
+            "context_rules": trajectory.metadata.get("context_rules", ""),
+            "steps": trajectory.metadata.get("steps", trajectory.content),
+        },
+        strip=False,
+    )

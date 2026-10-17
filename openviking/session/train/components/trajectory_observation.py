@@ -6,15 +6,13 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-import yaml
-
 from openviking.core.namespace import is_session_uri
 from openviking.session.memory.dataclass import (
     MemoryFile,
     StoredLink,
 )
 from openviking.session.memory.experience.dag import clip_evidence_summary, tool_evidence_summary
-from openviking.session.train.domain import RolloutAnalysis, RubricEvaluation, Trajectory
+from openviking.session.train.domain import RolloutAnalysis, RubricEvaluation
 
 MAX_EVIDENCE_CHARS = 64_000
 EXPERIENCE_EXECUTION_EVIDENCE_ID = "experience_execution"
@@ -142,38 +140,6 @@ def trajectory_evaluation_summary(evaluation: RubricEvaluation | None) -> dict |
     if details:
         summary["details"] = details
     return summary
-
-
-def render_trajectory_content(trajectory: Trajectory) -> str:
-    """Render immutable learning evidence once, before the Trajectory is persisted.
-
-    Metadata remains authoritative for programmatic selection and gates. Only this
-    allowlisted snapshot belongs in the body; mutable update state never does.
-    """
-    metadata = trajectory.metadata
-    evaluation = metadata.get("evaluation")
-    fields = {
-        "trajectory_uri": trajectory.uri,
-        "source_session_uri": metadata["source_session_uri"],
-        "case_name": metadata["case_name"],
-        "task_spec": metadata.get("task_spec"),
-        "outcome": trajectory.outcome,
-        "evaluation": None
-        if evaluation is None
-        else {
-            "passed": evaluation["passed"],
-            "score": evaluation["score"],
-            **({"details": evaluation["details"]} if "details" in evaluation else {}),
-        },
-        "evaluation_criteria": metadata.get("evaluation_criteria", []),
-        "experience_execution": metadata.get("experience_execution", {}),
-        "experience_effects": metadata.get("experience_effects"),
-        "experience_effect_sources": metadata.get("experience_effect_sources", {}),
-    }
-
-    normalized = json.loads(json.dumps(fields, ensure_ascii=False, default=str))
-    header = yaml.safe_dump(normalized, allow_unicode=True, sort_keys=False).rstrip()
-    return f"# Trajectory Record\n\n```yaml\n{header}\n```\n\n{trajectory.content}"
 
 
 def trajectory_source_session_uri(memory: MemoryFile) -> str:

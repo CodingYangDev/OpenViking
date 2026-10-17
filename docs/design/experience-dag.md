@@ -25,10 +25,14 @@ unchanged for tracing/scoring. This does not scrub literal strings from business
 migrate Trajectories when a Case is merged.
 
 A Case has no `evidence` field: domain scope/context/principles are its definition; execution
-facts and external scores belong to Trajectories. Existing Cases are explicitly selected without
-content writes using `sdk.commit(cases=[loaded_case])` or JSON `selected_case_ids`. Only loaded,
-in-scope, non-deleted Case references are accepted. New Cases are associated through creation.
-Read-only selections bypass the write batch; reading search candidates alone never selects them.
+facts and external scores belong to Trajectories. In a final Python extraction program, binding
+an existing Case to a local variable (e.g. `matched_case = prefetched_search[0]`) selects it without
+a content write; `sdk.commit()` is optional. `sdk.commit(cases=[...])` overrides these implicit
+selections; `cases=[]` clears them. JSON still uses explicit `selected_case_ids`.
+Only loaded, in-scope, non-deleted Case references are accepted. New or changed Cases use the
+normal write path. Read-only selections bypass the write batch. Merely prefetching or reading
+candidates does not select them, nor does binding an event/entity or a plain metadata dictionary.
+Case merges still require explicit `case_sources`; aliases there do not select inspected candidates.
 Selections remain internal references, separate from upserts and archive write diffs. Recording a
 Trajectory still maintains its real provenance links/backlinks through the existing storage code.
 Old evidence fields are ignored when loading a Case for learning; existing files are not migrated.
@@ -38,8 +42,8 @@ Without existing candidates, a singleton can be written without a second model c
 freshly read candidates and the proposal are compared by the shared patch merger. Each type/peer
 batcher keeps at most ten recent successful target URIs as additional read hints, bridging
 asynchronous vector indexing without caching file contents. These hints are process-local, not
-a global identity registry. Reading a candidate does not select it: existing Cases must still
-be explicitly associated with the submitting execution. Candidate lookup/read/model failures
+a global identity registry. Prefetched candidates alone do not select a Case; Case merges must
+still associate their final Cases with the submitting executions. Candidate lookup/read/model failures
 must not fall back to blindly applying new creates. Existing duplicate files are not migrated.
 Automatic flushes recheck current count/time readiness after acquiring the flush lock; queued
 flush tasks cannot prematurely consume a new underfilled buffer. Close still drains remaining work.
@@ -60,16 +64,18 @@ The normal field gate validates the complete list after patch application; uncha
 still be selected without writes. Loading maps these definitions into `Rubric.criteria`.
 
 The existing Trajectory extraction call receives the Case rubric, conversation and, if available,
-the full external evaluator report. Its LLM supplies best-effort assessments with
-`passed: true/false/null` and evidence; null covers insufficient evidence or inapplicability.
-Partial or empty assessments do not block factual Trajectory persistence. The server omits
-unknown IDs, all entries for repeated IDs, and malformed judgments; unparseable JSON or a
-non-list value becomes an empty assessment list. Discarded data is logged without inventing
-missing judgments or remapping IDs. No evaluator field-name whitelist creates the results.
-The server binds each retained result to the exact `{id, description}` snapshot supplied to
-that call and persists it in `evaluation_criteria`. Case rubric definitions remain strict; other
-trajectory validations are unchanged. Later Case edits or
-removals cannot reinterpret historical results. Original external outcomes/scores remain separate
+the full external evaluator report. Its LLM generates a YAML list of `id`,
+`passed: true/false/null`, block-scalar `evidence`, and optional `description`, without requiring
+precomputed rubric results; null covers insufficient evidence or inapplicability.
+Partial or empty assessments do not block factual Trajectory persistence. The Case rubric is
+guidance, not an ID whitelist. Structurally valid assessments are retained in model order, including unknown/repeated IDs and model-provided descriptions. A matching
+Case definition only fills a missing description; an unmatched ID neither discards the
+assessment nor causes a retry or extraction failure. No judgment or ID mapping is invented.
+Malformed judgments are still omitted; unparseable YAML or a non-list value becomes an empty
+assessment list. These structural issues are logged without blocking the factual Trajectory.
+No evaluator field-name whitelist creates the results. Retained entries are frozen in
+`evaluation_criteria`; Case rubric definitions remain strict and other trajectory validations
+are unchanged. Later Case edits or removals cannot reinterpret historical results. Original external outcomes/scores remain separate
 and unchanged for benchmark reporting; ordinary Sessions without them retain an unknown overall
 outcome. No additional model call or historical rewrite is introduced. Synthesis keeps
 these executions separate and judges each against its own task and rules. Feedback collection and
@@ -80,15 +86,22 @@ experiments must explicitly adopt the new code/templates before their behavior c
 ## Extraction and updates
 
 Agent Evolution first persists one factual Trajectory for each `(Case, Session archive)`.
-Its single `content` field is stored and consumed as text. The prompt recommends `# Session Context`
-with relevant clauses from the execution-time system messages, followed by `# Trajectory` and
-typed numbered items. Headings, their order, numbering, nonempty steps and a one-to-one source-step
-count are not runtime requirements; there is no 256-step cap. The server does not reparse content,
-renumber it or assign role labels by position. The existing extraction call selects rules based on
+The extraction schema exposes four string fields: `context_rules`, `steps`, `evaluation_criteria`
+and `action_scores`. `context_rules` holds relevant execution-time rule clauses; `steps` holds
+ordered Markdown execution text, not an array. The model emits neither the Trajectory Record
+header nor section titles. `content_template` renders the metadata, `# Session Context`, and
+`# Trajectory` sections. `MemoryFile.content` / `Trajectory.content` remain the rendered text.
+Trajectory identity, Case, outcome, `task_spec`, format, evaluation, execution paths and learning
+state remain backend-owned metadata, not model output fields. Identity is supplied before the
+normal URI/isolation resolution, not guessed by the model. Numbering, nonempty steps and a
+one-to-one source-step count are not runtime requirements; there is no 256-step cap. Neither
+extracted string is reparsed, renumbered or assigned role labels by position. The existing
+extraction call selects rules based on
 the user goal and the full supplied conversation, including requested actions that were skipped
 or refused. It preserves conditions and exceptions, not unrelated persona/style instructions;
-an empty context section is valid when no relevant rule is supplied. Training control messages
-are excluded. Relevant rule selection is prompt-guided; paragraphs are not required by a runtime
+an empty context section is valid when no relevant rule is supplied. The model is instructed
+not to copy training control metadata into either extracted field. Relevant rule selection is
+prompt-guided; paragraphs are not required by a runtime
 validator to match contiguous substrings of the source text.
 Rule selection uses the existing Trajectory extraction call. The model is asked to preserve the
 order, source labels and important facts of user messages, assistant messages, Experience Reminders
@@ -100,7 +113,7 @@ Experience generalizes facts into conditional reminders.
 ```text
 Session + Case + OutcomeEvaluation
   -> Phase 1: AgentTrajectoryContextProvider + ExtractLoop
-  -> model emits one sdk.create_trajectories(... Markdown content ...) + sdk.commit()
+  -> model emits sdk.create_trajectories(context_rules=..., steps=..., ...) + sdk.commit()
   -> server validates and normalizes the fixed add-only operation
   -> MemoryUpdater applies content, metadata and provenance links
   -> immutable Trajectory under trajectories/{case_name}/{archive_identity_hash}.md
@@ -223,8 +236,10 @@ result, preserving diagnostics and `retry_failed` behavior. The training adapter
 attempts as **skipped**, not applied: they advance processed progress without a red failure count
 and do not populate training `errors`. Console summaries report `skipped`; model/parse exception
 stacks are trace-only within the extraction call tree, without silencing unrelated concurrent
-requests. Request/task failures similarly retain their task ID and incomplete/diagnostic metadata
-without becoming training errors; interrupted waits never force completion of the progress bar.
+requests. Task-level failures are different: submission/polling errors, failed or cancelled tasks,
+and malformed completed results abort client training before evaluation or the next epoch.
+Their final event retains the task ID and incomplete/diagnostic metadata; no normal epoch result
+is returned. Cancellation propagates, and interrupted waits never force the progress bar to 100%.
 
 The learning API defaults to `wait=true` and returns the final result. With `wait=false`, it returns
 `{"task_id": "..."}` immediately after task creation. The existing `GET /api/v1/tasks/{task_id}`
@@ -242,10 +257,13 @@ requests have no known total until admitted; no artificial progress is emitted.
 The benchmark submits once with `wait=false` and the API's existing `max_cases=1000` limit,
 polls the task (every two seconds by default), and renders the shared progress bar from these counts.
 This does not add automatic pagination for epochs above the API's Case limit. Transient polling `ReadError`s use the existing
-capped backoff without resubmitting learning. The learning wait remains bounded to 1800 seconds;
-a cancelled/timed-out waiter does not cancel server work or force the bar to 100%. The recorded
-task ID permits subsequent status queries. Service shutdown cancels and joins in-process learning
-workers before closing storage. This is not an automatic restart/resume scheduler.
+capped backoff without resubmitting learning. The task wait is unbounded by default
+(`timeout_seconds=None`), while individual HTTP requests retain their own timeout. Direct callers
+can still set a positive task timeout; expiry aborts training rather than starting evaluation.
+A cancelled/timed-out waiter does not cancel server work, but the client must not continue into
+evaluation. The recorded task ID permits subsequent status queries. Service shutdown cancels and
+joins in-process learning workers before closing storage. This is not an automatic restart/resume
+scheduler.
 
 The explicit Phase 2 endpoint accepts exact Trajectory URIs, Case names, or both:
 
@@ -271,17 +289,26 @@ with the current `ordered_markdown_v3` format participate in comparison; older f
 and are not automatically migrated.
 
 Trajectory `content` is the complete immutable model-facing evidence. At observation creation,
-the server prepends a `# Trajectory Record` YAML block with identity/provenance, `task_spec`,
-`outcome`, compact `evaluation`, `evaluation_criteria`, `experience_execution`, and validated
-`experience_effects` / `experience_effect_sources`, followed by the extracted Session Context
-and ordered observation body. The external outcome/evaluation and fixed identity are server-owned;
+the content template renders a `# Trajectory Record` YAML block with `case_name`, `outcome`,
+explicitly failed `evaluation_criteria` and `experience_execution`, followed by the extracted
+Session Context and ordered observation body. `trajectory_uri` and `source_session_uri`
+remain in internal identity/provenance records, not in the body. `action_scores` and
+`action_score_sources` remain internal metadata for action feedback and are omitted
+from the body. The full `task_spec` remains in metadata and extraction context,
+but is omitted from the body. Metadata also retains every valid rubric assessment. Only entries
+with the Boolean `passed: false` appear in the body's rubric list; true, null and missing judgments
+are not displayed. Overall `evaluation.passed` and `evaluation.score` also stay in metadata;
+`outcome` is the body's status summary. If nonempty diagnostic `evaluation.details` exists,
+the body retains only that part under `evaluation`; otherwise it omits the whole block.
+The external outcome/evaluation and fixed identity are server-owned;
 criterion judgments and effects are model-produced, validated and frozen with their definitions. Metadata remains available for outcome selection,
 optional Gate inputs, attribution and lifecycle management; mutable `experience_update` state
 is excluded from the body. Lifecycle writes and retries preserve the body without re-rendering.
 Experience synthesis sends each Trajectory as one user message, retaining the Session Context
-and dialogue verbatim while compacting its generated header: identity/task metadata is omitted
-and only explicitly failed criterion snapshots are presented. Full results, including true/null,
-remain stored. Missing checks are not proof of success. Case context and the existing Experience
+and dialogue verbatim while compacting its generated header: identity/task metadata and
+Experience feedback annotations are omitted, including annotations in previously persisted
+headers, and only explicitly failed criterion snapshots are presented. Full results, including true/null,
+remain stored in metadata. Missing checks are not proof of success. Case context and the existing Experience
 remain separate messages, and the budget counts the compact model-facing view. Formats before v3 are
 not promoted or repaired at read time and are excluded from Phase 2 selection.
 
@@ -291,8 +318,9 @@ System rules remain in the single `source_steps` input and are used only for Ses
 not numbered policy-receipt steps; real policy quotations and assistant explanations remain
 observed dialogue. Native and VikingBot Tau2 builders no longer append synthetic `tau2-reward`
 user messages. Evaluation travels through `Rollout.evaluation` and OutcomeEvaluation instead.
-The persisted `evaluation` includes optional `details` for original termination reasons,
-non-null evaluator information and errors, so removing duplicate dialogue does not hide
+The internal `evaluation` includes optional `details` for original termination reasons,
+non-null evaluator information and errors. Those nonredundant details remain in the body,
+so removing duplicate status/score or dialogue does not hide
 `max_steps` or evaluation failures. Scores, criteria, confirmations, rejected tool calls and
 actual STOP events retain their existing meanings. This changes newly produced observations;
 it does not rewrite existing archives, Trajectories or cached rollouts.
@@ -317,24 +345,49 @@ The source body bypasses Markdown content templates and linkification; relations
 
 ### JSON-string fields in the Python SDK
 
-Memory fields such as Case `rubric`, Trajectory `evaluation_criteria`, and `experience_effects`
-remain `string` fields. In the final Python SDK program, serialize Python literal data with
-`sdk.json_dumps(value)` instead of manually escaping JSON inside another string:
+Case `rubric` remains a JSON-encoded `string` field. Trajectory `evaluation_criteria` and
+`action_scores` use YAML-encoded string fields.
+In the final Python SDK program, put valid JSON in a raw triple-single-quoted string so Python
+does not consume its JSON escapes:
 
 ```python
-json_text = sdk.json_dumps([
-    {"id": "confirmation", "passed": True, "evidence": """The user said "yes" before the action."""}
-])
+json_text = r'''[
+    {"id": "confirmation", "description": "Obtain an explicit \"yes\" before the action."}
+]'''
 # Pass json_text to the appropriate JSON-string field in a listed write method.
 ```
 
-This pure helper takes one positional argument and no options/callbacks. It uses standard JSON
-serialization with Unicode text preserved and non-finite numbers rejected. Encoded UTF-8 output
-is bounded by the SDK expression-size limit while encoding, not after building a potentially huge
-string. Memory objects and write handles are not serializable. No Python imports, arbitrary calls,
-read-only eval functions, or additional model calls are enabled. JSON-mode output is unchanged.
-This only guarantees serialization for supported data: rubric IDs, evidence types, missing entries
-and judgments still follow their domain validation and existing nonblocking commit behavior.
+Use JSON `true`/`false`/`null` inside the string. Escape quotes, newlines and backslashes once
+for JSON (`\"`, `\n`, `\\`), not again for Python. If the text contains literal `'''`, encode an
+apostrophe as `\u0027` instead of `\'`. Ordinary SDK text arguments retain their existing quote
+convention. Raw strings are already supported by the restricted Python DSL; no serializer helper,
+new field type, imports, or automatic JSON repair is added. The outer JSON-mode protocol is unchanged.
+Rubric IDs, evidence types, missing entries and judgments still follow their domain validation
+and existing nonblocking commit behavior.
+
+### Trajectory rubric results as YAML
+
+Trajectory `evaluation_criteria` remains a string field, but its model-produced value is a
+YAML list of `id`, `passed`, block-scalar `evidence`, and optional `description`. Generate
+these judgments using the supplied Case rubric as guidance and the conversation in the existing extraction call; ordinary Sessions do
+not need precomputed results or an external evaluator. For the Python SDK:
+
+```python
+assessment_text = r'''
+- id: confirmation
+  passed: false
+  evidence: |
+    The tool updated the record before the user said "yes".
+'''
+# Use an actual Case rubric ID and pass assessment_text to evaluation_criteria.
+```
+
+Safe YAML parsing preserves quoted and multiline evidence without nested JSON escaping.
+The server attaches the exact supplied criterion descriptions and retains the existing
+best-effort validation: malformed results do not block the factual Trajectory. Full snapshots
+remain structured in metadata; both the Trajectory body and Experience synthesis show only
+`passed: false`. This display projection does not change what the LLM assesses.
+Overall external outcomes/scores remain independent; without them the overall outcome is unknown.
 
 ### Materialized content validity gate
 
@@ -372,15 +425,21 @@ This deterministic validity gate is mandatory and independent of the optional mo
 
 Create-only collision checks live in `session/memory/validation/create.py`. These mandatory
 checks are shared by extraction and persistence and are repeated under the write-set lease.
-Optional training quality gates live in `session/train/gates/`; `ExperienceImprovementGate`
-implements the `PolicyProposalGate` (proposal filtering) and `PolicyUpdateGate` (plan filtering)
-protocols declared in `session/train/interfaces.py`. Proposal validation does not replace the
-mandatory create/content checks at persistence time.
+Experience candidate gates live in `session/train/gates/` and share the `PolicyUpdateGate`
+contract. Each gate controls activation through an `ENABLED: ClassVar[bool]` on its class:
+`ExperienceIdentifierGate` is on; `ExperienceImprovementGate` is off by default. There is no
+configuration enable flag or separate post-generation proposal filter. Disabled quality gates do
+not initialize or call Jev. Mandatory create/content checks at persistence time remain in place.
 
 Extraction previews reuse the existing operation materializer and the same gate, allowing the
 normal repair opportunity on invalid content. A valid patch remains a patch in the resolved
-operation: preview must not turn it into a stale full replacement. If repair remains invalid,
-invalid upserts are omitted and destructive follow-up operations are suppressed.
+operation: preview must not turn it into a stale full replacement. For ordinary memory, if
+repair remains invalid, invalid upserts are omitted and destructive follow-up operations are
+suppressed. Experience synthesis instead validates the complete materialized candidate through
+its provider hook in ExtractLoop: structural/target errors and enabled gate rejections share one
+repair opportunity. Concrete violations are fed back to the generating model; a second invalid
+candidate raises rather than becoming `no_op`. Evaluation infrastructure failures propagate
+without asking the generating model to repair them. An explicit model no-change remains valid.
 
 For gated writes, the updater acquires/reuses the complete write-set lease, reads the latest
 content, stages sequential patches to each URI, and validates every candidate before any write
@@ -612,7 +671,12 @@ advice as authoritative policy, user confirmation, or proof of completed actions
 client-side delivery recording. A unique client conversation and local reminder deduplication
 remain in place per rollout; no acknowledgement is sent to the server. `advice_recalls` records each query/status/count/duration in rollout
 metadata, including the user-message or before-action trigger. Injected messages retain their
-tool-history positions. `dag_runtime` keeps evaluations and separate `delivered_advice` facts;
+tool-history positions. At actual insertion, their export copies also capture the ordered advice
+`slot_name`s. The archived reminder header is annotated as `[Experience Reminder] advice_a, advice_b`,
+while its full instruction body remains available to extraction. Trajectory reminder steps copy
+that header rather than paraphrasing it or inventing names. Online Agent messages, captured raw
+advice text, recall and deduplication are unchanged; this is an archive annotation, not a new
+injection or a step-count validator. `dag_runtime` keeps evaluations and separate `delivered_advice` facts;
 client delivery does not manufacture completed Ask/Call nodes. Existing retrieval thresholds and DAG rules are unchanged.
 
 When a rollout is committed, the opening CaseSpec contains only static concrete-task input and rubric data.
@@ -625,9 +689,9 @@ names. These observations are passed directly to the reflection stage. They are 
 verified business outcomes; `evaluation` remains the authoritative external result. Missing
 evaluation is represented as unknown, never converted into a passing result.
 
-`agent_evolution.experience_gate_enabled` remains disabled by default. The existing optional
-proposal Gate is invoked on the synthesized candidate before apply; it never receives observation
-JSON as a DAG. Its legacy replay requires completion, so reminder-only DAGs cannot establish that
+`ExperienceImprovementGate.ENABLED` remains `False` by default. If enabled, it joins the same
+candidate validation/repair chain during extraction, before apply and outside the write lock; it
+never receives observation JSON as a DAG. Its legacy replay requires completion, so reminder-only DAGs cannot establish that
 through model slot filling alone. This refactor does not treat replayed reminder
 emission as business success or introduce a new Gate policy.
 
@@ -701,31 +765,58 @@ invalid programs/graphs, branches, default-instance validation, stateless reeval
 and concurrent state updates. They do not measure live-model slot-filling accuracy.
 
 
-## Experience 效果反馈
+## Action 有用性反馈
 
-Trajectory 提取会在同一次模型调用中生成 schema 字段 `experience_effects`：
-`positive_ids`、`negative_ids`、`weak_ids` 三个互斥数组。未分类代表未知或中性，
-不等于证明经验无用；这些标签也不等于 reward 或因果结论。
+Trajectory 提取在同一次模型调用中生成 `action_scores` YAML 列表。每个实际注入的
+不同 action 分配一个 `A1` 等编号，输出 `id`、简短 `evidence`，可评分时给出
+`score: 1`（有证据的用户目标收益）或 `score: -1`（有证据的副作用）。判断目标是用户当前的
+合法请求，不是 action 自己要求做什么。仅仅遵循提醒、未采纳、不适用或整题成败，都不足以定分。
+正分需要纠正决策、补充必要信息或推进任务等实际帮助；负分需要非预期成本/操作、错误变更、
+任务偏移或进展阻塞等副作用证据。有帮助且有副作用时记 `-1`，证据同时说明两者，供后续保留
+有效行为并修正有害部分。无明确影响或证据不足时省略 `score` 并说明原因，不使用 `0` 或 `null`。
+遗漏、非法或重复评分保留为未评分，不阻断事实轨迹提取。
 
-服务端只为运行时 `delivered_advice` 中实际送达的经验分配 `E1` 等编号，
-不会把候选、等待中的 DAG 节点或模型声明当作已注入。对应的编号到 URI 映射作为
-`experience_effect_sources` 系统元数据与不可变 Trajectory 一同保存。
-不合法或未注入的编号由现有 provider 操作校验与修复循环处理。
+编号只来自运行时 `delivered_advice`，不把候选、ACK 或待执行节点当成实际注入。
+`action_score_sources` 由代码绑定到 Experience URI、稳定 `slot_name` 和真实注入文本，
+与不可变 Trajectory 一起保存；模型不能改写绑定。同一轨迹中相同 action 只计一次。
 
-`feedback_stats` 不声明为模型可写的 schema 字段。它作为 Experience 的隐藏系统元数据，
-由代码通过既有 `MemoryUpdater` 在写集合锁内更新，不单独直接改写文件，也不重新嵌入
-未改变的 DAG 内容。普通内容更新保留这些元数据；模型 SDK、JSON 输出和合并提示词
-不能把它们作为可写的业务字段。
+Experience 的系统字段 `action_feedback` 以 `slot_name` 为键累计 `useful_count`、
+`not_useful_count`、`unscored_count`，并保留每类最新的有界证据和来源轨迹。
+不计算内容指纹；同一 Experience 内同名 slot 的反馈跨建议文本修改持续累加，改名后独立计数。
+不同 Experience 的同名 slot 不合并。每个实际注入的不同文本仍独立评分，再汇总到对应 slot。
+统计项不重复保存 slot 名或建议文本；当前建议文本从 DAG 读取。
+此统计格式仍为 `schema_version: 2`，不自动转换旧的指纹键统计。
+此次仅收紧新评分口径，不重评旧 Trajectory、不改写累计计数。`not_useful_count` 保留原名，
+历史负分可能仅表示冗余或不适用，不能直接当作副作用次数或副作用率。旧正分也不能证明新增
+条款有效；更新模型必须核对证据。比较新口径的效果时应使用独立的新实验数据，不混用旧评分。
+计数及 `observed_trajectories` 去重记录通过既有 `MemoryUpdater` 在同一锁内持久化，
+不重新嵌入未改变的 DAG。缓存重试、并发提交、写入 ACK 丢失不会重复计数；
+普通 DAG 更新保留最新反馈，已删除的 Experience 不会被统计重建。
 
-统计包含 `injected_count`、`positive_count`、`negative_count`、`weak_count` 和
-`neutral_count`。同一 Experience 在同一 Trajectory 中最多计一次；`injected_count`
-是被计入反馈的轨迹数量，而不是提醒插入消息的次数；统计按 Experience URI 跨版本累计，
-不代表当前版本的成功率。内部 `observed_trajectories`
-集合与计数在同一次文件更新中持久化，支持并发提交及失败后的幂等重试。
+exp 更新输入中的 `# Existing Experience` 展示完整 DAG，并将只读 `action_feedback` 压缩为两组。
+沿用当前按 `slot_name` 累计的全部反馈，不区分评分版本，action 文本变更后不清零。
+只检查当前 DAG 仍存在的 action，以 `useful_count + not_useful_count` 为样本数，排除未评分项：
 
-缓存命中已保存的 Trajectory 时，仅重试未完成的统计，不重新调用模型提取标签。
-没有送达绑定的历史轨迹不回填，已删除的 Experience 不会因统计而重建。
-读取或写入故障、损坏的统计结构会报错而不是清零或伪报成功。
+- `unchanged`（保持不变）：默认至少 10 次评分，正反馈比例 ≥ 90%。提示模型本轮不得删除、
+  改名、改写这些 action，也不得改变其触发条件；不只是保留节点。这是提示词约束，不是程序硬锁。
+- `revise`（需要修正）：默认至少 10 次评分，负反馈比例 ≥ 30%。核对负反馈证据后修正或删除
+  有副作用的部分，保留已证实的收益。不将旧负分直接解释为副作用。
 
-Phase 2 可以读取单条轨迹的效果标签和编号绑定来辅助分析，但必须重新核对源步骤、
-当前政策与评估事实。当前不根据累计统计自动重排、删除经验或修改 benchmark 分数。
+每组按对应比例降序排列，同分按 slot 名排序，最多 3 条；每条仅显示 slot 名、比例（分子/分母）
+和该方向的一条现有证据（单行，最多 160 字符；缺失则不展示）。不重复 action 正文，不展示
+内部去重记录或轨迹 URI。没有符合条件的 action 则省略反馈区块，未列出不等于无用。例如：
+
+```text
+### unchanged
+- check_payment_scope: positive 90.0% (18/20) — 提醒后纠正了支付范围。
+### revise
+- repeat_completed_check: negative 40.0% (4/10) — 重复检查阻止了已获授权的操作。
+```
+
+阈值可通过 `ov.conf` 的 `memory.action_feedback` 配置：`min_samples`（默认 10）、
+`unchanged_min_ratio`（0.9）、`revise_min_ratio`（0.3）、`max_per_group`（3）。
+样本数和展示数量须为正整数，比例须在 `(0, 1]`；阈值重叠时优先归入 `revise`，不同时要求不变和修正。
+这些配置只控制模型输入展示，不改变存储统计或运行时 action 执行。
+反馈字段不声明为可编辑 schema 字段，SDK、JSON 输出及合并模型不能修改它。
+评分是模型的观察性判断，不是因果证明；更新时仍需核对源步骤、适用条件和评估事实。
+不据此自动重排或删除 action，不修改 benchmark 分数，不将旧 exp 级标签回填为 action 评分。

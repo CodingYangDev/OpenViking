@@ -127,7 +127,7 @@ async def test_analysis_uses_context_memory_registry(analyzer_setup):
     _fs, model, analyzer, context = analyzer_setup
     context.memory_registry = MemoryTypeRegistry()
     schema = context.memory_registry.get("trajectories")
-    content_field = next(field for field in schema.fields if field.name == "content")
+    content_field = next(field for field in schema.fields if field.name == "steps")
     content_field.description += "\nACCOUNT_SPECIFIC_TRAJECTORY_RULE"
     rollout = Rollout(Case("c", "cancel", {}, Rubric("r", "", [])), [], "p")
     result = await analyzer.analyze(rollout, context)
@@ -209,6 +209,7 @@ async def test_trajectory_snapshots_llm_rubric_results_without_rewriting_externa
 
     import yaml
 
+    from openviking.message import ToolPart
     from openviking.session.memory.experience.experience_context import _trajectory_model_content
     from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
     from openviking.session.train import RubricCriterion
@@ -227,15 +228,24 @@ async def test_trajectory_snapshots_llm_rubric_results_without_rewriting_externa
         {
             "id": "confirm",
             "passed": False,
-            "evidence": "Step 2: changed records without confirmation.",
+            "evidence": 'Step 2: update_booking returned "updated" without confirmation.\n'
+            "No earlier user confirmation is recorded.",
         },
         {"id": "other", "passed": None, "evidence": "Not applicable to this request."},
     ]
-    model.get_completion_async.return_value = (
-        "sdk.create_trajectories(trajectory_name='fixed', case_name='fixed', outcome='unknown', "
-        f"evaluation_criteria={json.dumps(judgments)!r}, content='1. Observed execution.')\n"
-        "sdk.commit()"
-    )
+    model.get_completion_async.return_value = r"""sdk.create_trajectories(
+        context_rules='',
+        evaluation_criteria=r'''
+- id: confirm
+  passed: false
+  evidence: |-
+    Step 2: update_booking returned "updated" without confirmation.
+    No earlier user confirmation is recorded.
+- id: other
+  passed: null
+  evidence: Not applicable to this request.
+''', steps='1. Observed execution.')
+sdk.commit()"""
     evaluation = (
         None
         if external_passed is None
@@ -247,13 +257,36 @@ async def test_trajectory_snapshots_llm_rubric_results_without_rewriting_externa
             metadata={"custom_verdict": {"state": "reported", "details": "keep verbatim"}},
         )
     )
+    task_spec = (
+        None
+        if external_passed is None
+        else {"name": "task", "input": {"query": "private task-only input"}}
+    )
     rollout = Rollout(
         Case("library", "library", {}, rubric),
         [
-            Message(id="m", role="user", parts=[TextPart(text="Change the booking.")]),
+            Message(
+                id="m",
+                role="user",
+                parts=[TextPart(text="Change booking A; ask me before you update it.")],
+            ),
+            Message(
+                id="update",
+                role="assistant",
+                parts=[
+                    ToolPart(
+                        tool_id="update_a",
+                        tool_name="update_booking",
+                        tool_input={"id": "A"},
+                        tool_output="updated",
+                        tool_status="completed",
+                    )
+                ],
+            ),
         ],
         "p",
         evaluation,
+        metadata={"task_spec": task_spec},
     )
     result = await analyzer.analyze(rollout, context)
     trajectory = result.trajectories[0]
@@ -261,8 +294,15 @@ async def test_trajectory_snapshots_llm_rubric_results_without_rewriting_externa
     instruction = model.get_completion_async.await_args.kwargs["messages"][0]["content"]
     assert "Preserve explicitly reported results for matching criteria" in instruction
     assert "Use null for insufficient evidence or inapplicable criteria" in instruction
+    assert "External evaluation is optional" in instruction
+    assert "No precomputed rubric results are required" in instruction
+    assert "evaluation_criteria=r'''<YAML list>'''" in instruction
+    assert "evidence: |" in instruction
     assert payload["case"]["rubric"][0] == {"id": "confirm", "description": definition.description}
     assert payload["external_evaluation"] == (asdict(evaluation) if evaluation else None)
+    assert payload["task_spec"] == task_spec
+    assert "evaluation_criteria" not in payload
+    assert any("update_booking" in step["content"] for step in payload["source_steps"])
     assert result.evaluation is evaluation
     snapshots = trajectory.metadata["evaluation_criteria"]
     assert snapshots[0] == {**judgments[0], "description": definition.description}
@@ -271,10 +311,16 @@ async def test_trajectory_snapshots_llm_rubric_results_without_rewriting_externa
         None if evaluation is None else {"passed": external_passed, "score": float(external_passed)}
     )
     assert trajectory.metadata.get("evaluation") == expected
+    if evaluation is None:
+        assert trajectory.outcome == "unknown"
     stored = MemoryFileUtils.read(fs.files[trajectory.uri], uri=trajectory.uri)
     assert stored.extra_fields["evaluation_criteria"] == snapshots
+    assert stored.extra_fields.get("task_spec") == task_spec
     header = yaml.safe_load(stored.content.split("```yaml\n", 1)[1].split("\n```", 1)[0])
-    assert header["evaluation_criteria"] == snapshots
+    assert header["evaluation_criteria"] == [snapshots[0]]
+    assert "task_spec" not in header
+    assert "evaluation" not in header
+    assert "private task-only input" not in stored.content
     view = yaml.safe_load(
         _trajectory_model_content(stored.content).split("```yaml\n", 1)[1].split("\n```", 1)[0]
     )

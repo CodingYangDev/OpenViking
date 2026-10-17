@@ -12,12 +12,16 @@ set -euo pipefail
 #   --slot N   Run an isolated slot. Slot 0 is the default legacy setup. Slot N>0
 #              uses separate ports, OpenViking config/data, logs, and result dir.
 #   --enable-agent-evolution   Enable Experience/DAG learning for the selected slot account.
-# Tau2 response language follows ov.conf output_language_override (zh* -> zh) unless
-# TAU2_ROLLOUT_LANGUAGE explicitly overrides it.
+#   --auto-commit   Commit all Git-visible pending changes before restarting services.
+# Tau2 response language follows the task policy and conversation, independently of
+# OpenViking memory extraction language.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAU2_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${TAU2_DIR}/../.." && pwd)"
+source "${REPO_ROOT}/openviking/session/train/auto_commit.sh"
+
+AUTO_COMMIT=false
 
 SLOT="${TAU2_TRAIN_SLOT:-0}"
 ENABLE_AGENT_EVOLUTION="${TAU2_ENABLE_AGENT_EVOLUTION:-0}"
@@ -26,7 +30,7 @@ declare -a TRAIN_CLI_ARGS=()
 usage() {
   cat <<'USAGE'
 Usage:
-  bash benchmark/tau2/train/restart_vikingbot_train_eval.sh [--slot N] [--enable-agent-evolution] [train/eval args...]
+  bash benchmark/tau2/train/restart_vikingbot_train_eval.sh [--slot N] [--enable-agent-evolution] [--auto-commit] [train/eval args...]
 
 Launcher options:
   --slot N  Isolated experiment slot. Slot 0 is default/legacy. Slot N>0 uses:
@@ -37,12 +41,16 @@ Launcher options:
             OV data     = ~/.openviking_N/data
             result dir  = result/tau2/train_N
 
+  --auto-commit
+            Run git add -A and commit pending changes before services start.
+            Disabled by default; respects .gitignore and never pushes.
+
   --enable-agent-evolution
             Persist Agent Evolution enabled for the selected account after OpenViking starts.
 
 All remaining args are passed to benchmark/tau2/train/run_batch_train_eval.sh.
-Tau2 response language follows ov.conf output_language_override (zh* -> zh); set
-TAU2_ROLLOUT_LANGUAGE=default or zh to override it.
+Tau2 response language follows the task policy and conversation; memory extraction
+language does not impose a response language on the agent.
 USAGE
 }
 
@@ -59,6 +67,10 @@ parse_launcher_args() {
         ;;
       --slot=*)
         SLOT="${1#--slot=}"
+        shift 1
+        ;;
+      --auto-commit)
+        AUTO_COMMIT=true
         shift 1
         ;;
       --enable-agent-evolution)
@@ -89,6 +101,7 @@ validate_slot() {
   fi
 }
 
+openviking_capture_train_launch_command "$@"
 parse_launcher_args "$@"
 validate_slot
 
@@ -371,27 +384,9 @@ PY
   log "✓ Agent Evolution enabled for this slot"
 }
 
-resolve_rollout_language() {
-  if [[ -n "${TAU2_ROLLOUT_LANGUAGE:-}" ]]; then
-    printf '%s' "${TAU2_ROLLOUT_LANGUAGE}"
-    return
-  fi
-  python - "${OPENVIKING_CONFIG_FILE}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig"))
-language = str(config.get("output_language_override", "")).strip().lower()
-print("zh" if language == "zh" or language.startswith("zh-") else "default")
-PY
-}
-
 start_tau2_service() {
-  local rollout_language
-  rollout_language="$(resolve_rollout_language)"
   log "restarting tau2 service on ${TAU2_SERVICE_HOST}:${TAU2_SERVICE_PORT} backend=${TAU2_ROLLOUT_BACKEND}"
-  log "tau2 service language=${rollout_language} concurrency=${TAU2_MAX_ROLLOUT_CONCURRENCY} rollout_thread_workers=${TAU2_ROLLOUT_THREAD_WORKERS}"
+  log "tau2 service concurrency=${TAU2_MAX_ROLLOUT_CONCURRENCY} rollout_thread_workers=${TAU2_ROLLOUT_THREAD_WORKERS}"
   log "tau2 service log: ${TAU2_SERVICE_LOG}"
   : > "${TAU2_SERVICE_LOG}"
   stop_existing_listener "tau2 rollout service" "${TAU2_SERVICE_PORT}"
@@ -403,7 +398,7 @@ start_tau2_service() {
       --host "${TAU2_SERVICE_HOST}" \
       --port "${TAU2_SERVICE_PORT}" \
       --config "${OPENVIKING_CONFIG_FILE}" \
-      --rollout-language "${rollout_language}" \
+      --rollout-log-dir "${LOG_DIR}/rollouts" \
       --rollout-backend "${TAU2_ROLLOUT_BACKEND}" \
       --max-rollout-concurrency "${TAU2_MAX_ROLLOUT_CONCURRENCY}" \
       --rollout-thread-workers "${TAU2_ROLLOUT_THREAD_WORKERS}"
@@ -446,6 +441,7 @@ run_train_eval() {
 }
 
 main() {
+  openviking_train_auto_commit "${REPO_ROOT}" "tau2 train eval"
   start_openviking_server
   enable_agent_evolution
   start_tau2_service

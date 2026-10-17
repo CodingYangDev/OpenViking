@@ -10,6 +10,7 @@ from test_memory_create_guard import CTX, MemoryFS
 from openviking.server.identity import RequestContext, Role
 from openviking.session.compressor_v3 import _canonical_cases_from_update_result
 from openviking.session.memory.dataclass import MemoryFile, ResolvedOperation, ResolvedOperations
+from openviking.session.memory.experience.rubric import normalize_case_rubric
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry, get_default_registry
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.streaming_memory_updater import (
@@ -27,6 +28,7 @@ ROOT = "viking://user/alice/memories/cases"
 def fields(name):
     return {
         "case_name": name,
+        "execution_count": 1,
         "task_signature": (
             "Library lending and returns" if name == "library" else "Airline booking services"
         ),
@@ -270,3 +272,49 @@ async def test_canonical_and_alias_inputs_all_receive_the_unchanged_case(setup_m
         assert result.apply_result.written_uris == result.apply_result.edited_uris == []
     env.model.get_completion_async.assert_awaited_once()
     assert env.fs.files == before
+
+
+@pytest.mark.asyncio
+async def test_concurrent_count_only_updates_preserve_deltas_and_case_association(setup_merge):
+    env = setup_merge
+    uri = f"{ROOT}/airline.md"
+    initial = MemoryFile(
+        uri=uri,
+        memory_type="cases",
+        content="",
+        extra_fields={**fields("airline"), "execution_count": 7},
+    )
+    initial.extra_fields["rubric"] = normalize_case_rubric(initial.extra_fields["rubric"])
+    env.fs.files[uri] = MemoryFileUtils.write(initial, env.registry.get("cases").content_template)
+    initial_content = MemoryFileUtils.read(env.fs.files[uri], uri=uri).content
+    requests = []
+    for index in range(8):
+        req = request("airline", f"execution-{index}")
+        operation = req.operations.upsert_operations[0]
+        operation.create_only = False
+        operation.old_memory_file_content = initial
+        operation.memory_fields = {
+            key: value for key, value in fields("airline").items() if key != "rubric"
+        }
+        requests.append(req)
+
+    env.model.get_completion_async.return_value = (
+        "prefetched_memory_1.update(execution_count=8)\n"
+        "sdk.commit(case_sources=[(prefetched_memory_1, [1, 2, 3, 4, 5, 6, 7, 8])])"
+    )
+    results = await asyncio.gather(*(submit(env, req) for req in requests))
+
+    stored = MemoryFileUtils.read(env.fs.files[uri], uri=uri)
+    assert stored.extra_fields["execution_count"] == 15
+    assert stored.content == initial_content
+    env.model.get_completion_async.assert_awaited_once()
+    for req, result in zip(requests, results, strict=True):
+        assert not result.apply_result.errors
+        cases = await _canonical_cases_from_update_result(
+            operations=result.operations,
+            requested_operations=req.operations,
+            result=result.apply_result,
+            viking_fs=env.fs,
+            ctx=CTX,
+        )
+        assert [case.name for case in cases] == ["airline"]

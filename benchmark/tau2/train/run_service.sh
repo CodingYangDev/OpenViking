@@ -40,7 +40,6 @@ PORT="1944"
 DATA_ROOT="${TAU2_DATA_ROOT:-}"
 CONFIG="${OPENVIKING_CONFIG_FILE:-${HOME}/.openviking/ov.conf}"
 KILL_EXISTING=1
-ROLLOUT_LANGUAGE="default"
 ROLLOUT_BACKEND="${TAU2_ROLLOUT_BACKEND:-vikingbot}"
 NATIVE_THREAD_WORKERS="${TAU2_NATIVE_THREAD_WORKERS:-128}"
 MAX_ROLLOUT_CONCURRENCY="${TAU2_MAX_ROLLOUT_CONCURRENCY:-200}"
@@ -53,7 +52,7 @@ while [[ $# -gt 0 ]]; do
     --port) PORT="$2"; shift 2 ;;
     --data-root) DATA_ROOT="$2"; shift 2 ;;
     --config) CONFIG="$2"; shift 2 ;;
-    --rollout-language) ROLLOUT_LANGUAGE="$2"; shift 2 ;;
+    --rollout-log-dir) export TAU2_ROLLOUT_LOG_DIR="$2"; shift 2 ;;
     --rollout-backend) ROLLOUT_BACKEND="$2"; shift 2 ;;
     --native-thread-workers) NATIVE_THREAD_WORKERS="$2"; shift 2 ;;
     --max-rollout-concurrency) MAX_ROLLOUT_CONCURRENCY="$2"; shift 2 ;;
@@ -69,8 +68,8 @@ Usage:
 Options:
   --data-root PATH   tau2-bench data/tau2 root. Default auto-detect/TAU2_DATA_ROOT
   --config PATH      ov.conf for VikingBot/OpenViking access. Default ~/.openviking/ov.conf
-  --rollout-language default|zh
-                     Rollout response language. Use zh for Chinese user-facing replies.
+  --rollout-log-dir PATH
+                     Per-rollout log directory. Overrides TAU2_ROLLOUT_LOG_DIR.
   --rollout-backend native|vikingbot
                      Rollout implementation backend. Default: vikingbot.
   --native-thread-workers N
@@ -92,11 +91,6 @@ EOF
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
-
-if [[ "${ROLLOUT_LANGUAGE}" != "default" && "${ROLLOUT_LANGUAGE}" != "zh" ]]; then
-  echo "[tau2-service] invalid --rollout-language: ${ROLLOUT_LANGUAGE}. Expected default or zh" >&2
-  exit 1
-fi
 
 if [[ "${ROLLOUT_BACKEND}" != "native" && "${ROLLOUT_BACKEND}" != "vikingbot" ]]; then
   echo "[tau2-service] invalid --rollout-backend: ${ROLLOUT_BACKEND}. Expected native or vikingbot" >&2
@@ -202,7 +196,7 @@ export TAU2_ROLLOUT_BACKEND="${ROLLOUT_BACKEND}"
 export TAU2_NATIVE_THREAD_WORKERS="${NATIVE_THREAD_WORKERS}"
 export TAU2_MAX_ROLLOUT_CONCURRENCY="${MAX_ROLLOUT_CONCURRENCY}"
 export TAU2_ROLLOUT_THREAD_WORKERS="${ROLLOUT_THREAD_WORKERS}"
-echo "[tau2-service] host=${HOST} port=${PORT} data_root=${DATA_ROOT} config=${CONFIG} rollout_language=${ROLLOUT_LANGUAGE} rollout_backend=${ROLLOUT_BACKEND} native_thread_workers=${NATIVE_THREAD_WORKERS} max_rollout_concurrency=${MAX_ROLLOUT_CONCURRENCY} rollout_thread_workers=${ROLLOUT_THREAD_WORKERS}"
+echo "[tau2-service] host=${HOST} port=${PORT} data_root=${DATA_ROOT} config=${CONFIG} rollout_backend=${ROLLOUT_BACKEND} native_thread_workers=${NATIVE_THREAD_WORKERS} max_rollout_concurrency=${MAX_ROLLOUT_CONCURRENCY} rollout_thread_workers=${ROLLOUT_THREAD_WORKERS}"
 if [[ "${KILL_EXISTING}" == "1" ]]; then
   EXISTING_PIDS="$(lsof -tiTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null || true)"
   if [[ -n "${EXISTING_PIDS}" ]]; then
@@ -221,4 +215,4 @@ if [[ "${KILL_EXISTING}" == "1" ]]; then
     fi
   fi
 fi
-exec "${PYTHON_BIN}" "${SCRIPT_DIR}/service_app.py" --host "${HOST}" --port "${PORT}" --data-root "${DATA_ROOT}" --config "${CONFIG}" --rollout-language "${ROLLOUT_LANGUAGE}" --rollout-backend "${ROLLOUT_BACKEND}" --native-thread-workers "${NATIVE_THREAD_WORKERS}" --max-rollout-concurrency "${MAX_ROLLOUT_CONCURRENCY}" --rollout-thread-workers "${ROLLOUT_THREAD_WORKERS}"
+exec "${PYTHON_BIN}" "${SCRIPT_DIR}/service_app.py" --host "${HOST}" --port "${PORT}" --data-root "${DATA_ROOT}" --config "${CONFIG}" --rollout-backend "${ROLLOUT_BACKEND}" --native-thread-workers "${NATIVE_THREAD_WORKERS}" --max-rollout-concurrency "${MAX_ROLLOUT_CONCURRENCY}" --rollout-thread-workers "${ROLLOUT_THREAD_WORKERS}"

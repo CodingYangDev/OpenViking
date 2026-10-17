@@ -870,6 +870,10 @@ class ExtractLoop:
 
             for item_index, item in enumerate(items):
                 item_dict = dict(item)
+                # Supply trusted provider fields before isolation and URI rendering.
+                prepare_fields = getattr(self.context_provider, "prepare_operation_fields", None)
+                if callable(prepare_fields):
+                    item_dict = prepare_fields(memory_type, item_dict)
                 item_dict["memory_type"] = memory_type
                 identity_resolution_skip = None
                 classify_identity_fields = getattr(

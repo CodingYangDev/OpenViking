@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import yaml
+
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -44,50 +46,54 @@ def normalize_case_rubric(value: Any) -> str:
 def snapshot_rubric_results(value: Any, rubric: list[dict[str, str]]) -> list[dict[str, Any]]:
     """Keep valid judgments without letting auxiliary results block the factual trajectory.
 
-    Missing entries are not invented. Unknown or repeated IDs and invalid judgments are
-    omitted; descriptions always come from this call's Case rubric, not the model.
+    The Case rubric is guidance, not an ID whitelist. Preserve structurally valid
+    assessments in model order, including unknown/repeated IDs and model descriptions.
+    Case definitions only fill missing descriptions; no judgments or ID mappings are invented.
     """
     definitions = {item["id"]: item for item in rubric}
     if isinstance(value, str):
         try:
-            value = json.loads(value)
-        except (json.JSONDecodeError, RecursionError) as exc:
-            logger.warning("Discarding unparseable evaluation_criteria JSON: %s", exc)
+            value = yaml.safe_load(value)
+        except (yaml.YAMLError, RecursionError) as exc:
+            mark = getattr(exc, "problem_mark", None)
+            logger.warning(
+                "Discarding unparseable evaluation_criteria YAML: %s (line=%s, column=%s)",
+                type(exc).__name__,
+                mark.line + 1 if mark else None,
+                mark.column + 1 if mark else None,
+            )
             return []
     if not isinstance(value, list):
         logger.warning("Discarding non-list evaluation_criteria: %s", type(value).__name__)
         return []
 
-    results = {}
-    seen = set()
+    results = []
     for item in value:
-        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("id"), str)
+            or not item["id"].strip()
+        ):
             continue
         rubric_id = item["id"]
-        if rubric_id not in definitions:
-            continue
-        if rubric_id in seen:
-            # Do not choose between potentially conflicting judgments, even if one
-            # of the repeated entries is invalid. Omit this ID altogether.
-            results.pop(rubric_id, None)
-            continue
-        seen.add(rubric_id)
         if "passed" not in item or (
             item["passed"] is not None and type(item["passed"]) is not bool
         ):
             continue
         if not isinstance(item.get("evidence"), str) or not item["evidence"].strip():
             continue
-        results[rubric_id] = {
-            **definitions[rubric_id],
-            "passed": item["passed"],
-            "evidence": item["evidence"],
-        }
+        result: dict[str, Any] = {"id": rubric_id}
+        description = item.get("description")
+        if not isinstance(description, str) or not description.strip():
+            description = definitions.get(rubric_id, {}).get("description")
+        if description is not None:
+            result["description"] = description
+        result.update(passed=item["passed"], evidence=item["evidence"])
+        results.append(result)
     if len(results) != len(value):
         logger.warning(
-            "Discarded %d of %d evaluation_criteria entries "
-            "(invalid fields, unknown IDs or duplicate IDs)",
+            "Discarded %d of %d evaluation_criteria entries (invalid fields)",
             len(value) - len(results),
             len(value),
         )
-    return [results[item["id"]] for item in rubric if item["id"] in results]
+    return results

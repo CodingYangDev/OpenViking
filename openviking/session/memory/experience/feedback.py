@@ -1,93 +1,181 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Trajectory-level effect labels and system-owned Experience feedback counters."""
+"""Action-level observations and system-owned Experience feedback."""
 
 from __future__ import annotations
 
-import json
+from copy import deepcopy
 from typing import Any
+
+import yaml
 
 from openviking.session.archive_store import is_storage_not_found
 from openviking.session.memory.dataclass import MemoryFile, ResolvedOperation, ResolvedOperations
+from openviking.session.memory.experience.dag import Check, Dag, GeneralNode, clip_evidence_summary
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+from openviking_cli.utils.config.memory_config import ActionFeedbackConfig
 
-_EFFECT_FIELDS = ("positive_ids", "negative_ids", "weak_ids")
-_EFFECT_PRIORITY = {"neutral": 0, "weak": 1, "positive": 2, "negative": 3}
+_COUNTS = ("useful_count", "not_useful_count", "unscored_count")
 
 
-def injected_experiences(execution: dict[str, Any]) -> list[dict[str, Any]]:
-    """Assign aliases only to advice recorded as inserted, never to proposed DAG actions."""
-    reminders: list[dict[str, Any]] = []
+def injected_actions(execution: dict[str, Any]) -> list[dict[str, str]]:
+    """Assign one alias to each distinct action actually inserted into the agent context."""
+    actions = []
+    seen = set()
     for uri, snapshot in sorted(execution.items()):
-        instructions = list(
-            dict.fromkeys(
-                item["instruction"]
-                for item in (snapshot.get("delivered_advice") or [])
-                if isinstance(item, dict)
-                and isinstance(item.get("instruction"), str)
-                and item["instruction"].strip()
-            )
-        )
-        if instructions:
-            reminders.append(
+        for item in snapshot.get("delivered_advice") or []:
+            if not isinstance(item, dict):
+                continue
+            slot, text = item.get("slot_name"), item.get("instruction")
+            if (
+                not isinstance(slot, str)
+                or not slot
+                or not isinstance(text, str)
+                or not text.strip()
+            ):
+                continue
+            text = text.strip()
+            identity = (uri, slot, text)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            actions.append(
                 {
-                    "id": f"E{len(reminders) + 1}",
+                    "id": f"A{len(actions) + 1}",
                     "experience_uri": uri,
-                    "instructions": instructions,
+                    "slot_name": slot,
+                    "instruction": text,
                 }
             )
-    return reminders
+    return actions
 
 
-def validate_experience_effects(value: Any, sources: dict[str, str]) -> dict[str, list[str]]:
-    """Validate model-written categories against the server-owned delivery bindings."""
+def normalize_action_scores(value: Any, sources: dict[str, dict[str, str]]) -> list[dict]:
+    """Keep best-effort binary assessments; never turn missing evidence into a negative."""
     if isinstance(value, str):
-        value = json.loads(value)
-    if not isinstance(value, dict) or set(value) != set(_EFFECT_FIELDS):
-        raise ValueError("experience_effects requires positive_ids, negative_ids and weak_ids")
-    seen: set[str] = set()
-    result = {}
-    for name in _EFFECT_FIELDS:
-        ids = value[name]
-        if not isinstance(ids, list) or any(not isinstance(alias, str) for alias in ids):
-            raise ValueError(f"experience_effects.{name} must be a list of injected IDs")
-        if any(alias not in sources for alias in ids):
-            raise ValueError(f"experience_effects.{name} contains an ID that was not injected")
-        if len(set(ids)) != len(ids) or seen.intersection(ids):
-            raise ValueError("An injected ID may appear in at most one experience_effects category")
-        seen.update(ids)
-        result[name] = sorted(ids)
-    return result
+        try:
+            value = yaml.safe_load(value)
+        except (yaml.YAMLError, RecursionError):
+            value = []
+    results = {alias: {"id": alias, "evidence": ""} for alias in sources}
+    seen = set()
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, dict):
+            continue
+        alias = item.get("id")
+        if not isinstance(alias, str) or alias not in sources:
+            continue
+        if alias in seen:
+            results[alias] = {"id": alias, "evidence": ""}
+            continue
+        seen.add(alias)
+        evidence = item.get("evidence")
+        if not isinstance(evidence, str) or not evidence.strip():
+            continue
+        result = {"id": alias, "evidence": evidence.strip()}
+        score = item.get("score")
+        if type(score) in (int, float) and score in (-1, 1):
+            result["score"] = int(score)
+        results[alias] = result
+    return list(results.values())
 
 
-def _feedback_stats(value: Any) -> dict[str, Any]:
+def _feedback_state(value: Any) -> dict[str, Any]:
     if value is None:
-        return {
-            "schema_version": 1,
-            "injected_count": 0,
-            **{f"{effect}_count": 0 for effect in _EFFECT_PRIORITY},
-            "observed_trajectories": [],
-        }
-    if isinstance(value, str):
-        value = json.loads(value)
-    counters = ("injected_count", *(f"{effect}_count" for effect in _EFFECT_PRIORITY))
+        return {"schema_version": 2, "actions": {}, "observed_trajectories": []}
     if (
         not isinstance(value, dict)
         or type(value.get("schema_version")) is not int
-        or value["schema_version"] != 1
-        or any(type(value.get(key)) is not int or value[key] < 0 for key in counters)
+        or value["schema_version"] != 2
+        or not isinstance(value.get("actions"), dict)
+        or not isinstance(value.get("observed_trajectories"), list)
     ):
-        raise ValueError("Invalid system-owned feedback_stats counters")
-    observed = value.get("observed_trajectories")
-    if (
-        not isinstance(observed, list)
-        or any(not isinstance(uri, str) or not uri for uri in observed)
-        or len(set(observed)) != len(observed)
-        or len(observed) != value["injected_count"]
-        or sum(value[f"{effect}_count"] for effect in _EFFECT_PRIORITY) != value["injected_count"]
+        raise ValueError(
+            "Invalid system-owned action_feedback; expected schema_version=2 (slot_name keys)"
+        )
+    observed = value["observed_trajectories"]
+    if bool(observed) != bool(value["actions"]):
+        raise ValueError("Invalid action_feedback trajectory ledger")
+    if any(not isinstance(uri, str) or not uri for uri in observed) or len(set(observed)) != len(
+        observed
     ):
-        raise ValueError("feedback_stats counters and observed_trajectories disagree")
-    return {**value, "observed_trajectories": list(observed)}
+        raise ValueError("Invalid action_feedback trajectory ledger")
+    for key, item in value["actions"].items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or not isinstance(item, dict)
+            or any(type(item.get(name)) is not int or item[name] < 0 for name in _COUNTS)
+            or sum(item[name] for name in _COUNTS) == 0
+            or not isinstance(item.get("examples"), dict)
+        ):
+            raise ValueError("Invalid system-owned action_feedback counters or identity")
+        for label, example in item["examples"].items():
+            if (
+                label not in {"useful", "not_useful", "unscored"}
+                or not isinstance(example, dict)
+                or not isinstance(example.get("trajectory_uri"), str)
+                or not isinstance(example.get("evidence"), str)
+            ):
+                raise ValueError("Invalid system-owned action_feedback evidence")
+    return deepcopy(value)
+
+
+def action_feedback_for_content(
+    value: Any, content: str, *, config: ActionFeedbackConfig | None = None
+) -> dict[str, list[dict[str, str]]]:
+    """Group current slots by historical feedback ratios without changing cumulative counts."""
+    if value is None:
+        return {}
+    from openviking.session.memory.experience.compiler import compile_dag
+
+    config = config if config is not None else ActionFeedbackConfig()
+    state = _feedback_state(value)
+    if not state["actions"]:
+        return {}
+    dag = Dag.model_validate_json(compile_dag(content))
+    groups: dict[str, list[tuple[float, dict[str, str]]]] = {"unchanged": [], "revise": []}
+    for node in dag.nodes.values():
+        if not isinstance(node, GeneralNode) or isinstance(node.slot_provider, Check):
+            continue
+        item = state["actions"].get(node.slot_name)
+        if item is None:
+            continue
+        total = item["useful_count"] + item["not_useful_count"]
+        if total < config.min_samples:
+            continue
+        positive = item["useful_count"] / total
+        negative = item["not_useful_count"] / total
+        # Never issue contradictory instructions if configurable thresholds overlap.
+        if negative >= config.revise_min_ratio:
+            group, label, polarity, ratio = "revise", "not_useful", "negative", negative
+        elif positive >= config.unchanged_min_ratio:
+            group, label, polarity, ratio = "unchanged", "useful", "positive", positive
+        else:
+            continue
+        evidence = item["examples"].get(label, {}).get("evidence", "")
+        groups[group].append(
+            (
+                ratio,
+                {
+                    "slot_name": node.slot_name,
+                    "feedback": f"{polarity} {ratio:.1%} ({item[label + '_count']}/{total})",
+                    "evidence": clip_evidence_summary(
+                        "action_feedback", " ".join(evidence.split()), 160
+                    ).replace("\n", " "),
+                },
+            )
+        )
+    return {
+        group: [
+            item
+            for _, item in sorted(items, key=lambda pair: (-pair[0], pair[1]["slot_name"]))[
+                : config.max_per_group
+            ]
+        ]
+        for group, items in groups.items()
+        if items
+    }
 
 
 async def record_experience_feedback_stats(
@@ -97,44 +185,45 @@ async def record_experience_feedback_stats(
     viking_fs: Any,
     ctx: Any,
 ) -> dict[str, list[str]]:
-    """Count each persisted Trajectory once per Experience through the normal locked writer.
+    """Atomically count all injected actions once per Trajectory and Experience.
 
-    Counters and their deduplication markers are written together in one Experience file.
-    Cached Trajectories can retry this step without rerunning extraction or double counting.
-    Records without delivery bindings are not retrospectively attributed to an Experience.
+    Cached extraction retries reuse immutable scores. Each slot accumulates scores
+    across instruction changes; a removed Experience is never recreated by a feedback write.
     """
-    # Local imports avoid a provider -> feedback -> updater -> provider import cycle.
     from openviking.session.memory.memory_updater import MemoryUpdater
     from openviking.session.memory.streaming_memory_updater import _acquire_stable_operation_lease
 
     result: dict[str, list[str]] = {"updated_uris": [], "skipped_uris": []}
-    sources = trajectory.extra_fields.get("experience_effect_sources", {})
+    sources = trajectory.extra_fields.get("action_score_sources", {})
     if not isinstance(sources, dict):
-        raise ValueError("Invalid persisted Experience feedback sources")
+        raise ValueError("Invalid persisted action feedback sources")
     if not sources:
         return result
-    if (
-        not isinstance(sources, dict)
-        or any(
-            not isinstance(alias, str) or not isinstance(uri, str) for alias, uri in sources.items()
-        )
-        or any(MemoryUpdater.memory_type_from_uri(uri) != "experiences" for uri in sources.values())
-        or not trajectory.uri
-        or MemoryUpdater.memory_type_from_uri(trajectory.uri) != "trajectories"
-    ):
-        raise ValueError("Invalid persisted Experience feedback sources")
-    effects = validate_experience_effects(
-        trajectory.extra_fields.get("experience_effects"), sources
-    )
-    by_uri: dict[str, str] = {}
-    for alias, uri in sources.items():
-        effect = next(
-            (name.removesuffix("_ids") for name in _EFFECT_FIELDS if alias in effects[name]),
-            "neutral",
-        )
-        if _EFFECT_PRIORITY[effect] >= _EFFECT_PRIORITY[by_uri.get(uri, "neutral")]:
-            by_uri[uri] = effect
-    for uri, effect in sorted(by_uri.items()):
+    if not trajectory.uri or MemoryUpdater.memory_type_from_uri(trajectory.uri) != "trajectories":
+        raise ValueError("Invalid action feedback Trajectory")
+    grouped: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
+    scores = {
+        item["id"]: item
+        for item in normalize_action_scores(trajectory.extra_fields.get("action_scores"), sources)
+    }
+    for alias, source in sources.items():
+        if (
+            not isinstance(alias, str)
+            or not isinstance(source, dict)
+            or any(
+                not isinstance(source.get(k), str) or not source[k]
+                for k in ("experience_uri", "slot_name", "instruction")
+            )
+            or MemoryUpdater.memory_type_from_uri(source["experience_uri"]) != "experiences"
+        ):
+            raise ValueError("Invalid persisted action feedback sources")
+        # Distinct injected texts are scored separately, then accumulated under the same slot.
+        key = (source["slot_name"], source["instruction"])
+        actions = grouped.setdefault(source["experience_uri"], {})
+        if key in actions:
+            raise ValueError("Duplicate action feedback sources")
+        actions[key] = {**source, **scores[alias]}
+    for uri, actions in sorted(grouped.items()):
         operation = ResolvedOperation(memory_type="experiences", uris=[uri], memory_fields={})
         operations = ResolvedOperations(
             upsert_operations=[operation], delete_file_contents=[], errors=[]
@@ -148,20 +237,29 @@ async def record_experience_feedback_stats(
             except Exception as exc:
                 if not is_storage_not_found(exc):
                     raise
-                # A removed Experience must not be recreated by a statistics update.
                 result["skipped_uris"].append(uri)
                 continue
             previous = MemoryFileUtils.read(raw, uri=uri)
-            stats = _feedback_stats(previous.extra_fields.get("feedback_stats"))
-            if trajectory.uri in stats["observed_trajectories"]:
+            state = _feedback_state(previous.extra_fields.get("action_feedback"))
+            if trajectory.uri in state["observed_trajectories"]:
                 result["skipped_uris"].append(uri)
                 continue
-            stats["injected_count"] += 1
-            stats[f"{effect}_count"] += 1
-            stats["observed_trajectories"].append(trajectory.uri)
-            operation.memory_fields = {"feedback_stats": stats}
+            for action in actions.values():
+                item = state["actions"].setdefault(
+                    action["slot_name"], {**dict.fromkeys(_COUNTS, 0), "examples": {}}
+                )
+                label = {1: "useful", -1: "not_useful"}.get(action.get("score"), "unscored")
+                item[f"{label}_count"] += 1
+                if action["evidence"]:
+                    item["examples"][label] = {
+                        "trajectory_uri": trajectory.uri,
+                        "evidence": clip_evidence_summary(
+                            "action_feedback", action["evidence"], 1000
+                        ),
+                    }
+            state["observed_trajectories"].append(trajectory.uri)
+            operation.memory_fields = {"action_feedback": state}
             operation.old_memory_file_content = previous
-            # Feedback changes hidden metadata only; do not re-embed unchanged DAG content.
             updater = MemoryUpdater(registry=registry, transaction_handle=lease)
             updater._viking_fs = viking_fs
             updated = await updater.apply_operations(operations, ctx)

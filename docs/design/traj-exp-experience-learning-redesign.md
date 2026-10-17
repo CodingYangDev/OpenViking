@@ -1039,8 +1039,7 @@ POST /v1/rollouts/execute
   "options": {
     "config_path": "/path/to/ov.conf",
     "max_iterations": 30,
-    "keep_default_tools": true,
-    "rollout_language": "default"
+    "keep_default_tools": true
   }
 }
 ```

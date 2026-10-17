@@ -100,7 +100,6 @@ class NativeTau2RolloutExecutor:
     openviking_timeout: float = 600.0
     memory_enabled: bool = True
     scope_prompt: str = ""
-    rollout_language: str = "default"
     log_timings: bool = True
     show_progress: bool = False
     progress_label: str = "tau2"
@@ -116,8 +115,6 @@ class NativeTau2RolloutExecutor:
             raise ValueError("retrieval_top_k must be > 0")
         if self.retrieval_mode not in {"first_user", "prewrite", "first_user_prewrite"}:
             raise ValueError("retrieval_mode must be first_user, prewrite, or first_user_prewrite")
-        if self.rollout_language not in {"default", "zh"}:
-            raise ValueError("rollout_language must be 'default' or 'zh'")
         for name in (
             "memory_inject_max_chars",
             "first_user_memory_inject_max_chars",
@@ -403,17 +400,6 @@ def _register_native_memory_agent(executor: NativeTau2RolloutExecutor) -> str:
                 state.system_messages.append(
                     SystemMessage(role="system", content=executor_config.scope_prompt)
                 )
-            if executor_config.rollout_language == "zh":
-                state.system_messages.append(
-                    SystemMessage(
-                        role="system",
-                        content=(
-                            "Communicate with the user and write final responses in Chinese. "
-                            "Do not translate tool names, identifiers, JSON field names, "
-                            "reservation IDs, flight numbers, or other structured values."
-                        ),
-                    )
-                )
             return state
 
         def _retrieve(
@@ -667,7 +653,6 @@ def _native_agent_name(executor: NativeTau2RolloutExecutor) -> str:
         "openviking_user": executor.openviking_user,
         "openviking_timeout": executor.openviking_timeout,
         "scope_prompt": executor.scope_prompt,
-        "rollout_language": executor.rollout_language,
     }
     digest = hashlib.sha1(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")

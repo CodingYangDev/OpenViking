@@ -27,6 +27,7 @@ from benchmark.tau2.train._rollout_helpers import (
 from benchmark.tau2.train._rollout_helpers import (
     _tau2_evaluation as _tau2_evaluation_helper,
 )
+from benchmark.tau2.train.dag_experience_runtime import EXPERIENCE_REMINDER_MARKER
 from openviking.message import Message, ToolPart
 from openviking.session.train import (
     Case,
@@ -304,11 +305,6 @@ class VikingBotTau2RolloutExecutor:
     keep_default_tools: bool = True
     max_iterations: int = DEFAULT_MAX_ROLLOUT_ITERATIONS
     log_timings: bool = True
-    rollout_language: str = "default"
-
-    def __post_init__(self) -> None:
-        if self.rollout_language not in {"default", "zh"}:
-            raise ValueError("rollout_language must be 'default' or 'zh'")
 
     async def execute(
         self,
@@ -374,7 +370,6 @@ class VikingBotTau2RolloutExecutor:
         system_prompt = _build_system_prompt(
             provider.policy,
             keep_default_tools=self.keep_default_tools,
-            rollout_language=self.rollout_language,
         )
         user_prompt = provider.user_query
         SessionKey = _vikingbot_imports()["SessionKey"]
@@ -834,7 +829,7 @@ def _classify_write_tools(provider: Any) -> set[str]:
     return write_names
 
 
-def _build_system_prompt(policy: str, *, keep_default_tools: bool, rollout_language: str) -> str:
+def _build_system_prompt(policy: str, *, keep_default_tools: bool) -> str:
     instructions = []
     if policy:
         instructions.append(policy)
@@ -844,12 +839,6 @@ def _build_system_prompt(policy: str, *, keep_default_tools: bool, rollout_langu
             "Relevant past-experience advice may be supplied automatically after user messages "
             "as [Experience Reminder]. Use it as a review aid only when applicable; task "
             "requirements, constraints, and current facts remain authoritative."
-        )
-    if rollout_language == "zh":
-        instructions.append(
-            "Communicate with the user and write the final response in Chinese. "
-            "Do not translate tool names, identifiers, JSON field names, reservation IDs, "
-            "flight numbers, or other structured values used by tools."
         )
     instructions.append(
         "If you need to communicate with the user, you MUST call tool `communicate_with_user`."
@@ -944,6 +933,14 @@ async def _run_agent(
         ),
         record_user_message=runtime.record_user_message if runtime else None,
     )
+
+    async def record_experience_injected(note: str) -> None:
+        if runtime is not None:
+            await runtime.record_injected(
+                note,
+                captured_message=experience_messages[-1] if experience_messages else None,
+            )
+
     execution_error = None
     try:
         result = await agent._run_agent_loop(
@@ -957,7 +954,7 @@ async def _run_agent(
             on_plain_text=plain_text_router,
             inject_write_experience=False,
             experience_context_provider=runtime.recall if runtime else None,
-            experience_context_injected=runtime.record_injected if runtime else None,
+            experience_context_injected=record_experience_injected if runtime else None,
             captured_experience_messages=experience_messages,
             on_initial_llm_request=(
                 lambda messages, tools: _capture_initial_llm_request(
@@ -1143,6 +1140,13 @@ def _build_rollout_messages(
             if reminder.get("after_tool_count", 0) != after_tool_count:
                 continue
             content = str(reminder.get("content") or "").strip()
+            names = reminder.get("advice_names") or []
+            if names and content.startswith(EXPERIENCE_REMINDER_MARKER):
+                content = content.replace(
+                    EXPERIENCE_REMINDER_MARKER,
+                    f"{EXPERIENCE_REMINDER_MARKER} {', '.join(names)}",
+                    1,
+                )
             if content:
                 messages.append(
                     _message(
@@ -1169,7 +1173,9 @@ def _build_rollout_messages(
             result = tool_info.get("result")
             has_result = result is not None
             if _is_communicate_with_user(tool_name):
-                assistant_text = _communicate_text_from_tool_input(tool_input)
+                assistant_text = _communicate_text_from_tool_input(
+                    tool_input, auto_forwarded=tool_info.get("auto") is True
+                )
                 if assistant_text.strip():
                     messages.append(
                         _message(

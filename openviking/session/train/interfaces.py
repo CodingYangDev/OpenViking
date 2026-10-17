@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 from openviking.session.memory.dataclass import MemoryFile, StoredLink
 from openviking.session.train.context import ExecutionContext
@@ -65,19 +65,10 @@ class PolicyOptimizer(Protocol):
     ) -> PolicyUpdatePlan: ...
 
 
-class PolicyProposalGate(Protocol):
-    """Filters semantic proposals before they are assembled into a policy plan."""
-
-    async def validate_proposals(
-        self,
-        gradients: list[SemanticGradient],
-        policy_set: PolicySet,
-        context: Any,
-    ) -> tuple[list[SemanticGradient], dict[str, Any]]: ...
-
-
 class PolicyUpdateGate(Protocol):
     """Validates an optimized policy plan before it is applied."""
+
+    ENABLED: ClassVar[bool]
 
     async def validate(
         self,

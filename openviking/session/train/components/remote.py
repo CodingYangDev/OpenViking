@@ -191,7 +191,10 @@ class RemoteRolloutExecutor:
             },
         )
         response.raise_for_status()
-        execution_id = _require_execution_id(response.json(), case=case)
+        execution_data = response.json()
+        execution_id = _require_execution_id(execution_data, case=case)
+        log_path = execution_data.get("rollout_log_path")
+        log_hint = f"; rollout_log_path={log_path}" if log_path else ""
         try:
             # A stalled polling HTTP request must not extend the execution budget.
             return await asyncio.wait_for(
@@ -212,7 +215,7 @@ class RemoteRolloutExecutor:
             if isinstance(failure, TimeoutError):
                 raise TimeoutError(
                     f"rollout execution {execution_id} timed out for case {case.name} "
-                    f"after {self.execution_timeout_seconds}s"
+                    f"after {self.execution_timeout_seconds}s{log_hint}"
                 ) from failure
             raise
 
@@ -277,6 +280,8 @@ class RemoteRolloutExecutor:
                 continue
             response.raise_for_status()
             data = response.json()
+            log_path = data.get("rollout_log_path")
+            log_hint = f"; rollout_log_path={log_path}" if log_path else ""
             status = data.get("status")
             if status == "completed":
                 rollout_data = data.get("rollout")
@@ -288,7 +293,7 @@ class RemoteRolloutExecutor:
             if status == "failed":
                 raise RuntimeError(
                     f"rollout execution {execution_id} failed for case {case.name}: "
-                    f"{data.get('error') or 'unknown error'}"
+                    f"{data.get('error') or 'unknown error'}{log_hint}"
                 )
             if asyncio.get_running_loop().time() >= deadline:
                 last_error_text = (

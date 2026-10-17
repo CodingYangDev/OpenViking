@@ -26,13 +26,15 @@ from openviking_cli.client.http import AsyncHTTPClient
 class RemoteExperienceLearner:
     client: AsyncHTTPClient
     poll_interval_seconds: float = 2.0
-    timeout_seconds: float = 1800.0
+    timeout_seconds: float | None = None
     show_progress: bool = False
     event_recorder: Any | None = None
 
     def __post_init__(self) -> None:
-        if self.poll_interval_seconds <= 0 or self.timeout_seconds <= 0:
-            raise ValueError("Learning poll interval and timeout must be > 0")
+        if self.poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_seconds must be > 0")
+        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0 or None")
 
     async def learn(
         self,
@@ -143,10 +145,12 @@ class RemoteExperienceLearner:
                             f"{item.get('error') or 'unknown error'}",
                             console=False,
                         )
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 error = f"{type(exc).__name__}: {exc}"
                 tracer.error(
-                    "Experience learning skipped after request/task failure", e=exc, console=False
+                    "Experience learning interrupted; stopping before evaluation",
+                    e=exc,
+                    console=False,
                 )
                 # An interrupted wait is not evidence that every Case failed remotely.
                 learning = {
@@ -163,49 +167,51 @@ class RemoteExperienceLearner:
                         no_op_count=last_progress["no_op"],
                         failed_count=last_progress["failed"],
                     )
+                # An incomplete result would let the pipeline evaluate while server writes continue.
+                raise
             finally:
                 if printer is not None:
                     printer.finish()
-            learning["task_id"] = task_id
-            await self._record_learning_event(
-                "experience_learn_done",
-                execution_metadata=execution_metadata,
-                task_id=task_id,
-                **{
-                    key: learning.get(key)
-                    for key in (
-                        "case_count",
-                        "trajectory_count",
-                        "applied_count",
-                        "no_op_count",
-                        "failed_count",
-                        "written_experience_uris",
-                        "error",
-                        "incomplete",
-                        "progress",
-                    )
-                },
-                case_results=[
-                    {
-                        "case_name": item.get("case_name"),
-                        "state": item.get("state"),
-                        "trajectory_count": len(item.get("trajectory_uris", [])),
-                        "experience_uri": item.get("experience_uri"),
-                        "error": item.get("error"),
-                    }
-                    for item in learning.get("results", [])
-                ],
-            )
-            print(
-                "[EXPERIENCE_LEARN] "
-                f"cases={learning.get('case_count', 0)} "
-                f"trajectories={learning.get('trajectory_count', 0)} "
-                f"applied={learning.get('applied_count', 0)} "
-                f"no_op={learning.get('no_op_count', 0)} "
-                f"skipped={learning.get('failed_count', 0)}"
-                + (" incomplete=1" if learning.get("incomplete") else ""),
-                flush=True,
-            )
+                learning["task_id"] = task_id
+                await self._record_learning_event(
+                    "experience_learn_done",
+                    execution_metadata=execution_metadata,
+                    task_id=task_id,
+                    **{
+                        key: learning.get(key)
+                        for key in (
+                            "case_count",
+                            "trajectory_count",
+                            "applied_count",
+                            "no_op_count",
+                            "failed_count",
+                            "written_experience_uris",
+                            "error",
+                            "incomplete",
+                            "progress",
+                        )
+                    },
+                    case_results=[
+                        {
+                            "case_name": item.get("case_name"),
+                            "state": item.get("state"),
+                            "trajectory_count": len(item.get("trajectory_uris", [])),
+                            "experience_uri": item.get("experience_uri"),
+                            "error": item.get("error"),
+                        }
+                        for item in learning.get("results", [])
+                    ],
+                )
+                print(
+                    "[EXPERIENCE_LEARN] "
+                    f"cases={learning.get('case_count', 0)} "
+                    f"trajectories={learning.get('trajectory_count', 0)} "
+                    f"applied={learning.get('applied_count', 0)} "
+                    f"no_op={learning.get('no_op_count', 0)} "
+                    f"skipped={learning.get('failed_count', 0)}"
+                    + (" incomplete=1" if learning.get("incomplete") else ""),
+                    flush=True,
+                )
         metadata = {
             **(batches[-1].apply_result.metadata if batches else {}),
             "committed_rollout_count": sum(

@@ -10,12 +10,13 @@ def test_tau2_service_configures_tau2_loguru_at_warning(monkeypatch):
     calls = []
 
     class FakeLoguruLogger:
-        def remove(self):
-            calls.append(("remove",))
+        def remove(self, sink_id):
+            calls.append(("remove", sink_id))
 
-        def add(self, sink, *, level):
+        def add(self, sink, *, level, diagnose):
             del sink
-            calls.append(("add", level))
+            calls.append(("add", level, diagnose))
+            return 123
 
     monkeypatch.setitem(
         __import__("sys").modules,
@@ -23,9 +24,11 @@ def test_tau2_service_configures_tau2_loguru_at_warning(monkeypatch):
         type("FakeLoguruModule", (), {"logger": FakeLoguruLogger()})(),
     )
 
+    monkeypatch.setattr(service_app, "_service_log_sink_id", None)
+    service_app.configure_tau2_service_logging()
     service_app.configure_tau2_service_logging()
 
-    assert calls == [("remove",), ("add", "WARNING")]
+    assert calls == [("remove", 0), ("add", "WARNING", False)]
 
 
 def test_tau2_service_disables_rollout_progress_by_default(monkeypatch):
@@ -50,6 +53,7 @@ def test_tau2_service_disables_rollout_progress_by_default(monkeypatch):
     app = service_app.create_app(rollout_backend="native")
     executor = app["make_rollout_executor"]({"rollout_backend": "vikingbot", "max_iterations": 5})
 
+    assert app["rollout_log_dir"] == service_app.DEFAULT_ROLLOUT_LOG_DIR
     assert isinstance(executor, FakeExecutor)
     assert calls[-1]["factory"]["backend"] == "vikingbot"
     assert calls[-1]["factory"]["options"]["max_iterations"] == 5
@@ -75,3 +79,15 @@ def test_tau2_service_keeps_explicit_rollout_progress_override(monkeypatch):
     app["make_rollout_executor"]({"rollout_backend": "native", "show_progress": True})
 
     assert calls[-1]["options"]["show_progress"] is True
+
+
+def test_tau2_service_log_directory_is_configured_by_service_args(monkeypatch):
+    import sys
+
+    import benchmark.tau2.train.service_app as service_app
+
+    monkeypatch.setenv("TAU2_ROLLOUT_LOG_DIR", "/tmp/env-rollout-logs")
+    monkeypatch.setattr(sys, "argv", ["service_app"])
+    assert service_app.parse_args().rollout_log_dir == "/tmp/env-rollout-logs"
+    monkeypatch.setattr(sys, "argv", ["service_app", "--rollout-log-dir", "/tmp/cli-rollout-logs"])
+    assert service_app.parse_args().rollout_log_dir == "/tmp/cli-rollout-logs"

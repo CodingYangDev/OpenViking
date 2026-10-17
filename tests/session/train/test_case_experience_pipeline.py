@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 import yaml
-from test_gradient_estimator_component import ROOT, analysis, operations
+from test_gradient_estimator_component import ROOT, analysis, operations, validated_operations
 from test_train_components import FakeVikingFS
 
 from openviking.message import Message, TextPart, ToolPart
@@ -21,6 +22,7 @@ from openviking.session.memory.experience.experience_context import (
 from openviking.session.memory.experience.trajectory_context import trajectory_source_steps
 from openviking.session.memory.memory_type_registry import get_default_registry
 from openviking.session.memory.memory_updater import MemoryUpdater
+from openviking.session.memory.utils.link_renderer import LinkRenderer
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.train import (
     ExperienceGradientContext,
@@ -40,23 +42,23 @@ from openviking.session.train.components.trajectory_observation import (
     TRAJECTORY_FORMAT,
     ObservationGradient,
     observation_evidence,
-    render_trajectory_content,
     trajectory_source_session_uri,
 )
-from openviking.session.train.components.trajectory_optimizer import TrajectoryExperienceOptimizer
+from openviking.session.train.components.trajectory_optimizer import (
+    SUCCESS_TRAJECTORY_REFS,
+    TrajectoryExperienceOptimizer,
+    _comparison_key,
+)
 from openviking_cli.session.user_id import UserIdentifier
+from tests.session.train.test_fakes import render_trajectory_template
 
 OBSERVATION = "1. `user` requested cancellation of the duplicate booking"
 STORED_OBSERVATION = "# Session Context\n\n\n\n# Trajectory\n\n1. `user` requested cancellation of the duplicate booking"
 
 
-def trajectory_program(content: str = OBSERVATION, *, context_rules: str = "") -> str:
-    content = f"# Session Context\n\n{context_rules}\n\n# Trajectory\n\n{content}"
+def trajectory_program(steps: str = OBSERVATION, *, context_rules: str = "") -> str:
     return (
-        "sdk.create_trajectories("
-        "trajectory_name='server_fixed', case_name='server_fixed', outcome='unknown', "
-        f"content={content!r})\n"
-        "sdk.commit()"
+        f"sdk.create_trajectories(context_rules={context_rules!r}, steps={steps!r})\nsdk.commit()"
     )
 
 
@@ -123,6 +125,29 @@ async def observe(analyzer, run, policies, context):
     return [ObservationGradient(run, run.rollout.case.name, target, memory)]
 
 
+async def store_success_reference(fs, policies, run):
+    target = f"{ROOT}/{run.rollout.case.name}.md"
+    trajectory = run.trajectories[0]
+    fs.files[target] = MemoryFileUtils.write(
+        MemoryFile(
+            uri=target,
+            content='dag = workflow("cancel")\nstep = tell("verify duplicate identity")',
+            memory_type="experiences",
+            extra_fields={
+                "experience_name": run.rollout.case.name,
+                "case_name": run.rollout.case.name,
+                "version": 1,
+                SUCCESS_TRAJECTORY_REFS: {
+                    _comparison_key(trajectory.metadata): LinkRenderer.relative_path(
+                        target, trajectory.uri
+                    )
+                },
+            },
+        )
+    )
+    return await policies.reload()
+
+
 @pytest.fixture
 def setup_observation():
     fs = ObservationFS()
@@ -143,22 +168,37 @@ def setup_observation():
     [
         (None, []),
         ('[{"id":"confirm","passed":true,"evidence":"{"nested":true}"}]', []),
-        ([{"id": "tau2_reward", "passed": True, "evidence": "External result."}], []),
+        ([{"id": "tau2_reward", "passed": True, "evidence": "External result."}], ["tau2_reward"]),
+        (
+            [{"id": "tau2_reward", "passed": False, "evidence": "Required information missing."}],
+            ["tau2_reward"],
+        ),
+        (
+            [{"id": "tau2_reward", "passed": None, "evidence": "No sufficient evidence."}],
+            ["tau2_reward"],
+        ),
         (
             [
                 {
                     "id": "confirm",
-                    "description": "untrusted",
+                    "description": "Model-assessed confirmation requirement.",
                     "passed": True,
                     "evidence": "Confirmation observed.",
                 },
                 {"id": "scope", "passed": "false", "evidence": "Wrong type."},
-                {"id": "tau2_reward", "passed": True, "evidence": "Wrong rubric."},
+                {"id": "tau2_reward", "passed": True, "evidence": "Additional assessment."},
             ],
-            ["confirm"],
+            ["confirm", "tau2_reward"],
         ),
     ],
-    ids=["omitted", "malformed-json", "unknown-id", "partial"],
+    ids=[
+        "omitted",
+        "malformed-json",
+        "unmatched-success",
+        "unmatched-failure",
+        "unmatched-unknown",
+        "partial",
+    ],
 )
 async def test_bad_or_missing_rubric_results_do_not_block_trajectory_persistence(
     setup_observation, rubric_results, expected_ids
@@ -176,7 +216,7 @@ async def test_bad_or_missing_rubric_results_do_not_block_trajectory_persistence
     program = trajectory_program().replace("outcome='unknown'", "outcome='success'")
     if rubric_results is not None:
         value = rubric_results if isinstance(rubric_results, str) else json.dumps(rubric_results)
-        program = program.replace("content=", f"evaluation_criteria={value!r}, content=", 1)
+        program = program.replace("steps=", f"evaluation_criteria={value!r}, steps=", 1)
     model.get_completion_async.return_value = program
 
     signals = await observe(analyzer, run, policies, context)
@@ -187,20 +227,22 @@ async def test_bad_or_missing_rubric_results_do_not_block_trajectory_persistence
     header = yaml.safe_load(memory.content.split("```yaml\n", 1)[1].split("\n```", 1)[0])
     assert memory.content.endswith(STORED_OBSERVATION)
     assert header["outcome"] == "failure"
-    assert header["evaluation"]["passed"] is False
-    assert header["evaluation"]["score"] == 0.0
-    assert [r["id"] for r in header["evaluation_criteria"]] == expected_ids
-    assert memory.extra_fields["evaluation_criteria"] == header["evaluation_criteria"]
+    assert "evaluation" not in header
+    assert memory.extra_fields["evaluation"] == {"passed": False, "score": 0.0}
+    snapshots = memory.extra_fields["evaluation_criteria"]
+    assert [r["id"] for r in snapshots] == expected_ids
+    assert header["evaluation_criteria"] == [r for r in snapshots if r["passed"] is False]
     assert memory.extra_fields["experience_update"]["state"] == "pending"
-    if expected_ids:
-        assert header["evaluation_criteria"] == [
-            {
-                "id": "confirm",
-                "description": "Confirm before changing the record.",
-                "passed": True,
-                "evidence": "Confirmation observed.",
-            }
+    if isinstance(rubric_results, list):
+        assert snapshots == [
+            item
+            for item in rubric_results
+            if item.get("passed") is None or type(item.get("passed")) is bool
         ]
+    # Experience synthesis keeps unmatched failed assessments in its compact model view.
+    projected = _trajectory_model_content(memory.content)
+    model_header = yaml.safe_load(projected.split("```yaml\n", 1)[1].split("\n```", 1)[0])
+    assert model_header["evaluation_criteria"] == header["evaluation_criteria"]
 
 
 @pytest.mark.asyncio
@@ -307,7 +349,8 @@ async def test_selected_session_rules_persist_and_reach_experience_input(setup_o
         "# Trajectory\n\n1. `user` requested cancellation of the duplicate booking"
     )
     assert unrelated not in stored.content
-    assert "context_rules" not in stored.extra_fields
+    assert stored.extra_fields["context_rules"] == rules
+    assert stored.extra_fields["steps"] == OBSERVATION
     assert "session_context" not in stored.extra_fields
     model.get_completion_async.assert_awaited_once()
     extraction_messages = model.get_completion_async.await_args.kwargs["messages"]
@@ -383,7 +426,7 @@ async def test_experience_request_has_separate_plain_user_messages_and_working_u
     run.trajectories[0].metadata["experience_execution"] = {
         "case_a": {"slot_values": {"booking": "duplicate"}, "executed_nodes": ["reminder"]}
     }
-    run.trajectories[0].content = render_trajectory_content(run.trajectories[0])
+    run.trajectories[0].content = render_trajectory_template(run.trajectories[0])
     # Only the persisted content, not freshly changed evidence metadata, goes to the LLM.
     run.trajectories[0].metadata["experience_execution"] = {"not_in_content": True}
     model.get_completion_async.return_value = programs[method] + "\nsdk.commit()"
@@ -412,6 +455,9 @@ async def test_experience_request_has_separate_plain_user_messages_and_working_u
     assert system_prompt.count("AND semantics") == 1
     assert system_prompt.count("fictional execution") == 1
     assert "omitted checks are not proof of success" in system_prompt
+    assert system_prompt.count("Analyze each candidate:") == 1
+    assert "Reject advice already followed in the failed run" in system_prompt
+    assert "each need only repair its own failure pattern" in system_prompt
     assert "not that the business task succeeded" in system_prompt
     assert "Example — linking" not in messages[0]["content"]
     assert "read-only context, not the SDK reply" in messages[0]["content"]
@@ -486,15 +532,18 @@ async def test_noncontiguous_related_rules_do_not_trigger_repair(setup_observati
 async def test_historical_success_accepts_unstructured_content(setup_observation):
     fs, ctx, model, analyzer, context, policies = setup_observation
     model.get_completion_async.return_value = (
-        "sdk.create_trajectories(trajectory_name='model', case_name='model', outcome='unknown', "
-        "content='The requested change succeeded.')\nsdk.commit()"
+        "sdk.create_trajectories(context_rules='', "
+        "steps='The requested change succeeded.')\nsdk.commit()"
     )
     historical = analysis(session="viking://session/historical/archives/001", passed=True)
+    historical.metadata["task_spec"] = asdict(historical.rollout.case)
     await observe(analyzer, historical, policies, context)
     memory = historical.metadata["trajectory_memory"]
     memory.extra_fields["experience_update"]["state"] = "applied"
     fs.files[memory.uri] = MemoryFileUtils.write(memory)
+    policies = await store_success_reference(fs, policies, historical)
     current = analysis(session="viking://session/current/archives/001", passed=False)
+    current.metadata["task_spec"] = asdict(current.rollout.case)
     signals = await observe(analyzer, current, policies, context)
     estimator = SimpleNamespace(estimate=AsyncMock(return_value=[]))
 
@@ -552,7 +601,7 @@ def test_source_steps_keep_every_record_within_shared_budget():
 def test_experience_input_keeps_unstructured_content_and_inline_tool_json():
     trajectory = analysis().trajectories[0]
     trajectory.content = 'flights=[{"flight_number":"HAT072","date":"2024-05-19"}], payment_id=gift'
-    assert render_trajectory_content(trajectory).endswith(trajectory.content)
+    assert render_trajectory_template(trajectory).endswith(trajectory.content)
 
 
 @pytest.mark.asyncio
@@ -647,6 +696,7 @@ async def test_concurrent_sessions_batch_once_and_load_one_historical_success(
     pending = analysis(session="viking://user/u/sessions/pending/history/archive_001", passed=True)
     history_runs = [older, historical, failed, unknown, foreign, pending]
     for day, run in enumerate(history_runs, start=1):
+        run.metadata["task_spec"] = asdict(run.rollout.case)
         await observe(analyzer, run, policies, context)
         memory = run.metadata["trajectory_memory"]
         memory.extra_fields["created_at"] = f"2024-01-{day:02d}T00:00:00+00:00"
@@ -654,10 +704,13 @@ async def test_concurrent_sessions_batch_once_and_load_one_historical_success(
             "pending" if run is pending else "no_op" if run is historical else "applied"
         )
         fs.files[memory.uri] = MemoryFileUtils.write(memory)
+    policies = await store_success_reference(fs, policies, historical)
     runs = [
         analysis(session=f"viking://user/u/sessions/s{i}/history/archive_001", passed=False)
         for i in range(2)
     ]
+    for run in runs:
+        run.metadata["task_spec"] = asdict(run.rollout.case)
     signals = await asyncio.gather(*(observe(analyzer, run, policies, context) for run in runs))
     captured = []
 
@@ -666,8 +719,11 @@ async def test_concurrent_sessions_batch_once_and_load_one_historical_success(
         provider.read_file = AsyncMock(return_value=None)
         payload = await presented_trajectories(provider)
         captured.append(payload)
-        return operations(
-            content='dag = workflow("cancel")\nc = check("duplicate requested")\nr = tell("verify duplicate identity")\nc.then(r)'
+        return await validated_operations(
+            provider,
+            operations(
+                content='dag = workflow("cancel")\nc = check("duplicate requested")\nr = tell("verify duplicate identity")\nc.then(r)'
+            ),
         )
 
     monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", synthesize)
@@ -705,6 +761,11 @@ async def test_concurrent_sessions_batch_once_and_load_one_historical_success(
     assert all(result.apply_result.written_uris == [f"{ROOT}/case_a.md"] for result in results)
     stored = MemoryFileUtils.read(fs.files[f"{ROOT}/case_a.md"])
     assert len(stored.extra_fields["source_sessions"]) == 3
+    assert stored.extra_fields[SUCCESS_TRAJECTORY_REFS] == {
+        _comparison_key(historical.trajectories[0].metadata): LinkRenderer.relative_path(
+            f"{ROOT}/case_a.md", historical.trajectories[0].uri
+        )
+    }
     assert {t.uri for run in [historical, *runs] for t in run.trajectories} == (
         {link["to_uri"] for link in stored.links}
     )
@@ -741,22 +802,25 @@ async def test_any_current_success_skips_history_lookup(setup_observation, monke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("passed", [False, None])
+@pytest.mark.parametrize("outcome", ["failure", "partial", "unfinished", "unknown"])
 async def test_no_historical_success_does_not_use_other_outcomes(
-    setup_observation, monkeypatch, passed
+    setup_observation, monkeypatch, passed, outcome
 ):
     fs, ctx, _model, analyzer, context, policies = setup_observation
-    for outcome in ("failure", "partial", "unfinished", "unknown"):
-        historical = analysis(session=f"viking://session/{outcome}/archives/001", passed=False)
-        await observe(analyzer, historical, policies, context)
-        memory = historical.metadata["trajectory_memory"]
-        memory.extra_fields["outcome"] = outcome
-        memory.extra_fields["experience_update"]["state"] = "applied"
-        # Ineligible historical outcomes are excluded regardless of their content.
-        memory.content = "irrelevant history"
-        fs.files[memory.uri] = MemoryFileUtils.write(memory)
+    historical = analysis(session=f"viking://session/{outcome}/archives/001", passed=False)
+    historical.metadata["task_spec"] = asdict(historical.rollout.case)
+    await observe(analyzer, historical, policies, context)
+    memory = historical.metadata["trajectory_memory"]
+    memory.extra_fields["outcome"] = outcome
+    memory.extra_fields["experience_update"]["state"] = "applied"
+    # An invalid reference must not promote a non-successful trajectory.
+    memory.content = "irrelevant history"
+    fs.files[memory.uri] = MemoryFileUtils.write(memory)
+    policies = await store_success_reference(fs, policies, historical)
     run = analysis(session="viking://session/current/archives/001", passed=passed)
+    run.metadata["task_spec"] = asdict(run.rollout.case)
     signals = await observe(analyzer, run, policies, context)
-    lookup = AsyncMock(wraps=fs.ls)
+    lookup = AsyncMock(side_effect=AssertionError("Read the reference, not the directory"))
     monkeypatch.setattr(fs, "ls", lookup)
     estimator = SimpleNamespace(estimate=AsyncMock(return_value=[]))
 
@@ -764,7 +828,7 @@ async def test_no_historical_success_does_not_use_other_outcomes(
         signals, policies, PatchMergePolicyOptimizerContext(ctx)
     )
 
-    lookup.assert_awaited_once()
+    lookup.assert_not_awaited()
     selected = estimator.estimate.await_args.args[0]
     assert [trajectory.uri for trajectory in selected.trajectories] == [run.trajectories[0].uri]
 
@@ -794,44 +858,34 @@ async def test_failure_only_batch_can_produce_noop_without_losing_trajectory(
 
 
 @pytest.mark.asyncio
-async def test_optional_gate_rejects_dag_but_keeps_observation(setup_observation, monkeypatch):
+async def test_candidate_gate_failure_propagates_but_keeps_observation(
+    setup_observation, monkeypatch
+):
     fs, ctx, model, analyzer, context, policies = setup_observation
     signals = await observe(analyzer, analysis(passed=False), policies, context)
 
     async def candidate(self, provider, context):
-        return operations()
+        return await validated_operations(provider, operations())
 
     monkeypatch.setattr(ExperienceGradientEstimator, "_run_extract_loop", candidate)
+    from openviking.session.train.gates.errors import ExperienceGateRejected
+
     gate = SimpleNamespace(
-        validate_proposals=AsyncMock(
-            return_value=(
-                [],
-                {
-                    "experience_improvement_gate": {
-                        "passed": False,
-                        "accepted_count": 0,
-                        "rejected_count": 1,
-                        "candidates": [
-                            {
-                                "target_uri": ROOT + "/case_a.md",
-                                "target_name": "case_a",
-                                "passed": False,
-                                "reason": "unsupported correction",
-                            }
-                        ],
-                    }
-                },
+        ENABLED=True,
+        validate=AsyncMock(
+            side_effect=ExperienceGateRejected(
+                [{"gate": "test", "error": "unsupported correction"}]
             )
-        )
+        ),
     )
-    plan = await TrajectoryExperienceOptimizer(
-        fs, ExperienceGradientEstimator(viking_fs=fs), proposal_gate=gate
-    ).plan(signals, policies, PatchMergePolicyOptimizerContext(ctx))
-    assert not plan.items
-    assert plan.read_policy_uris is None
-    gate.validate_proposals.assert_awaited_once()
+    with pytest.raises(ValueError, match="unsupported correction"):
+        await TrajectoryExperienceOptimizer(
+            fs, ExperienceGradientEstimator(viking_fs=fs, gates=[gate])
+        ).plan(signals, policies, PatchMergePolicyOptimizerContext(ctx))
+    gate.validate.assert_awaited_once()
     assert signals[0].after_file.uri in fs.files
-    assert plan.metadata["proposal_gates"][0]["experience_improvement_gate"]["rejected_count"] == 1
+    proposal = gate.validate.await_args.args[1][0]
+    assert len(proposal.metadata["_experience_gate_contexts"]) == len(signals)
 
 
 @pytest.mark.asyncio
@@ -883,13 +937,16 @@ async def test_deferred_experience_learning_claims_and_applies_pending_trajector
         stored = MemoryFileUtils.read(fs.files[signal.after_file.uri])
         assert stored.extra_fields["experience_update"]["state"] == "processing"
         assert stored.content == original_content
-        return operations(
-            content=(
-                'dag = workflow("cancel")\n'
-                'c = check("duplicate requested")\n'
-                'r = tell("verify duplicate identity")\n'
-                "c.then(r)"
-            )
+        return await validated_operations(
+            provider,
+            operations(
+                content=(
+                    'dag = workflow("cancel")\n'
+                    'c = check("duplicate requested")\n'
+                    'r = tell("verify duplicate identity")\n'
+                    "c.then(r)"
+                )
+            ),
         )
 
     async def registry_snapshot(viking_fs, account_id, registry):
@@ -905,7 +962,6 @@ async def test_deferred_experience_learning_claims_and_applies_pending_trajector
         "openviking.session.compressor_v3.get_openviking_config",
         lambda: SimpleNamespace(
             agent_evolution=SimpleNamespace(
-                experience_gate_enabled=False,
                 dag_decider=None,
             ),
             jev=None,
@@ -1091,7 +1147,9 @@ async def test_inserted_tell_reaches_commit_persisted_trajectory_and_experience_
     provider._eval_memory = AsyncMock(return_value={"experience": {"error": "File not found"}})
     record = (await presented_trajectories(provider))[0]
     assert record["experience_execution"] == expected
-    assert record["evaluation"] == {"passed": True, "score": 1.0}
+    assert record["outcome"] == "success"
+    assert "evaluation" not in record
+    assert stored.extra_fields["evaluation"] == {"passed": True, "score": 1.0}
 
 
 @pytest.mark.asyncio
@@ -1160,7 +1218,7 @@ async def test_distinct_tasks_share_case_and_experience_but_keep_their_own_evide
         == "Respect the user's payment preference and confirm changes."
     )
     _model.get_completion_async.return_value = trajectory_program().replace(
-        "content=",
+        "steps=",
         "evaluation_criteria="
         + repr(
             json.dumps(
@@ -1173,7 +1231,7 @@ async def test_distinct_tasks_share_case_and_experience_but_keep_their_own_evide
                 ]
             )
         )
-        + ", content=",
+        + ", steps=",
         1,
     )
     records = []
@@ -1237,7 +1295,9 @@ async def test_distinct_tasks_share_case_and_experience_but_keep_their_own_evide
     )
     provider._ctx, provider._viking_fs = ctx, fs
     presented = await presented_trajectories(provider)
-    assert [item["evaluation"]["passed"] for item in presented] == [True, False]
+    assert [item["outcome"] for item in presented] == ["success", "failure"]
+    assert all("evaluation" not in item for item in presented)
+    assert [record.metadata["evaluation"]["passed"] for record in records] == [True, False]
     assert all("task_spec" not in item and "source_session_uri" not in item for item in presented)
     assert len({record.metadata["source_session_uri"] for record in records}) == 2
 
@@ -1335,12 +1395,13 @@ async def test_outcome_roundtrip_persists_diagnostics_without_synthetic_steps(
     trajectory = run.trajectories[0]
     stored = MemoryFileUtils.read(fs.files[trajectory.uri], uri=trajectory.uri)
     result = yaml.safe_load(stored.content.split("```yaml\n", 1)[1].split("\n```\n\n", 1)[0])
-    assert result["evaluation"] == {
+    assert result["outcome"] == "failure"
+    assert result["evaluation"] == {"details": {"info": {"note": note}}}
+    assert stored.extra_fields["evaluation"] == {
         "passed": False,
         "score": 0.0,
         "details": {"info": {"note": note}},
     }
-    assert stored.extra_fields["evaluation"] == result["evaluation"]
     assert payload["external_evaluation"]["metadata"]["evaluation_result"] == raw_result
     # An empty Case rubric has no per-criterion judgments; external diagnostics stay intact.
     assert result["evaluation_criteria"] == []
@@ -1358,3 +1419,107 @@ async def test_outcome_roundtrip_persists_diagnostics_without_synthetic_steps(
     await observe(analyzer, run, policies, context)
     assert MemoryFileUtils.read(fs.files[trajectory.uri]).content == stored.content
     model.get_completion_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_trajectory_template_renders_once_and_lifecycle_keeps_frozen_body(setup_observation):
+    from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
+
+    fs, ctx, model, analyzer, context, policies = setup_observation
+    registry = MemoryTypeRegistry()
+    schema = registry.get("trajectories")
+    assert schema.content_template
+    schema.content_template = schema.content_template.replace(
+        "# Trajectory Record", "# Template-owned Trajectory"
+    )
+    context.memory_registry = registry
+    run = analysis(passed=False)
+    await observe(analyzer, run, policies, context)
+    memory = run.metadata["trajectory_memory"]
+    frozen = memory.content
+    assert frozen.startswith("# Template-owned Trajectory\n\n```yaml\n")
+    assert "# Trajectory Record" not in frozen
+    assert frozen.count("# Template-owned Trajectory") == 1
+    assert frozen.endswith(STORED_OBSERVATION)
+
+    # Neither lifecycle updates nor re-reading the same extraction may apply a new
+    # template to the already rendered body (or call the extraction model again).
+    schema.content_template = "{{ content | deliberately_missing_filter }}"
+    compressor = object.__new__(SessionCompressorV3)
+    for state in ("processing", "applied"):
+        memory = await compressor._write_trajectory_update_state(
+            viking_fs=fs, memory=memory, ctx=ctx, state=state, batch_id="test-batch"
+        )
+        assert memory.content == frozen
+        assert memory.extra_fields["experience_update"]["state"] == state
+    await observe(analyzer, run, policies, context)
+    assert run.trajectories[0].content == frozen
+    model.get_completion_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_invalid_trajectory_template_does_not_persist_an_unrendered_body(setup_observation):
+    from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
+
+    fs, _ctx, _model, analyzer, context, policies = setup_observation
+    registry = MemoryTypeRegistry()
+    registry.get("trajectories").content_template = "{{ content | deliberately_missing_filter }}"
+    context.memory_registry = registry
+    with pytest.raises(ValueError, match="deliberately_missing_filter"):
+        await observe(analyzer, analysis(passed=False), policies, context)
+    assert not any("/memories/trajectories/" in uri for uri in fs.files)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auto_forwarded", [False, True])
+async def test_communication_provenance_reaches_trajectory_model_input(
+    setup_observation, auto_forwarded
+):
+    from benchmark.tau2.train.rollout_executor_vikingbot import _build_rollout_messages
+    from openviking.session.compressor_v3 import (
+        _training_conversation_messages,
+        _training_outcome_from_messages,
+    )
+    from openviking.session.train.components.session_commit import build_commit_messages
+
+    _fs, _ctx, model, analyzer, context, policies = setup_observation
+    run = analysis()
+    run.rollout.messages = _build_rollout_messages(
+        system_prompt="Use communicate_with_user to speak to the user.",
+        user_prompt="Cancel A.",
+        tools_used=[
+            {
+                "tool_name": "communicate_with_user",
+                "args": {"content": "Please confirm cancellation of A."},
+                "result": "Yes.",
+                "auto": auto_forwarded,
+            }
+        ],
+        final_content="A plain final response.",
+    )
+    run.rollout.evaluation = run.evaluation
+    run.metadata["experience_execution"] = {
+        f"{ROOT}/case_a.md": {
+            "delivered_advice": [
+                {"slot_name": "tell_comm_tool", "instruction": "Use communicate_with_user."}
+            ]
+        }
+    }
+    # Exercise the actual commit serializer, message reconstruction and metadata removal.
+    wire_messages = json.loads(json.dumps(build_commit_messages(run.rollout)))
+    committed = [Message.from_dict({"id": f"m{i}", **m}) for i, m in enumerate(wire_messages)]
+    run.evaluation, _ = _training_outcome_from_messages(committed)
+    run.rollout.messages = _training_conversation_messages(committed)
+    await observe(analyzer, run, policies, context)
+    model.get_completion_async.assert_awaited_once()
+    request = model.get_completion_async.await_args.kwargs["messages"]
+    payload = next(json.loads(m["content"]) for m in request if m["content"].startswith('{"case":'))
+    steps = payload["source_steps"]
+    assert [step["type"] for step in steps] == ["user", "user", "assistant", "user", "assistant"]
+    prefix = "auto-forwarded via" if auto_forwarded else "via"
+    assert steps[2]["content"] == (
+        f"[{prefix} communicate_with_user]\nPlease confirm cancellation of A."
+    )
+    assert steps[3]["content"] == "Yes."
+    assert steps[4]["content"] == "A plain final response."
+    assert payload["injected_actions"][0]["slot_name"] == "tell_comm_tool"

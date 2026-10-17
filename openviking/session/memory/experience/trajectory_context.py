@@ -15,7 +15,7 @@ from typing import Any, Dict, List
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import ResolvedOperations
 from openviking.session.memory.experience.dag import clip_evidence_summary, tool_evidence_summary
-from openviking.session.memory.experience.feedback import validate_experience_effects
+from openviking.session.memory.experience.feedback import normalize_action_scores
 from openviking.session.memory.experience.rubric import snapshot_rubric_results
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
@@ -64,7 +64,7 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
         outcome: str = "",
         target_uri: str = "",
         source_steps: list[dict[str, str]] | None = None,
-        injected_experiences: list[dict[str, Any]] | None = None,
+        injected_actions: list[dict[str, Any]] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -83,9 +83,10 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
         self.outcome = outcome
         self.target_uri = target_uri
         self.source_steps = source_steps
-        self.injected_experiences = list(injected_experiences or [])
-        self.experience_effect_sources = {
-            item["id"]: item["experience_uri"] for item in self.injected_experiences
+        self.injected_actions = list(injected_actions or [])
+        self.action_score_sources = {
+            item["id"]: {key: item[key] for key in ("experience_uri", "slot_name", "instruction")}
+            for item in self.injected_actions
         }
         self._skill_provider = SessionSkillContextProvider(*args, **kwargs)
         self._sync_skill_provider_state()
@@ -108,33 +109,45 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
             setattr(skill_provider, attr, getattr(self, attr))
 
     def instruction(self) -> str:
+        language_instruction = f"Write new prose in {self.get_output_language()}.\n"
         if self.source_steps is not None:
             schema = self._get_registry().get(TRAJECTORY_MEMORY_TYPE)
-            content_field = next(
-                (field for field in schema.fields if field.name == "content"), None
+            text_fields = {
+                field.name: field
+                for field in schema.fields
+                if field.name in {"context_rules", "steps"}
+            }
+            if set(text_fields) != {"context_rules", "steps"} or any(
+                not str(field.description or "").strip() for field in text_fields.values()
+            ):
+                raise ValueError(
+                    "Trajectory context_rules and steps require extraction instructions"
+                )
+            field_instructions = "\n\n".join(
+                f"{name}:\n{text_fields[name].description.strip()}"
+                for name in ("context_rules", "steps")
             )
-            if content_field is None or not str(content_field.description or "").strip():
-                raise ValueError("Trajectory content field requires extraction instructions")
             return (
-                f"{content_field.description.strip()}\n"
+                language_instruction + field_instructions + "\n"
                 "Create exactly one Trajectory and no other memory operation. Use:\n"
-                "sdk.create_trajectories(trajectory_name=..., case_name=..., outcome=..., "
-                "evaluation_criteria='<JSON list>', experience_effects='<JSON object>', "
-                "content='''# Session Context\n<relevant verbatim rules, or empty>\n\n"
-                "# Trajectory\n1. `user` factual step\n...''')\n"
-                "then sdk.commit(). The fixed values are:\n"
-                f"trajectory_name={self.trajectory_name!r}\n"
-                f"case_name={self.case_name!r}\n"
-                f"outcome={self.outcome!r}\n"
-                "Put both sections inside the same triple-single-quoted content argument. "
+                "sdk.create_trajectories("
+                "context_rules='''<relevant verbatim rules, or empty>''', "
+                "steps='''1. `user` factual step\n...''', "
+                "evaluation_criteria=r'''<YAML list>''', action_scores=r'''<YAML list>''')\n"
+                "then sdk.commit(). The server supplies the trajectory identity, canonical Case, "
+                "outcome and lifecycle metadata. Do not generate those fields.\n"
+                "Keep context_rules and steps as separate triple-single-quoted string arguments. "
+                "Do not add section titles; the content template renders them. "
                 "System rules in source_steps are context, not dialogue steps; do not emit "
                 "a step such as 'user received the policy'. Genuine user policy quotations "
                 "and assistant explanations remain dialogue. "
-                "Assess only supplied injected_experiences in experience_effects; keep the "
-                "content factual. Unknown effects belong in none of the three arrays."
+                "Assess each supplied injected action in action_scores; keep steps factual. "
+                "Use 1 for supported user-goal benefit or -1 for supported side effects. "
+                "Otherwise omit score and explain why; do not use 0 or null."
             )
         return (
-            "Compress each supplied user message, assistant message, Experience Reminder and tool "
+            language_instruction
+            + "Compress each supplied user message, assistant message, Experience Reminder and tool "
             "record into one minimal factual step in the same order. Use system rules only as "
             "Session Context, never as numbered execution steps. Preserve exact relevant "
             "values. Do not analyze causes, write a future procedure or invent a corrected path."
@@ -169,7 +182,7 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
                             "task_spec": self.task_spec,
                             "external_evaluation": self.external_evaluation,
                             "source_steps": self.source_steps,
-                            "injected_experiences": self.injected_experiences,
+                            "injected_actions": self.injected_actions,
                         },
                         ensure_ascii=False,
                     ),
@@ -198,6 +211,17 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
         self._sync_skill_provider_state(include_extract_context=True)
         return self._skill_provider.customize_tool_schema(tool_name, schema)
 
+    def prepare_operation_fields(self, memory_type: str, fields: dict[str, Any]) -> dict[str, Any]:
+        """Supply server-owned identity before the normal URI/isolation resolution."""
+        if memory_type != TRAJECTORY_MEMORY_TYPE or self.source_steps is None:
+            return fields
+        return {
+            **fields,
+            "trajectory_name": self.trajectory_name,
+            "case_name": self.case_name,
+            "outcome": self.outcome,
+        }
+
     def validate_resolved_operations(self, operations: ResolvedOperations) -> list[dict[str, Any]]:
         if self.source_steps is None:
             return []
@@ -215,11 +239,9 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
             criteria = snapshot_rubric_results(
                 operation.memory_fields.get("evaluation_criteria", []), self.rubric
             )
-            effects = validate_experience_effects(
-                operation.memory_fields.get(
-                    "experience_effects", {"positive_ids": [], "negative_ids": [], "weak_ids": []}
-                ),
-                self.experience_effect_sources,
+            scores = normalize_action_scores(
+                operation.memory_fields.get("action_scores", []),
+                self.action_score_sources,
             )
         except ValueError as exc:
             return [{"error": str(exc)}]
@@ -228,9 +250,9 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
                 "trajectory_name": self.trajectory_name,
                 "case_name": self.case_name,
                 "outcome": self.outcome,
-                "experience_effects": effects,
+                "action_scores": scores,
                 "evaluation_criteria": criteria,
-                "experience_effect_sources": dict(self.experience_effect_sources),
+                "action_score_sources": dict(self.action_score_sources),
             }
         )
         operation.uris = [self.target_uri]
@@ -244,9 +266,9 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
     def render_operation_repair(errors: list[dict[str, Any]]) -> str:
         return (
             "The Trajectory operation was invalid. Re-emit the complete Python SDK program with "
-            "exactly one sdk.create_trajectories(...) and sdk.commit(). Keep content as a "
-            "triple-single-quoted string ('''...'''). Follow the suggested context/trajectory layout when useful, "
-            "but do not change content merely to match a heading, numbering or step count. Do not "
+            "exactly one sdk.create_trajectories(...) and sdk.commit(). Keep context_rules and steps "
+            "each as a triple-single-quoted string ('''...'''). The template generates section titles; "
+            "do not change the extracted text merely to match numbering or a step count. Do not "
             "emit raw Markdown outside the SDK call. Errors: "
             + json.dumps(errors, ensure_ascii=False)
         )

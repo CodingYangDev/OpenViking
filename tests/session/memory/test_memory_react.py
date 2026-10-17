@@ -188,7 +188,7 @@ class TestExtractLoopFinalJsonRetry:
             filename_template="preferences.md",
             fields=[],
         )
-        context_provider = MagicMock()
+        context_provider = MagicMock(prepare_operation_fields=None)
         context_provider.get_memory_schemas.return_value = [schema]
         context_provider.read_file_contents = (
             {

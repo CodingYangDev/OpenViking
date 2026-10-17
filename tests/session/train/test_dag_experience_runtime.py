@@ -434,3 +434,57 @@ async def test_delivery_save_preserves_latest_session_object(tmp_path):
     restored = SessionManager(tmp_path).get_or_create(key)
     assert restored.messages == [{"role": "user", "content": "newer message"}]
     assert restored.metadata["delivered_experience_advice"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("save_fails", [False, True])
+async def test_injected_advice_names_are_captured_before_persistence(
+    tmp_path, monkeypatch, save_fails
+):
+    runtime = Tau2DagExperienceRuntime()
+    bind(runtime, tmp_path)
+    payload = advice(slot="require_chinese", text="Communicate clearly.")
+    payload["instructions"].extend(
+        advice(slot="ask_reason", text="Ask for the reason.", node_id=2)["instructions"]
+    )
+    runtime.client = client(payload)
+    note = await recall(runtime)
+    captured = {"role": "user", "content": note, "after_tool_count": 3}
+    original = copy.deepcopy(captured)
+    if save_fails:
+        monkeypatch.setattr(runtime, "_save", AsyncMock(side_effect=OSError("disk error")))
+        with pytest.raises(OSError, match="disk error"):
+            await runtime.record_injected(note, captured_message=captured)
+    else:
+        await runtime.record_injected(note, captured_message=captured)
+    assert captured == {**original, "advice_names": ["require_chinese", "ask_reason"]}
+    assert "require_chinese" not in note and "ask_reason" not in note
+    assert len(runtime._delivered) == 2
+
+
+@pytest.mark.asyncio
+async def test_identical_reminders_capture_their_own_advice_names(tmp_path):
+    runtime = Tau2DagExperienceRuntime()
+    bind(runtime, tmp_path)
+    runtime.client = client()
+    runtime.client.search_advice.side_effect = [advice(slot="first"), advice(slot="second")]
+    captures = []
+    for _ in range(2):
+        note = await recall(runtime)
+        captured = {"role": "user", "content": note, "after_tool_count": 0}
+        await runtime.record_injected(note, captured_message=captured)
+        captures.append(captured)
+    assert captures[0]["content"] == captures[1]["content"]
+    assert [x["advice_names"] for x in captures] == [["first"], ["second"]]
+
+
+@pytest.mark.asyncio
+async def test_mismatched_capture_is_not_annotated_with_advice_names(tmp_path):
+    runtime = Tau2DagExperienceRuntime()
+    bind(runtime, tmp_path)
+    runtime.client = client()
+    note = await recall(runtime)
+    captured = {"content": "a different message"}
+    await runtime.record_injected(note, captured_message=captured)
+    assert captured == {"content": "a different message"}
+    assert len(runtime._delivered) == 1

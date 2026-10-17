@@ -189,7 +189,8 @@ def test_tau2_rollout_messages_use_completed_structured_tool_parts():
     )
 
 
-def test_tau2_communicate_with_user_renders_as_dialogue():
+@pytest.mark.parametrize("auto_forwarded", [False, True])
+def test_tau2_communicate_with_user_renders_as_dialogue(auto_forwarded):
     from benchmark.tau2.train.rollout_executor import _build_rollout_messages
     from openviking.message import TextPart, ToolPart
 
@@ -201,6 +202,7 @@ def test_tau2_communicate_with_user_renders_as_dialogue():
                 "tool_name": "communicate_with_user",
                 "args": {"content": "Could you provide your user ID?"},
                 "result": "Sure, it is emma_kim_9957.",
+                "auto": auto_forwarded,
             }
         ],
         final_content=None,
@@ -208,7 +210,11 @@ def test_tau2_communicate_with_user_renders_as_dialogue():
 
     assert rollout_messages[2].role == "assistant"
     assert isinstance(rollout_messages[2].parts[0], TextPart)
-    assert rollout_messages[2].parts[0].text == "Could you provide your user ID?"
+    prefix = "auto-forwarded via" if auto_forwarded else "via"
+    assert rollout_messages[2].parts[0].text == (
+        f"[{prefix} communicate_with_user]\nCould you provide your user ID?"
+    )
+    assert len(rollout_messages) == 4
     assert rollout_messages[3].role == "user"
     assert isinstance(rollout_messages[3].parts[0], TextPart)
     assert rollout_messages[3].parts[0].text == "Sure, it is emma_kim_9957."
@@ -216,6 +222,53 @@ def test_tau2_communicate_with_user_renders_as_dialogue():
         isinstance(part, ToolPart) and part.tool_name == "communicate_with_user"
         for message in rollout_messages
         for part in message.parts
+    )
+
+
+def test_native_communication_call_provenance_does_not_label_plain_assistant_text():
+    from benchmark.tau2.train.rollout_executor_native import _build_rollout_messages_from_simulation
+    from openviking.message import ToolPart
+
+    tool_input = {"content": "Could you provide your user ID?"}
+    simulation = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    SimpleNamespace(id="comm1", name="communicate_with_user", arguments=tool_input)
+                ],
+            ),
+            SimpleNamespace(role="tool", id="comm1", content="My user ID is U1."),
+            SimpleNamespace(role="assistant", content="A plain response."),
+        ]
+    )
+    messages = _build_rollout_messages_from_simulation(simulation=simulation)
+    assert [m.role for m in messages] == ["assistant", "user", "assistant"]
+    assert [m.content for m in messages] == [
+        "[via communicate_with_user]\nCould you provide your user ID?",
+        "My user ID is U1.",
+        "A plain response.",
+    ]
+    assert not any(isinstance(p, ToolPart) for m in messages for p in m.parts)
+    assert tool_input == {"content": "Could you provide your user ID?"}
+
+
+@pytest.mark.parametrize(
+    "tool_input", [None, {}, {"content": None}, {"content": ""}, {"content": " \n"}]
+)
+def test_empty_communication_does_not_create_a_provenance_only_step(tool_input):
+    from benchmark.tau2.train._rollout_helpers import _communicate_text_from_tool_input
+
+    assert _communicate_text_from_tool_input(tool_input) == ""
+
+
+def test_communication_provenance_preserves_original_text_whitespace():
+    from benchmark.tau2.train._rollout_helpers import _communicate_text_from_tool_input
+
+    text = "  Please confirm.\n"
+    assert _communicate_text_from_tool_input({"content": text}) == (
+        "[via communicate_with_user]\n" + text
     )
 
 
@@ -788,7 +841,6 @@ def test_tau2_rollout_backend_factory_selects_vikingbot(monkeypatch):
             "max_iterations": 9,
         },
         concurrency=2,
-        rollout_language="zh",
     )
 
     assert isinstance(executor, FakeVikingBotExecutor)
@@ -797,7 +849,6 @@ def test_tau2_rollout_backend_factory_selects_vikingbot(monkeypatch):
         "concurrency": 2,
         "keep_default_tools": True,
         "max_iterations": 9,
-        "rollout_language": "zh",
     }
 
 
@@ -1396,3 +1447,93 @@ def test_native_executor_keeps_termination_in_structured_evaluation(monkeypatch)
         "termination_reason": "max_steps",
         "info": {"note": "Simulation stopped at step budget"},
     }
+
+
+def test_named_experience_messages_keep_capture_text_and_tool_positions():
+    from copy import deepcopy
+
+    from benchmark.tau2.train.rollout_executor_vikingbot import _build_rollout_messages
+    from openviking.session.memory.experience.trajectory_context import trajectory_source_steps
+
+    note = "[Experience Reminder]\n\n### 建议 1\n\n**建议**\nKeep the original guidance."
+    captures = [
+        {"content": note, "after_tool_count": 0, "advice_names": ["require_chinese", "ask_reason"]},
+        {"content": note, "after_tool_count": 1, "advice_names": ["check_total"]},
+    ]
+    before = deepcopy(captures)
+    messages = _build_rollout_messages(
+        system_prompt="policy",
+        user_prompt="request",
+        final_content=None,
+        tools_used=[{"tool_name": "get_booking", "args": {"id": "A"}, "result": "found"}],
+        experience_messages=captures,
+    )
+    steps = trajectory_source_steps(messages)
+    assert [x["type"] for x in steps] == [
+        "user",
+        "user",
+        "experience_reminder",
+        "tool:get_booking",
+        "experience_reminder",
+    ]
+    assert steps[2]["content"] == note.replace(
+        "[Experience Reminder]", "[Experience Reminder] require_chinese, ask_reason", 1
+    )
+    assert steps[4]["content"] == note.replace(
+        "[Experience Reminder]", "[Experience Reminder] check_total", 1
+    )
+    assert captures == before
+
+
+@pytest.mark.asyncio
+async def test_run_agent_captures_names_without_changing_online_advice(tmp_path):
+    from copy import deepcopy
+
+    from test_dag_experience_runtime import advice, client
+    from vikingbot.config.schema import SessionKey
+    from vikingbot.session.manager import SessionManager
+
+    from benchmark.tau2.train.dag_experience_runtime import Tau2DagExperienceRuntime
+    from benchmark.tau2.train.rollout_executor_vikingbot import _run_agent
+
+    runtime = Tau2DagExperienceRuntime()
+    runtime.client = client(advice(slot="require_chinese", text="Communicate clearly."))
+    inserted = []
+
+    async def run_loop(**kwargs):
+        async for note in kwargs["experience_context_provider"](
+            kwargs["messages"], before_tools=False
+        ):
+            message = {"role": "user", "content": note}
+            kwargs["messages"].append(message)
+            before = deepcopy(message)
+            kwargs["captured_experience_messages"].append({**message, "after_tool_count": 0})
+            await kwargs["experience_context_injected"](note)
+            assert message == before
+            inserted.append(note)
+        return None, None, [], {}, 1
+
+    agent = SimpleNamespace(
+        sessions=SessionManager(tmp_path),
+        context=SimpleNamespace(build_messages=AsyncMock(return_value=[])),
+        _tau2_dag_runtime=runtime,
+        _run_agent_loop=AsyncMock(side_effect=run_loop),
+    )
+    result = await _run_agent(
+        agent=agent,
+        system_prompt="policy",
+        user_prompt="request",
+        session_key=SessionKey(type="cli", channel_id="test", chat_id="names"),
+        sender_id="user",
+        keep_default_tools=True,
+    )
+    assert len(inserted) == 1 and "require_chinese" not in inserted[0]
+    assert result[5] == inserted[0]
+    assert result[6] == [
+        {
+            "role": "user",
+            "content": inserted[0],
+            "after_tool_count": 0,
+            "advice_names": ["require_chinese"],
+        }
+    ]

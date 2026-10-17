@@ -48,8 +48,8 @@ fields:
         precedence over the failed trajectory's interpretation. Derive a narrow runtime-observable
         correction or exception from differing inputs and actions, not a full workflow or hardcoded
         answer. A failed trajectory need not independently prove the successful comparison action.
-      - When an existing experience was delivered before the relevant decision boundary and the
-        corresponding failure still occurred, require a concrete decision-rule or action delta.
+      - Keep correct, applicable guidance even if ignored. Update only to fix evidence-backed
+        flaws in content, wording, scope or timing, with a concrete decision-rule or action delta.
         Reject paraphrases, stronger wording or extra checklists that preserve the same decision logic.
       - Ground required behavior in runtime-visible evidence and preserve nearby correct cases.
         Do not invent hidden causes, unsupported policy rules or tool capabilities.

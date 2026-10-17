@@ -14,6 +14,8 @@ from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry, get_default_registry
+from openviking.session.memory.memory_updater import MemoryUpdateResult
+from openviking.session.memory.merge_op.sum import SumOp
 from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
 from openviking.session.memory.streaming_memory_updater import (
     MemoryUpdateRequest,
@@ -42,7 +44,7 @@ def case_memory(name, *, user="u", memory_type="cases"):
     )
 
 
-def selection_loop(monkeypatch, *, output_format, invalid=None):
+def selection_loop(monkeypatch, *, output_format, invalid=None, execution_count=None):
     monkeypatch.setattr(get_openviking_config().memory, "extraction_output_format", output_format)
     registry = MemoryTypeRegistry(load_schemas=False)
     registry.register(get_default_registry().get("cases"))
@@ -54,6 +56,8 @@ def selection_loop(monkeypatch, *, output_format, invalid=None):
             memory_type="entities" if invalid == "wrong_type" else "cases",
         ),
     ]
+    if execution_count is not None:
+        memories[1].extra_fields["execution_count"] = execution_count
     files = {m.uri: MemoryFileUtils.write(m) for m in memories}
     fs = SimpleNamespace(
         read_file=AsyncMock(side_effect=lambda uri, **kwargs: files[uri]),
@@ -77,6 +81,7 @@ def selection_loop(monkeypatch, *, output_format, invalid=None):
         ids.append(page_id)
         provider.read_file_contents[memory.uri] = memory
         payload[name] = {**memory.to_metadata(), "page_id": page_id}
+    payload["prefetched_search"] = [payload["first"], payload["second"]]
     if invalid == "unread":
         del provider.read_file_contents[memories[1].uri]
     prefetch = []
@@ -89,6 +94,7 @@ def selection_loop(monkeypatch, *, output_format, invalid=None):
                 f"{name} = sdk.read(uri={memory.uri!r})"
                 for name, memory in zip(["first", "second"], memories, strict=True)
             )
+            + "\nprefetched_search = [first, second]"
         },
         payload,
     )
@@ -115,13 +121,86 @@ def selection_loop(monkeypatch, *, output_format, invalid=None):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("execution_count", [None, 7])
 @pytest.mark.parametrize("output_format", ["python", "json"])
+async def test_count_only_case_update_associates_execution_without_explicit_selection(
+    monkeypatch, execution_count, output_format
+):
+    loop, model, files, fs, ctx, _registry, memories = selection_loop(
+        monkeypatch, output_format=output_format, execution_count=execution_count
+    )
+    target = memories[1]
+    if output_format == "python":
+        # No alias assignment or commit(cases=...): the update itself must associate the Case.
+        program = "prefetched_search[1].update(execution_count=1)"
+    else:
+        page_id = loop.context_provider.get_extract_context().page_id_map.get_page_id(target.uri)
+        program = json.dumps(
+            {
+                "cases": [
+                    {
+                        "page_id": page_id,
+                        **{
+                            name: target.extra_fields[name]
+                            for name in ("case_name", "task_signature", "input")
+                        },
+                        "execution_count": 1,
+                    }
+                ]
+            }
+        )
+    model.get_completion_async.return_value = program
+
+    operations, _ = await loop.run()
+
+    assert operations.errors == []
+    assert operations.case_references == []
+    assert operations.delete_file_contents == []
+    (update,) = operations.upsert_operations
+    assert update.uris == [target.uri]
+    assert not update.create_only
+    assert update.memory_fields["execution_count"] == 1  # Delta, not old total + 1.
+    assert update.memory_fields.get("rubric") is None
+    model.get_completion_async.assert_awaited_once()
+
+    # Apply the schema's SUM semantics and resolve the Case passed to trajectory extraction.
+    target.extra_fields["execution_count"] = await SumOp().apply(
+        execution_count, update.memory_fields["execution_count"]
+    )
+    assert target.extra_fields["execution_count"] == (execution_count or 0) + 1
+    files[target.uri] = MemoryFileUtils.write(target)
+    apply_result = MemoryUpdateResult()
+    apply_result.add_edited(target.uri)
+    cases = await _canonical_cases_from_update_result(
+        operations=operations,
+        requested_operations=operations,
+        result=apply_result,
+        viking_fs=fs,
+        ctx=ctx,
+    )
+    assert [case.name for case in cases] == ["second"]
+    assert cases[0].metadata["memory_fields"]["execution_count"] == (execution_count or 0) + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output_format, program",
+    [
+        ("python", None),
+        ("json", None),
+        ("python", "chosen = prefetched_search[1]"),
+        ("python", "chosen = prefetched_search[1]\nsdk.commit()"),
+        ("python", "chosen = prefetched_search[1]\nalias = chosen"),
+    ],
+)
 async def test_selected_case_without_writes_reaches_compressor_and_does_not_select_all_candidates(
-    monkeypatch, output_format
+    monkeypatch, output_format, program
 ):
     loop, model, files, fs, ctx, registry, memories = selection_loop(
         monkeypatch, output_format=output_format
     )
+    if program is not None:
+        model.get_completion_async.return_value = program
     before = dict(files)
     operations, _ = await loop.run()
     assert operations.upsert_operations == [] and operations.delete_file_contents == []
@@ -212,7 +291,7 @@ async def test_reading_candidates_without_selection_does_not_associate_them(
         "sdk.commit(cases=['viking://user/u/memories/cases/second.md'])",
         "second.delete()\nsdk.commit(cases=[second])",
         "created = sdk.create_cases(case_name='new', task_signature='New domain', "
-        "input='{}', rubric='[]')\nsdk.commit(cases=[created])",
+        "input='{}', rubric='[]', execution_count=1)\nsdk.commit(cases=[created])",
     ],
 )
 async def test_python_case_selection_rejects_invalid_objects(monkeypatch, program):
@@ -243,4 +322,125 @@ async def test_json_case_selection_does_not_coerce_invalid_page_ids(monkeypatch,
     assert operations is None
     assert error
     assert files == before
+    fs.write_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "program, selected",
+    [
+        ("existing_case = prefetched_search[0]", [0]),
+        ("a = first\nb = second", [0, 1]),
+        ("a = first\nb = second\nsdk.commit(cases=[b])", [1]),
+        ("chosen = second\nsdk.commit(cases=[])", []),
+        ("chosen = second\nchosen.delete()", []),
+        ("chosen = second\nchosen.rubric.overwrite('[]')", []),
+        ("existing_case = {'memory_type': 'cases', 'page_id': 2}", []),
+    ],
+)
+async def test_python_case_binding_respects_explicit_override_and_write_operations(
+    monkeypatch, program, selected
+):
+    loop, model, files, fs, _ctx, _registry, memories = selection_loop(
+        monkeypatch, output_format="python"
+    )
+    model.get_completion_async.return_value = program
+    before = dict(files)
+    result, _ = await loop.run()
+    assert [ref.uris for ref in result.case_references] == [[memories[i].uri] for i in selected]
+    if ".rubric.overwrite" in program:
+        assert len(result.upsert_operations) == 1
+    if ".delete()" in program:
+        assert len(result.delete_file_contents) == 1
+    assert files == before
+    fs.write_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_python_implicit_case_selection_still_enforces_isolation(monkeypatch):
+    loop, model, files, fs, _ctx, _registry, _memories = selection_loop(
+        monkeypatch, output_format="python", invalid="foreign"
+    )
+    model.get_completion_async.return_value = "chosen = prefetched_search[1]"
+    before = dict(files)
+    with pytest.raises(ValueError, match="Selected Case"):
+        await loop.run()
+    assert files == before
+    fs.write_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_binding_contract_is_only_for_case_selection(monkeypatch):
+    loop, _model, _files, _fs, _ctx, _registry, _memories = selection_loop(
+        monkeypatch, output_format="python"
+    )
+    await loop.run()
+    contract = loop._output_protocol.render_contract(loop._output_context)
+    assert "Binding a matched, loaded Case to a local variable selects it" in contract
+    assert "override" in contract and "cases=[]" in contract
+
+
+@pytest.mark.parametrize(
+    "memory_type, fields, field",
+    [
+        ("entities", {"category": "people", "name": "alice"}, "content"),
+        (
+            "events",
+            {
+                "event_name": "visit",
+                "goal": "Meet Alice",
+                "summary": "Original",
+                "ranges": "0",
+            },
+            "summary",
+        ),
+    ],
+)
+def test_event_and_entity_bindings_still_require_writes_not_case_selection(
+    memory_type, fields, field
+):
+    from test_extraction_output_protocol import _bind, _context
+
+    from openviking.session.memory.extraction_output_protocol import (
+        create_extraction_output_protocol,
+    )
+
+    memory = MemoryFile(
+        uri=f"viking://user/u/memories/{memory_type}/known.md",
+        memory_type=memory_type,
+        content="Original",
+        extra_fields=fields,
+    )
+    context = _context(
+        [get_default_registry().get("cases"), get_default_registry().get(memory_type)],
+        files=[case_memory("candidate"), memory],
+        template_context={"language": "en"},
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    binding = f"existing_case = {memory_type}_1"
+    read_only, error = protocol.parse(binding, context)
+    assert error is None and read_only.is_empty()
+    assert read_only.selected_case_ids == []
+    updated, error = protocol.parse(
+        binding + f"\nexisting_case.{field}.overwrite('Changed')", context
+    )
+    assert error is None and updated.selected_case_ids == []
+    assert updated.model_dump()[memory_type][0][field] == "Changed"
+
+
+@pytest.mark.asyncio
+async def test_new_case_binding_still_uses_creation_not_a_reference(monkeypatch):
+    loop, model, _files, fs, _ctx, _registry, _memories = selection_loop(
+        monkeypatch, output_format="python"
+    )
+    fs._uri_to_path = lambda uri, **kwargs: uri
+    model.get_completion_async.return_value = (
+        "created = sdk.create_cases(case_name='new', task_signature='New domain', "
+        "input='{}', rubric='[]', execution_count=1)"
+    )
+    result, _ = await loop.run()
+    assert not result.case_references
+    assert len(result.upsert_operations) == 1
+    assert result.upsert_operations[0].memory_type == "cases"
     fs.write_file.assert_not_awaited()

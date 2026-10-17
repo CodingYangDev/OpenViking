@@ -189,6 +189,7 @@ def make_loop(fs, outputs, *, max_iterations=1):
     record_schema = schema()
     extract_context = ExtractContext([])
     provider = MagicMock()
+    provider.prepare_operation_fields = None
     provider.get_memory_schemas.return_value = [record_schema]
     provider.get_output_language.return_value = "en"
     provider.get_tools.return_value = ["eval"]

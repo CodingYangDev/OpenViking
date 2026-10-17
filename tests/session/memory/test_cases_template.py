@@ -38,25 +38,29 @@ def test_case_schema_groups_business_domains_without_changing_storage_contract(
     assert "Infer the business domain from the current service/task context" in description
     assert "one Case: airline_customer_service" not in description
     assert "Do not split a domain" in description
-    assert "sdk.commit(cases=[loaded_case])" in description
+    assert "matched_case.update(execution_count=1)" in description
     assert "selected_case_ids" in operations.model_fields
     assert "Do not group tasks merely because they share a broad domain" not in description
     assert "{{ language }}" not in description
     name_description = model.model_fields["case_name"].description
     assert "regardless of conversation language" in name_description
-    assert "Examples only, not prescribed identifiers or a fixed domain list" in name_description
+    assert "Never name a Case after a workflow" in name_description
     assert {field.name for field in schema.fields} == {
         "case_name",
         "task_signature",
         "input",
         "rubric",
+        "execution_count",
     }
     assert {field.name: field.merge_op for field in schema.fields} == {
         "case_name": MergeOp.IMMUTABLE,
         "task_signature": MergeOp.IMMUTABLE,
         "input": MergeOp.IMMUTABLE,
         "rubric": MergeOp.PATCH,
+        "execution_count": MergeOp.SUM,
     }
+    counter = next(field for field in schema.fields if field.name == "execution_count")
+    assert counter.field_type.value == "int64"
     fields = {
         "case_name": domain_name,
         "task_signature": f"Service scope for {domain_name}.",
@@ -84,6 +88,7 @@ def test_case_rubric_round_trips_through_protocol_template_and_learning(output_f
     )
     fields = {
         "case_name": "library_services",
+        "execution_count": 1,
         "task_signature": "办理图书借还、续借和预约请求。",
         "input": "基于当前借阅规则和读者提供的信息处理请求。\n保留工具字段的原始值。",
         "rubric": json.dumps(
@@ -110,6 +115,7 @@ def test_case_rubric_round_trips_through_protocol_template_and_learning(output_f
     operations, error = protocol.parse(program, context)
     assert error is None
     item = operations.cases[0]
+    assert item.execution_count == 1
     assert item.input == fields["input"] and item.rubric == fields["rubric"]
     uri = generate_uri(schema, fields, user_space="default")
     raw = MemoryFileUtils.write(
@@ -127,6 +133,8 @@ def test_case_rubric_round_trips_through_protocol_template_and_learning(output_f
     assert f"## Rubric\n```json\n{fields['rubric']}" in memory.content
     assert memory.extra_fields["input"] == fields["input"]
     assert memory.extra_fields["rubric"] == fields["rubric"]
+    assert memory.extra_fields["execution_count"] == 1
+    assert "execution_count" not in memory.content
     case = _memory_file_to_case(memory)
     assert case.input == {"summary": fields["input"]}
     assert case.rubric.description == ""

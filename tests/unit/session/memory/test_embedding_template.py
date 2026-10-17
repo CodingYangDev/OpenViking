@@ -77,7 +77,7 @@ class TestContentTemplateRendering:
 
         assert rendered.startswith("Road Trip | Body content | 2026")
 
-    def test_content_template_render_failure_is_logged_before_plain_content_fallback(self):
+    def test_content_template_render_failure_propagates_without_plain_content_fallback(self):
         memory_file = MemoryFile(
             content="Body content",
             extra_fields={"title": "Road Trip", "ranges": "0-1"},
@@ -86,19 +86,13 @@ class TestContentTemplateRendering:
             get_year=Mock(side_effect=RuntimeError("template render failed"))
         )
 
-        with patch(
-            "openviking.session.memory.utils.memory_file_utils.logger.exception"
-        ) as mock_logger_exception:
-            rendered = MemoryFileUtils.write(
+        with pytest.raises(RuntimeError, match="template render failed"):
+            MemoryFileUtils.write(
                 memory_file,
                 content_template="{{ title }} | {{ content }} | {{ extract_context.get_year(ranges) }}",
                 extract_context=extract_context,
             )
-
-        assert rendered.startswith("Body content")
-        mock_logger_exception.assert_called_once_with(
-            "Failed to render memory content template; using plain content fallback"
-        )
+        assert memory_file.content == "Body content"
 
 
 class TestEmbeddingTextConstruction:
@@ -151,9 +145,7 @@ class TestEmbeddingTextConstruction:
 
         embedding_msg = updater._vikingdb.enqueue_embedding_msg.await_args.args[0]
         assert embedding_msg.context_data["search_tags"] == tags
-        assert embedding_msg.context_data["_upsert_options"] == {
-            "search_tag_mode": expected_mode
-        }
+        assert embedding_msg.context_data["_upsert_options"] == {"search_tag_mode": expected_mode}
 
     @pytest.mark.asyncio
     async def test_trajectory_vectorization_adds_source_experience_search_tags(self):

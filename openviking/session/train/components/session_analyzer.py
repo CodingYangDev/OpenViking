@@ -16,7 +16,7 @@ from openviking.session.archive_store import is_storage_not_found
 from openviking.session.memory import ExtractLoop
 from openviking.session.memory.dataclass import MemoryFile, ResolvedOperations, StoredLink
 from openviking.session.memory.experience.feedback import (
-    injected_experiences,
+    injected_actions,
     record_experience_feedback_stats,
 )
 from openviking.session.memory.experience.trajectory_context import (
@@ -38,7 +38,6 @@ from openviking.session.train.components.trajectory_observation import (
     TRAJECTORY_FORMAT,
     execution_paths,
     observation_evidence,
-    render_trajectory_content,
     trajectory_evaluation_summary,
     trajectory_source_session_uri,
 )
@@ -159,7 +158,7 @@ class SessionRolloutAnalyzer:
                 outcome=outcome,
                 target_uri=uri,
                 source_steps=source_steps,
-                injected_experiences=injected_experiences(
+                injected_actions=injected_actions(
                     analysis.metadata.get("experience_execution") or {}
                 ),
                 memory_registry=registry,
@@ -223,17 +222,8 @@ class SessionRolloutAnalyzer:
                     ).model_dump()
                 )
             operation.memory_fields.update(fields)
-            # Freeze the same learning evidence into the body and structured fields.
-            # Later lifecycle writes must preserve this body, not render it again.
-            operation.memory_fields["content"] = render_trajectory_content(
-                Trajectory(
-                    name=identity,
-                    uri=uri,
-                    outcome=outcome,
-                    content=operation.memory_fields["content"],
-                    metadata={**operation.memory_fields, "source_session_uri": source},
-                )
-            )
+            # The common writer renders the schema's content_template from these fields
+            # once. Lifecycle updates preserve the resulting immutable body.
             operations.resolved_links = [StoredLink.model_validate(link) for link in links]
             lock = await _acquire_stable_operation_lease(operations, fs, ctx)
             try:

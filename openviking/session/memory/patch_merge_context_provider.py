@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from openviking.config.vlm import VLMHandle
 
 _SYSTEM_HIDDEN_FIELDS = {
+    "action_feedback",
+    "action_score_sources",
     # Relations are maintained by storage, not reconciled as model-editable fields.
     "links",
     "backlinks",

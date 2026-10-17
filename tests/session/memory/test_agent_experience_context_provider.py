@@ -18,8 +18,9 @@ from openviking.session.memory.experience.experience_context import (
 from openviking.session.train import Case, Rubric, Trajectory
 from openviking.session.train.components.trajectory_observation import (
     TRAJECTORY_FORMAT,
-    render_trajectory_content,
 )
+from openviking_cli.utils.config.memory_config import ActionFeedbackConfig
+from tests.session.train.test_fakes import render_trajectory_template
 
 
 def metadata(message):
@@ -48,17 +49,15 @@ def test_instruction_consolidates_trajectory_scope_without_dropping_distinct_evi
         "do not assume those headings or numbering exist",
         "Context rules describe that execution, not additional actions",
         "An empty context is not proof that no rules exist",
-        "Only explicitly failed checks are included",
-        "omitted checks are not proof of success",
-        "Overall outcome and evaluation remain authoritative",
-        "Successful runs are evidence of what happened, not complete SOPs to copy",
-        "preserve passed subcriteria from failed runs and state uncertainty; never invent success",
+        "Only failed entries are shown; omitted checks are not proof of success",
+        "These LLM judgments do not override external outcome/evaluation",
+        "Without successful comparisons, rely on direct evidence; do not invent success",
         "User messages define intent, tools establish facts, evaluation reports acceptance",
         "assistant statements can be wrong",
         "Apply the content schema's evidence and learning rules to resolve competing interpretations",
-        "checking its inputs, components and omitted fees against tool evidence",
-        "Multiple examples repeating one error are not proof that the behavior is valid",
-        "reminder trigger must hold before the failing action",
+        "Verify an assistant's calculation against tool evidence, including its inputs and omitted components",
+        "Repeated behavior alone is not proof of correctness",
+        "Trigger before the failing action",
         "not as causal proof, policy authority or a substitute for the source steps and evaluation",
         "not proof that an Ask or Call suggestion was executed",
         "Tell nodes in executed_nodes with true slot_values",
@@ -67,6 +66,72 @@ def test_instruction_consolidates_trajectory_scope_without_dropping_distinct_evi
         "or too broad may themselves need repair",
     ):
         assert constraint in instruction
+
+
+@pytest.mark.parametrize("language", ["en", "zh-CN"])
+def test_instruction_uses_one_candidate_local_analysis_sequence(language):
+    provider = AgentExperienceContextProvider(
+        messages=[],
+        case=Case("case_a", "cancel", {}, Rubric("r", "", [])),
+        target_uri="viking://user/u/memories/experiences/case_a.md",
+        source_session_uri="viking://session/s/archives/1",
+    )
+    provider._output_language = language
+    instruction = " ".join(provider.instruction().split())
+    steps = (
+        "1. Compare successful and failed runs with comparable requests, constraints and initial states",
+        "2. Locate this failure pattern's earliest correctable decision",
+        "3. Identify the trigger, minimal rule change, changed action or output",
+        "4. Reject advice already followed in the failed run",
+        "5. Keep independent corrections in separate subgraphs",
+    )
+    positions = []
+    for step in steps:
+        assert instruction.count(step) == 1
+        positions.append(instruction.index(step))
+    assert positions == sorted(positions)
+    for requirement in (
+        "differences relevant to an unmet evaluation criterion",
+        "Use visible evidence to explain the rule used and its effect on the result",
+        "why it could meet the criterion",
+        "Trigger before the failing action",
+        "find a change to its decision logic",
+        "Check counterexamples and preserve nearby correct behavior",
+        "each need only repair its own failure pattern",
+        "If the cause is unknown, use supported local verification or make no change",
+        "Without successful comparisons, rely on direct evidence; do not invent success",
+        "Emit restricted Python memory SDK code only, not a bare DAG program",
+        f"Write DAG descriptions in {language}",
+    ):
+        assert requirement in instruction
+    assert instruction.count("Only failed entries are shown") == 1
+    assert "First group runs by server-owned outcome" not in instruction
+    assert "Fix the earliest supported decision difference" not in instruction
+    # These rules already have one shared owner in the Experience schema.
+    assert "Reject paraphrases, stronger wording or extra checklists" not in instruction
+
+
+def test_schema_preserves_correct_ignored_guidance_without_duplicating_provider_rules():
+    provider = AgentExperienceContextProvider(
+        messages=[],
+        case=Case("case_a", "cancel", {}, Rubric("r", "", [])),
+        target_uri="viking://user/u/memories/experiences/case_a.md",
+        source_session_uri="viking://session/s/archives/1",
+    )
+    schema = provider._get_registry().get("experiences")
+    content = next(field for field in schema.fields if field.name == "content")
+    description = " ".join(content.description.split())
+    preservation = "Keep correct, applicable guidance even if ignored."
+    assert description.count(preservation) == 1
+    assert (
+        "Update only to fix evidence-backed flaws in content, wording, scope or timing, "
+        "with a concrete decision-rule or action delta."
+    ) in description
+    assert (
+        "Reject paraphrases, stronger wording or extra checklists that preserve the same decision logic."
+    ) in description
+    assert "corresponding failure still occurred, require" not in description
+    assert preservation not in provider.instruction()
 
 
 @pytest.mark.parametrize("error", ["File not found: missing.md", "Permission denied", "ReadError"])
@@ -85,6 +150,45 @@ def test_existing_experience_content_is_not_json_escaped_or_line_numbered():
     text = _existing_experience_message("experience", {"content": numbered})
     assert text.endswith(source)
     assert "\\n" not in text
+
+
+def test_existing_experience_feedback_is_compact_and_does_not_repeat_actions():
+    source = 'dag = workflow("review")\nfirst = tell("First instruction")\nsecond = tell("Second instruction")'
+    result = {
+        "content": source,
+        "action_feedback": {
+            "schema_version": 2,
+            "observed_trajectories": ["private_trajectory"],
+            "actions": {
+                slot: {
+                    "useful_count": 9,
+                    "not_useful_count": 1,
+                    "unscored_count": 100,
+                    "examples": {
+                        "useful": {
+                            "trajectory_uri": "private_uri",
+                            "evidence": "Helped\nwith scope",
+                        }
+                    },
+                }
+                for slot in ("second", "first")
+            },
+        },
+    }
+    before = copy.deepcopy(result)
+    text = _existing_experience_message("experience", result)
+    assert text.endswith(
+        "## action_feedback (system-owned, read-only)\n\n### unchanged\n"
+        "\n- first: positive 90.0% (9/10) — Helped with scope"
+        "\n- second: positive 90.0% (9/10) — Helped with scope"
+    )
+    assert "### revise" not in text and "private_" not in text
+    assert text.count("First instruction") == text.count("Second instruction") == 1
+    assert result == before
+    text = _existing_experience_message(
+        "experience", result, feedback_config=ActionFeedbackConfig(min_samples=11)
+    )
+    assert text.endswith(source) and "action_feedback" not in text
 
 
 @pytest.mark.asyncio
@@ -119,7 +223,7 @@ async def test_prefetch_reads_only_fixed_case_experience():
     )
     for trajectory in provider.trajectories:
         trajectory.metadata["trajectory_format"] = TRAJECTORY_FORMAT
-        trajectory.content = render_trajectory_content(trajectory)
+        trajectory.content = render_trajectory_template(trajectory)
     provider._eval_memory = AsyncMock(
         return_value={
             "experience": {
@@ -319,7 +423,7 @@ async def test_prefetch_does_not_promote_successful_communication_value_to_liter
     )
     for trajectory in provider.trajectories:
         trajectory.metadata["trajectory_format"] = TRAJECTORY_FORMAT
-        trajectory.content = render_trajectory_content(trajectory)
+        trajectory.content = render_trajectory_template(trajectory)
     provider._eval_memory = AsyncMock(return_value={"experience": {"error": "File not found"}})
 
     messages = provider.format_prefetch_messages(await provider.prefetch())
@@ -356,7 +460,7 @@ async def test_prefetch_keeps_each_sessions_rules_with_its_own_dialogue():
     )
     for trajectory in provider.trajectories:
         trajectory.metadata["trajectory_format"] = TRAJECTORY_FORMAT
-        trajectory.content = render_trajectory_content(trajectory)
+        trajectory.content = render_trajectory_template(trajectory)
     provider._eval_memory = AsyncMock(return_value={"experience": {"error": "File not found"}})
 
     messages = provider.format_prefetch_messages(await provider.prefetch())
@@ -387,7 +491,7 @@ async def test_prefetch_preserves_frozen_evidence_without_rebuilding_live_metada
             "experience_execution": {"case_a": {"current_nodes": ["confirm"]}},
         },
     )
-    trajectory.content = render_trajectory_content(trajectory)
+    trajectory.content = render_trajectory_template(trajectory)
     # Evidence fields are no longer required to construct a model message.
     trajectory.metadata = {"trajectory_format": TRAJECTORY_FORMAT, "private": "not model input"}
     provider = AgentExperienceContextProvider(

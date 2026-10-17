@@ -16,8 +16,8 @@ from openviking.session.memory.experience.experience_context import (
 from openviking.session.train import Case, Rubric, Trajectory
 from openviking.session.train.components.trajectory_observation import (
     TRAJECTORY_FORMAT,
-    render_trajectory_content,
 )
+from tests.session.train.test_fakes import render_trajectory_template
 
 BODY = (
     '# Session Context\n\nKeep "quoted rules" and exact spacing.\n\n'
@@ -40,11 +40,13 @@ def make_trajectory(*, outcome="failure", evaluation=None, criteria=None, task_t
             "evaluation": evaluation,
             "evaluation_criteria": criteria or [],
             "experience_execution": {"case_a": {"slot_values": {"ready": True}}},
+            "action_scores": [{"id": "A1", "score": -1, "evidence": "Already completed."}],
+            "action_score_sources": {"A1": {"slot_name": "hint", "instruction": "Check"}},
             "experience_effects": {"positive_ids": [], "negative_ids": ["E1"], "weak_ids": []},
             "experience_effect_sources": {"E1": "viking://user/u/memories/experiences/case_a.md"},
         },
     )
-    trajectory.content = render_trajectory_content(trajectory)
+    trajectory.content = render_trajectory_template(trajectory)
     return trajectory
 
 
@@ -74,19 +76,53 @@ def test_model_view_removes_identity_and_task_spec_and_keeps_failed_criteria_onl
         "evaluation",
         "evaluation_criteria",
         "experience_execution",
-        "experience_effects",
-        "experience_effect_sources",
     }
     assert fields["outcome"] == "failure"
-    assert fields["evaluation"] == trajectory.metadata["evaluation"]
+    assert fields["evaluation"] == {"details": trajectory.metadata["evaluation"]["details"]}
     assert fields["evaluation_criteria"] == [failed]
-    for name in ["experience_execution", "experience_effects", "experience_effect_sources"]:
-        assert fields[name] == trajectory.metadata[name]
+    assert fields["experience_execution"] == trajectory.metadata["experience_execution"]
+    for name in [
+        "experience_effects",
+        "experience_effect_sources",
+        "action_scores",
+        "action_score_sources",
+    ]:
+        assert name not in fields
+        assert name not in header(trajectory.content)
+        assert trajectory.metadata[name] == original.metadata[name]
     assert content.endswith(BODY)
     assert "TASK_ONLY" not in content and "success-only evidence" not in content
     assert trajectory == original
-    assert header(trajectory.content)["task_spec"] == trajectory.metadata["task_spec"]
+    assert "task_spec" not in header(trajectory.content)
+    assert trajectory.metadata["task_spec"]["input"] == {"user_query": "TASK_ONLY"}
     assert _trajectory_model_content(content) == content
+
+
+def test_model_view_omits_internal_annotations_from_previously_rendered_headers():
+    trajectory = make_trajectory()
+    fields = header(trajectory.content)
+    fields["trajectory_uri"] = trajectory.uri
+    fields["source_session_uri"] = trajectory.metadata["source_session_uri"]
+    fields["experience_effects"] = trajectory.metadata["experience_effects"]
+    fields["experience_effect_sources"] = trajectory.metadata["experience_effect_sources"]
+    body = BODY + "The user mentioned experience_effects and experience_effect_sources.\n"
+    persisted = (
+        "# Trajectory Record\n\n```yaml\n"
+        + yaml.safe_dump(fields, allow_unicode=True, sort_keys=False).rstrip()
+        + "\n```\n\n"
+        + body
+    )
+
+    compact = _trajectory_model_content(persisted)
+
+    assert "trajectory_uri" not in header(compact)
+    assert "source_session_uri" not in header(compact)
+    assert "experience_effects" not in header(compact)
+    assert "experience_effect_sources" not in header(compact)
+    assert header(compact)["experience_execution"] == fields["experience_execution"]
+    assert compact.endswith(body)
+    assert header(persisted)["experience_effects"] == trajectory.metadata["experience_effects"]
+    assert _trajectory_model_content(compact) == compact
 
 
 def test_success_retains_failed_diagnostic_without_changing_overall_result():
@@ -95,7 +131,8 @@ def test_success_retains_failed_diagnostic_without_changing_overall_result():
         outcome="success", evaluation={"passed": True, "score": 1.0}, criteria=[failed]
     )
     fields = header(_trajectory_model_content(trajectory.content))
-    assert fields["outcome"] == "success" and fields["evaluation"]["passed"] is True
+    assert fields["outcome"] == "success" and "evaluation" not in fields
+    assert trajectory.metadata["evaluation"] == {"passed": True, "score": 1.0}
     assert fields["evaluation_criteria"] == [failed]
 
 
@@ -107,7 +144,8 @@ def test_no_failed_criteria_does_not_invent_failures(outcome, evaluation):
         outcome=outcome, evaluation=evaluation, criteria=[{"passed": True}]
     )
     fields = header(_trajectory_model_content(trajectory.content))
-    assert fields["outcome"] == outcome and fields["evaluation"] == evaluation
+    assert fields["outcome"] == outcome and "evaluation" not in fields
+    assert trajectory.metadata["evaluation"] == evaluation
     assert fields["evaluation_criteria"] == []
 
 
@@ -126,7 +164,8 @@ def test_text_without_a_complete_generated_header_is_unchanged(content):
 @pytest.mark.asyncio
 async def test_prefetch_budgets_the_compact_view_but_keeps_full_internal_trajectory():
     trajectory = make_trajectory(
-        task_text="INTERNAL_TASK_DETAILS " * 2000, criteria=[{"passed": True}]
+        task_text="INTERNAL_TASK_DETAILS " * 2000,
+        criteria=[{"id": "passed", "passed": True, "evidence": "SUCCESS_ONLY_DETAILS " * 2000}],
     )
     case = Case("case_a", "service domain", {}, Rubric("r", "", []))
     target = "viking://user/u/memories/experiences/case_a.md"
@@ -141,7 +180,13 @@ async def test_prefetch_budgets_the_compact_view_but_keeps_full_internal_traject
         char_limit=100_000,
     )
     budget = sum(len(message["content"]) for message in _trajectory_comparison_messages(payload))
-    assert len(trajectory.content) > budget
+    assert len(trajectory.content) > len(compact)
+    assert "INTERNAL_TASK_DETAILS" not in trajectory.content
+    assert (
+        trajectory.metadata["task_spec"]["input"]["user_query"] == "INTERNAL_TASK_DETAILS " * 2000
+    )
+    assert "SUCCESS_ONLY_DETAILS" not in trajectory.content
+    assert "SUCCESS_ONLY_DETAILS" not in compact
     original = copy.deepcopy(trajectory)
     provider = AgentExperienceContextProvider(
         messages=[],

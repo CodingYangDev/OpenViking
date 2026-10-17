@@ -663,6 +663,7 @@ def _status_payload(record: _RolloutRecord) -> dict[str, Any]:
         "passed": record.passed,
         "score": record.score,
         "policy_snapshot_id": rollout.policy_snapshot_id,
+        "rollout_log_path": rollout.metadata.get("rollout_log_path"),
         "has_memory_context": bool(_memory_context(rollout).strip()),
         "has_task_case_experience_skill": bool(_task_case_experience_skill(rollout).strip()),
         "task_case_experience_skill_path": "task_case_experience_skill.md"
@@ -699,6 +700,7 @@ def _rollout_index(record: _RolloutRecord, rollout_dir: Path) -> dict[str, Any]:
         "score": record.score,
         "artifact_state": record.artifact_state,
         "path": str(rollout_dir),
+        "rollout_log_path": record.rollout.metadata.get("rollout_log_path"),
         "commit_error": record.commit_result.get("error") if record.commit_result else None,
         "archive_uri": record.commit_result.get("archive_uri") if record.commit_result else None,
         "commit_task_status": (

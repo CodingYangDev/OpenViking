@@ -15,7 +15,6 @@ from openviking.session.train.gates.experience import (
     EXPERIENCE_GATE_CONTEXTS_KEY,
     ExperienceImprovementGate,
     _bounded_success_evidence,
-    accept_proposals_without_gate,
 )
 from openviking.session.train.gradients import PatchSemanticGradient
 from openviking_cli.utils.config.agent_evolution_config import DagDeciderConfig
@@ -182,7 +181,7 @@ async def test_failed_session_accepts_relevant_corrective_action():
     )
     source = _source("Report the total 1628 required by the failed trajectory")
 
-    result = await gate.validate(
+    result = await gate._validate(
         _plan(source),
         [_gradient(source, passed=False)],
         PolicySet(root_uri="viking://user/u/memories/experiences", policies=[]),
@@ -208,7 +207,7 @@ async def test_failed_session_rejects_candidate_that_still_completes():
     )
     source = _source()
 
-    result = await gate.validate(
+    result = await gate._validate(
         _plan(source),
         [_gradient(source, passed=False)],
         PolicySet(root_uri="viking://user/u/memories/experiences", policies=[]),
@@ -231,7 +230,7 @@ async def test_successful_session_requires_candidate_to_complete():
     )
     source = _source()
 
-    result = await gate.validate(
+    result = await gate._validate(
         _plan(source),
         [_gradient(source, passed=True)],
         PolicySet(root_uri="viking://user/u/memories/experiences", policies=[]),
@@ -264,7 +263,7 @@ async def test_merged_plan_keeps_independently_passing_candidate():
         jev=SimpleNamespace(evaluate=AsyncMock(return_value={"preservation_0": {"noul": 0.99}})),
     )
 
-    result = await gate.validate(
+    result = await gate._validate(
         plan,
         [
             _gradient(source, passed=True),
@@ -313,13 +312,16 @@ async def test_shared_replay_does_not_infer_reminder_ack_from_model_answers():
             for question_id, question in questions.items()
         }
 
+    from openviking.service.experience_dag_decider import ExperienceDagDecider
+
     jev = SimpleNamespace(evaluate=AsyncMock(side_effect=complete_all_slots))
     gate = ExperienceImprovementGate(
         config=DagDeciderConfig(provider="jev"),
         jev=jev,
+        dag_decider=ExperienceDagDecider(config=DagDeciderConfig(provider="jev"), evaluator=jev),
     )
 
-    result = await gate.validate(
+    result = await gate._validate(
         plan,
         [
             _gradient(candidate, passed=True),
@@ -372,7 +374,7 @@ async def test_failed_update_compares_candidate_with_baseline_and_execution_feed
         jev=jev,
     )
 
-    result = await gate.validate(
+    result = await gate._validate(
         _plan(candidate, before_source=baseline),
         [gradient],
         PolicySet(root_uri="viking://user/u/memories/experiences", policies=[]),
@@ -425,7 +427,7 @@ async def test_failed_candidates_share_corrective_action_jev_call():
         jev=jev,
     )
 
-    result = await gate.validate(
+    result = await gate._validate(
         plan,
         [
             _gradient(candidate, passed=False),
@@ -489,7 +491,7 @@ async def test_provider_oversize_splits_candidates_but_keeps_each_baseline_atomi
         jev=jev,
     )
 
-    result = await gate.validate(
+    result = await gate._validate(
         plan,
         [
             _gradient(candidate, passed=False),
@@ -554,7 +556,7 @@ async def test_estimated_oversized_candidate_does_not_reject_other_candidate(mon
         jev=jev,
     )
 
-    result = await gate.validate(
+    result = await gate._validate(
         plan,
         [
             _gradient(candidate, passed=False),
@@ -594,7 +596,7 @@ async def test_compile_error_rejects_entire_experience_plan():
     )
     source = "not valid Python ("
 
-    result = await gate.validate(
+    result = await gate._validate(
         _plan(source),
         [_gradient(source, passed=False)],
         PolicySet(root_uri="viking://user/u/memories/experiences", policies=[]),
@@ -611,7 +613,7 @@ async def test_missing_jev_configuration_rejects_candidate():
     gate = ExperienceImprovementGate(config=DagDeciderConfig(provider="jev"))
     source = _source()
 
-    result = await gate.validate(
+    result = await gate._validate(
         _plan(source),
         [_gradient(source, passed=False)],
         PolicySet(root_uri="viking://user/u/memories/experiences", policies=[]),
@@ -713,7 +715,7 @@ async def test_case_gate_aggregates_success_and_failed_sessions(
         dag_decider=EvidenceDecider(),
         jev=SimpleNamespace(evaluate=AsyncMock(side_effect=judge)),
     )
-    result = await gate.validate(
+    result = await gate._validate(
         _plan(source, before_source=source),
         [success, failed],
         PolicySet(root_uri="viking://user/u/memories/experiences", policies=[]),
@@ -740,7 +742,7 @@ async def test_unknown_session_requires_grounding_without_claiming_improvement()
         dag_decider=BatchStopsAtReportDecider(),
         jev=SimpleNamespace(evaluate=AsyncMock(side_effect=judge)),
     )
-    result = await gate.validate(_plan(source), [gradient], PolicySet("root", []), None)
+    result = await gate._validate(_plan(source), [gradient], PolicySet("root", []), None)
     assert len(result.items) == 1
     assert result.metadata["experience_improvement_gate"]["candidates"][0]["improved"] is False
 
@@ -757,7 +759,7 @@ async def test_failed_session_completion_never_counts_as_improvement():
         dag_decider=BatchCompletesDecider(),
         jev=SimpleNamespace(evaluate=AsyncMock(side_effect=judge)),
     )
-    result = await gate.validate(
+    result = await gate._validate(
         _plan(source, before_source=source),
         [_gradient(source, passed=False)],
         PolicySet("root", []),
@@ -778,7 +780,7 @@ async def test_empty_session_evidence_cannot_pass_gate():
         dag_decider=BatchCompletesDecider(),
         jev=SimpleNamespace(evaluate=AsyncMock()),
     )
-    result = await gate.validate(_plan(source), [gradient], PolicySet("root", []), None)
+    result = await gate._validate(_plan(source), [gradient], PolicySet("root", []), None)
     assert result.items == []
     assert (
         "no replay evidence"
@@ -787,7 +789,8 @@ async def test_empty_session_evidence_cannot_pass_gate():
 
 
 @pytest.mark.asyncio
-async def test_failed_proposal_without_successful_anchor_is_rejected():
+async def test_failed_proposal_without_successful_anchor_is_rejected(monkeypatch):
+    monkeypatch.setattr(ExperienceImprovementGate, "ENABLED", True)
     source = _source("Report the verified total 1628")
     gradient = _gradient(source, passed=False)
     gate = ExperienceImprovementGate(
@@ -796,25 +799,20 @@ async def test_failed_proposal_without_successful_anchor_is_rejected():
         jev=SimpleNamespace(evaluate=AsyncMock()),
     )
 
-    accepted, metadata = await gate.validate_proposals(
-        [gradient],
-        PolicySet(root_uri="viking://user/u/memories/experiences", policies=[]),
-        None,
-    )
+    with pytest.raises(RuntimeError, match="no successful Session anchor"):
+        await gate.validate(
+            _plan(source),
+            [gradient],
+            PolicySet(root_uri="viking://user/u/memories/experiences", policies=[]),
+            None,
+        )
 
-    assert accepted == []
-    diagnostic = metadata["experience_improvement_gate"]
-    assert diagnostic["stage"] == "proposal"
-    assert diagnostic["accepted_count"] == 0
-    assert diagnostic["rejected_count"] == 1
-    assert diagnostic["candidates"][0]["reason"] == (
-        "failed proposal has no successful Session anchor"
-    )
     gate.jev.evaluate.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_successful_proposal_uses_its_own_session_as_gate_evidence():
+async def test_successful_proposal_uses_its_own_session_as_gate_evidence(monkeypatch):
+    monkeypatch.setattr(ExperienceImprovementGate, "ENABLED", True)
     source = _source("Report the verified total 1628")
     gradient = _gradient(source, passed=True)
     gate = ExperienceImprovementGate(
@@ -830,13 +828,15 @@ async def test_successful_proposal_uses_its_own_session_as_gate_evidence():
         ),
     )
 
-    accepted, metadata = await gate.validate_proposals(
+    result = await gate.validate(
+        _plan(source),
         [gradient],
         PolicySet(root_uri="viking://user/u/memories/experiences", policies=[]),
         None,
     )
 
-    assert accepted == [gradient]
+    assert len(result.items) == 1
+    metadata = result.metadata
     assert metadata["experience_improvement_gate"]["accepted_count"] == 1
     diagnostic = metadata["experience_improvement_gate"]["candidates"][0]
     assert diagnostic["gate_basis"] == "proposal_session"
@@ -844,7 +844,8 @@ async def test_successful_proposal_uses_its_own_session_as_gate_evidence():
 
 
 @pytest.mark.asyncio
-async def test_failed_proposal_gate_preserves_successful_session_anchor():
+async def test_failed_proposal_gate_preserves_successful_session_anchor(monkeypatch):
+    monkeypatch.setattr(ExperienceImprovementGate, "ENABLED", True)
     from openviking.message import Message, TextPart
     from openviking.session.train.domain import Policy
 
@@ -884,14 +885,16 @@ async def test_failed_proposal_gate_preserves_successful_session_anchor():
         ),
     )
 
-    accepted, metadata = await gate.validate_proposals(
+    result = await gate.validate(
+        _plan(source),
         [gradient],
         PolicySet("viking://user/u/memories/experiences", [policy], viking_fs=fs),
         None,
     )
 
-    assert accepted == [gradient]
-    source_session = gradient.metadata["proposal_source_sessions"][0]
+    assert len(result.items) == 1
+    metadata = result.metadata
+    source_session = gradient.metadata[EXPERIENCE_GATE_CONTEXTS_KEY][0]
     assert source_session["source_session_uri"] == SESSION_URI
     assert source_session["passed"] is False
     anchors = gradient.metadata["proposal_gate_anchor_sessions"]
@@ -925,20 +928,76 @@ def test_successful_session_witness_is_bounded_and_drops_system_messages():
     assert bounded[-1]["id"] == "last"
 
 
-def test_disabled_gate_admits_proposal_and_preserves_source_session():
-    gradient = _gradient(_source(), passed=False)
+@pytest.mark.asyncio
+async def test_disabled_gate_does_not_initialize_or_call_evaluators(monkeypatch):
+    from dataclasses import fields
 
-    accepted, metadata = accept_proposals_without_gate([gradient])
+    from openviking.session.train.gates import experience as module
+    from openviking_cli.utils.config.jev_config import JevConfig
 
-    assert accepted == [gradient]
-    assert gradient.metadata["proposal_source_sessions"][0]["source_session_uri"] == SESSION_URI
-    gate = gradient.metadata["experience_proposal_gate"]
-    assert gate == {
-        "enabled": False,
-        "stage": "proposal",
-        "passed": True,
-        "accepted_count": 1,
-        "rejected_count": 0,
-        "reason": "Experience proposal gate is disabled",
-    }
-    assert metadata["experience_improvement_gate"]["enabled"] is False
+    def unexpected(*args, **kwargs):
+        pytest.fail("disabled quality gate must not initialize evaluators")
+
+    monkeypatch.setattr(module, "JevClient", unexpected)
+    monkeypatch.setattr(module, "ExperienceDagDecider", unexpected)
+    assert ExperienceImprovementGate.ENABLED is False
+    assert "ENABLED" not in {f.name for f in fields(ExperienceImprovementGate)}
+    gate = ExperienceImprovementGate(
+        config=DagDeciderConfig(), jev_config=JevConfig(api_url="http://unused", api_key="unused")
+    )
+    plan = _plan(_source())
+    assert (
+        await gate.validate(plan, [_gradient(_source(), passed=False)], PolicySet("root", []), None)
+        is plan
+    )
+    assert gate.jev is None
+    assert gate.dag_decider is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["replay", "judgement", "missing_config", "missing_evidence"])
+async def test_public_quality_gate_infrastructure_errors_are_not_candidate_rejections(
+    monkeypatch, failure
+):
+    from openviking.session.train.gates.errors import ExperienceGateRejected
+
+    monkeypatch.setattr(ExperienceImprovementGate, "ENABLED", True)
+    gradient = _gradient(_source(), passed=True)
+    jev = SimpleNamespace(evaluate=AsyncMock(side_effect=ConnectionError("Jev unavailable")))
+    decider = CompletesDecider()
+    if failure == "replay":
+        decider = SimpleNamespace(
+            decide=AsyncMock(side_effect=ConnectionError("decider unavailable"))
+        )
+    elif failure == "missing_evidence":
+        gradient.metadata[EXPERIENCE_GATE_CONTEXTS_KEY][0]["evidence"] = []
+    gate = ExperienceImprovementGate(
+        config=DagDeciderConfig(),
+        dag_decider=decider,
+        jev=None if failure == "missing_config" else jev,
+    )
+    with pytest.raises(RuntimeError) as error:
+        await gate.validate(_plan(_source()), [gradient], PolicySet("root", []), None)
+    assert not isinstance(error.value, ExperienceGateRejected)
+    if failure != "judgement":
+        jev.evaluate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enabled_quality_gate_does_not_gate_ordinary_memory(monkeypatch):
+    monkeypatch.setattr(ExperienceImprovementGate, "ENABLED", True)
+    gate = ExperienceImprovementGate(config=DagDeciderConfig())
+    plan = PolicyUpdatePlan(
+        items=[
+            PolicyPlanItem(
+                kind="upsert",
+                memory_type="profiles",
+                target_name="user",
+                target_uri="viking://user/u/memories/profiles/user.md",
+                before_content=None,
+                after_content="user facts",
+            ),
+        ]
+    )
+    assert await gate.validate(plan, [], PolicySet("root", []), None) is plan
+    assert gate.jev is None and gate.dag_decider is None

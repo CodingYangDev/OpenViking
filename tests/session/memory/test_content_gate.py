@@ -28,6 +28,7 @@ from openviking.session.memory.merge_op import (
 )
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.validation import content as content_gate
+from tests.session.train.test_fakes import render_trajectory_template
 
 URI = "viking://user/alice/memories/experiences/case_a.md"
 OTHER = "viking://user/alice/memories/records/a.md"
@@ -345,7 +346,6 @@ def extraction_case(monkeypatch, responses, *, source=SOURCE, output_format="pyt
     from openviking.session.train import Case, Rubric, Trajectory
     from openviking.session.train.components.trajectory_observation import (
         TRAJECTORY_FORMAT,
-        render_trajectory_content,
     )
 
     old = file(source)
@@ -374,7 +374,7 @@ def extraction_case(monkeypatch, responses, *, source=SOURCE, output_format="pyt
     provider.get_extract_context().page_id_map.get_page_id(URI)
     for trajectory in provider.trajectories:
         trajectory.metadata["trajectory_format"] = TRAJECTORY_FORMAT
-        trajectory.content = render_trajectory_content(trajectory)
+        trajectory.content = render_trajectory_template(trajectory)
     provider._eval_memory = AsyncMock(
         return_value={
             "experience": {

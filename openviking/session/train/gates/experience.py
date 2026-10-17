@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from openviking.models.jev import JevClient, JevPayloadTooLarge, estimate_jev_input_tokens
 from openviking.service.experience_dag_decider import ExperienceDagDecider
@@ -18,7 +18,8 @@ from openviking.session.memory.experience.dag import (
     DagInstance,
     clip_evidence_summary,
 )
-from openviking.session.train.domain import PolicyPlanItem, PolicySet, PolicyUpdatePlan
+from openviking.session.train.domain import PolicySet, PolicyUpdatePlan
+from openviking.session.train.gates.errors import ExperienceGateRejected
 from openviking.session.train.interfaces import SemanticGradient
 from openviking.telemetry import tracer
 from openviking_cli.utils.config.agent_evolution_config import DagDeciderConfig
@@ -77,134 +78,12 @@ class _CorrectiveJudgementResult:
 class ExperienceImprovementGate:
     """Validate successful proposals or protect successful anchors from failed repairs."""
 
+    ENABLED: ClassVar[bool] = False
+
     config: DagDeciderConfig
     jev_config: JevConfig | None = None
     dag_decider: Any = None
     jev: Any = None
-
-    def __post_init__(self) -> None:
-        if self.jev is None and self.jev_config is not None:
-            self.jev = JevClient(self.jev_config)
-        if self.dag_decider is None and self.jev is not None:
-            self.dag_decider = ExperienceDagDecider(config=self.config, evaluator=self.jev)
-
-    @tracer(
-        "train.proposal_gate.experience.validate",
-        ignore_args=True,
-        ignore_result=True,
-    )
-    async def validate_proposals(
-        self,
-        gradients: list[SemanticGradient],
-        policy_set: PolicySet,
-        context: Any,
-    ) -> tuple[list[SemanticGradient], dict[str, Any]]:
-        """Validate each Session proposal independently before PatchMerge."""
-
-        accepted: list[SemanticGradient] = []
-        candidate_diagnostics: list[dict[str, Any]] = []
-        jev_batch_count = 0
-        jev_split_count = 0
-        oversized_candidates: list[dict[str, str]] = []
-
-        for gradient in gradients:
-            proposal_contexts = list(
-                _gate_contexts_by_target([gradient]).get(gradient.target_uri or "", {}).values()
-            )
-            current = next(
-                (policy for policy in policy_set.policies if policy.uri == gradient.target_uri),
-                None,
-            )
-            failed_proposal = any(item.get("passed") is False for item in proposal_contexts)
-            validation_contexts = proposal_contexts
-            gate_basis = "proposal_session"
-            if failed_proposal:
-                validation_contexts = await _successful_anchor_contexts(current, policy_set)
-                gate_basis = "successful_session_regression"
-                if not validation_contexts:
-                    candidate_diagnostics.append(
-                        {
-                            "target_uri": gradient.target_uri,
-                            "target_name": gradient.target_name,
-                            "passed": False,
-                            "improved": False,
-                            "reason": "failed proposal has no successful Session anchor",
-                            "replays": [],
-                            "proposal_source_session_uri": _first_source_session_uri(
-                                proposal_contexts
-                            ),
-                        }
-                    )
-                    continue
-            before_content = (
-                gradient.before_file.content
-                if gradient.before_file is not None
-                else current.content
-                if current is not None
-                else None
-            )
-            proposal = PolicyPlanItem(
-                kind="upsert",
-                memory_type="experiences",
-                target_name=gradient.target_name,
-                target_uri=gradient.target_uri,
-                before_content=before_content,
-                after_content=gradient.after_file.content,
-                base_version=gradient.base_version,
-                confidence=gradient.confidence,
-                links=list(gradient.links),
-            )
-            gated = await self._validate(
-                PolicyUpdatePlan(items=[proposal], metadata={"gate_stage": "proposal"}),
-                [gradient],
-                policy_set,
-                context,
-                contexts_by_target={
-                    gradient.target_uri or "": {
-                        str(item.get("source_session_uri") or index): item
-                        for index, item in enumerate(validation_contexts)
-                    }
-                },
-            )
-            gate = dict(gated.metadata.get("experience_improvement_gate") or {})
-            for diagnostic in gate.get("candidates") or []:
-                candidate_diagnostics.append(
-                    {
-                        **diagnostic,
-                        "gate_basis": gate_basis,
-                        "proposal_source_session_uri": _first_source_session_uri(proposal_contexts),
-                    }
-                )
-            jev_batch_count += int(gate.get("jev_batch_count") or 0)
-            jev_split_count += int(gate.get("jev_split_count") or 0)
-            oversized_candidates.extend(gate.get("oversized_candidates") or [])
-            if not gated.items:
-                continue
-
-            gradient.metadata["proposal_source_sessions"] = _stored_session_contexts(
-                proposal_contexts
-            )
-            gradient.metadata["proposal_gate_anchor_sessions"] = _stored_session_contexts(
-                validation_contexts
-            )
-            gradient.metadata["experience_proposal_gate"] = gate
-            accepted.append(gradient)
-
-        accepted_count = len(accepted)
-        diagnostics = {
-            "experience_improvement_gate": {
-                "stage": "proposal",
-                "passed": bool(gradients) and accepted_count == len(gradients),
-                "atomic": False,
-                "accepted_count": accepted_count,
-                "rejected_count": len(gradients) - accepted_count,
-                "jev_batch_count": jev_batch_count,
-                "jev_split_count": jev_split_count,
-                "oversized_candidates": oversized_candidates,
-                "candidates": candidate_diagnostics,
-            }
-        }
-        return accepted, diagnostics
 
     @tracer("train.policy_gate.experience.validate", ignore_args=True, ignore_result=True)
     async def validate(
@@ -214,7 +93,86 @@ class ExperienceImprovementGate:
         policy_set: PolicySet,
         context: Any,
     ) -> PolicyUpdatePlan:
-        return await self._validate(plan, gradients, policy_set, context)
+        """Check candidates inside extraction; reject with feedback, never silently filter.
+
+        Evaluation infrastructure/context failures cannot be repaired by rewriting a
+        candidate. They propagate immediately instead of consuming a model repair turn.
+        """
+        targets = {
+            item.target_uri
+            for item in plan.items
+            if item.kind == "upsert" and item.memory_type == "experiences"
+        }
+        if not self.ENABLED or not targets:
+            return plan
+        gradients = [gradient for gradient in gradients if gradient.target_uri in targets]
+        # Lazily initialize only when this class-level switch is on.
+        if self.jev is None and self.jev_config is not None:
+            self.jev = JevClient(self.jev_config)
+        if self.dag_decider is None and self.jev is not None:
+            self.dag_decider = ExperienceDagDecider(config=self.config, evaluator=self.jev)
+        if self.jev is None or self.dag_decider is None:
+            raise RuntimeError("Experience quality gate requires shared Jev configuration")
+
+        contexts_by_target = _gate_contexts_by_target(gradients)
+        gate_bases = {}
+        for gradient in gradients:
+            target = gradient.target_uri or ""
+            proposal_contexts = list(contexts_by_target.get(target, {}).values())
+            validation_contexts = proposal_contexts
+            basis = "proposal_session"
+            if any(item.get("passed") is False for item in proposal_contexts):
+                current = next((p for p in policy_set.policies if p.uri == target), None)
+                validation_contexts = await _successful_anchor_contexts(current, policy_set)
+                basis = "successful_session_regression"
+                if not validation_contexts:
+                    raise RuntimeError(
+                        "Experience quality gate: failed proposal has no successful Session anchor"
+                    )
+            if not validation_contexts:
+                raise RuntimeError(
+                    "Experience quality gate: candidate has no source Session validation context"
+                )
+            for item in validation_contexts:
+                if item.get("error") or not _parse_evidence(item.get("evidence")):
+                    raise RuntimeError(
+                        "Experience quality gate: "
+                        + str(item.get("error") or "source Session has no replay evidence")
+                    )
+            contexts_by_target[target] = {
+                str(item.get("source_session_uri") or index): item
+                for index, item in enumerate(validation_contexts)
+            }
+            gate_bases[target] = {
+                "gate_basis": basis,
+                "proposal_source_session_uri": _first_source_session_uri(proposal_contexts),
+            }
+
+        gated = await self._validate(plan, gradients, policy_set, context, contexts_by_target)
+        diagnostics = gated.metadata.get("experience_improvement_gate") or {}
+        for diagnostic in diagnostics.get("candidates", []):
+            diagnostic.update(gate_bases.get(diagnostic.get("target_uri"), {}))
+        if not diagnostics.get("passed"):
+            if diagnostics.get("repairable") is False or any(
+                item.get("repairable") is False for item in diagnostics.get("candidates", [])
+            ):
+                raise RuntimeError(
+                    "Experience quality evaluation failed: "
+                    + json.dumps(diagnostics, ensure_ascii=False)
+                )
+            raise ExperienceGateRejected(
+                [
+                    {
+                        "gate": type(self).__name__,
+                        "error": diagnostics,
+                    }
+                ]
+            )
+        for gradient in gradients:
+            gradient.metadata["proposal_gate_anchor_sessions"] = _stored_session_contexts(
+                list(contexts_by_target.get(gradient.target_uri or "", {}).values())
+            )
+        return gated
 
     async def _validate(
         self,
@@ -244,6 +202,7 @@ class ExperienceImprovementGate:
                         "rejected_count": len(upserts),
                         "candidates": [],
                         "reason": "shared Jev configuration is missing",
+                        "repairable": False,
                     },
                 },
             )
@@ -268,6 +227,7 @@ class ExperienceImprovementGate:
                     result={
                         "passed": False,
                         "reason": "candidate has no source Session validation context",
+                        "repairable": False,
                     },
                 )
                 ordinal += 1
@@ -296,6 +256,7 @@ class ExperienceImprovementGate:
                 or {
                     "passed": False,
                     "reason": "candidate validation did not produce a result",
+                    "repairable": False,
                 }
                 for validation in item_validations
             ]
@@ -409,6 +370,7 @@ class ExperienceImprovementGate:
                     ),
                     "passed": False,
                     "reason": f"candidate corrective-action validation failed: {exc}",
+                    "repairable": False,
                     "replay": candidate.replay,
                     **_baseline_diagnostic(
                         validation,
@@ -426,6 +388,7 @@ class ExperienceImprovementGate:
                     ),
                     "passed": False,
                     "reason": f"candidate corrective-action input is oversized: {error}",
+                    "repairable": False,
                     "replay": candidate.replay,
                     **_baseline_diagnostic(
                         validation,
@@ -750,9 +713,14 @@ def _preliminary_validation_result(
         **_baseline_diagnostic(validation, baseline),
     }
     if gate_context.get("error"):
-        return {**diagnostic, "passed": False, "reason": gate_context["error"]}
+        return {**diagnostic, "passed": False, "repairable": False, "reason": gate_context["error"]}
     if not _parse_evidence(gate_context.get("evidence")):
-        return {**diagnostic, "passed": False, "reason": "source Session has no replay evidence"}
+        return {
+            **diagnostic,
+            "passed": False,
+            "repairable": False,
+            "reason": "source Session has no replay evidence",
+        }
     if candidate.error or candidate.replay is None:
         error_prefix = (
             "candidate DAG does not compile"
@@ -763,10 +731,16 @@ def _preliminary_validation_result(
             **diagnostic,
             "passed": False,
             "reason": f"{error_prefix}: {candidate.error or 'missing replay'}",
+            "repairable": candidate.error_kind == "compile",
         }
     diagnostic["replay"] = candidate.replay
     if baseline is not None and (baseline.error or baseline.replay is None):
-        return {**diagnostic, "passed": False, "reason": "baseline replay failed"}
+        return {
+            **diagnostic,
+            "passed": False,
+            "repairable": False,
+            "reason": "baseline replay failed",
+        }
     outcome = gate_context.get("passed")
     complete = candidate.replay["state"] == "completed"
     if outcome is True and not complete:
@@ -810,6 +784,7 @@ def _aggregate_session_results(
     return {
         "passed": passed,
         "improved": improved,
+        "repairable": all(result.get("repairable", True) for result in results),
         "reason": "Session replay requirements satisfied"
         if passed
         else "a source Session regressed or could not be validated"
@@ -828,51 +803,6 @@ def _gate_contexts_by_target(
             if isinstance(value, dict) and value.get("source_session_uri"):
                 result.setdefault(target, {})[value["source_session_uri"]] = value
     return result
-
-
-def accept_proposals_without_gate(
-    gradients: list[SemanticGradient],
-) -> tuple[list[SemanticGradient], dict[str, Any]]:
-    """Mark structurally valid proposals ready for PatchMerge without Jev evaluation."""
-
-    candidates: list[dict[str, Any]] = []
-    for gradient in gradients:
-        proposal_contexts = list(
-            _gate_contexts_by_target([gradient]).get(gradient.target_uri or "", {}).values()
-        )
-        gradient.metadata["proposal_source_sessions"] = _stored_session_contexts(proposal_contexts)
-        gate = {
-            "enabled": False,
-            "stage": "proposal",
-            "passed": True,
-            "accepted_count": 1,
-            "rejected_count": 0,
-            "reason": "Experience proposal gate is disabled",
-        }
-        gradient.metadata["experience_proposal_gate"] = gate
-        candidates.append(
-            {
-                "target_uri": gradient.target_uri,
-                "target_name": gradient.target_name,
-                "passed": True,
-                "reason": gate["reason"],
-                "proposal_source_session_uri": _first_source_session_uri(proposal_contexts),
-            }
-        )
-    return list(gradients), {
-        "experience_improvement_gate": {
-            "enabled": False,
-            "stage": "proposal",
-            "passed": True,
-            "atomic": False,
-            "accepted_count": len(gradients),
-            "rejected_count": 0,
-            "jev_batch_count": 0,
-            "jev_split_count": 0,
-            "oversized_candidates": [],
-            "candidates": candidates,
-        }
-    }
 
 
 async def _successful_anchor_contexts(

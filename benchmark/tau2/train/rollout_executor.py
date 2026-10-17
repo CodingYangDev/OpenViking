@@ -40,7 +40,6 @@ def make_tau2_rollout_executor(
     options: dict[str, Any] | None = None,
     config_path: str | None = None,
     concurrency: int = 1,
-    rollout_language: str = "default",
 ):
     """Create a tau2 rollout executor for the selected backend."""
 
@@ -52,7 +51,6 @@ def make_tau2_rollout_executor(
             concurrency=concurrency,
             keep_default_tools=_bool_option(opts.get("keep_default_tools"), default=True),
             max_iterations=int(opts.get("max_iterations") or DEFAULT_MAX_ROLLOUT_ITERATIONS),
-            rollout_language=str(opts.get("rollout_language") or rollout_language),
         )
     return NativeTau2RolloutExecutor(
         concurrency=concurrency,
@@ -89,7 +87,6 @@ def make_tau2_rollout_executor(
         openviking_user=_optional_str(opts.get("openviking_user")),
         openviking_timeout=float(opts.get("openviking_timeout") or 600.0),
         scope_prompt=str(opts.get("scope_prompt") or ""),
-        rollout_language=str(opts.get("rollout_language") or rollout_language),
         show_progress=_bool_option(opts.get("show_progress"), default=False),
         progress_label=str(opts.get("progress_label") or "tau2"),
     )

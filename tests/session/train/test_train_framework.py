@@ -1502,7 +1502,7 @@ async def test_session_commit_policy_trainer_retains_exception_type(
         (RuntimeError, "unavailable", "RuntimeError: unavailable"),
     ],
 )
-async def test_session_commit_policy_trainer_retains_learning_exception_type(
+async def test_session_commit_policy_trainer_records_and_propagates_learning_exception(
     tmp_path, exception_type, message, expected_error
 ):
     from openviking.session.train import (
@@ -1527,16 +1527,17 @@ async def test_session_commit_policy_trainer_retains_learning_exception_type(
 
     collected = await trainer.train_rollouts([rollout], _policy_set())
     learner = RemoteExperienceLearner(client=client, event_recorder=trainer.event_recorder)
-    result = await learner.learn([collected], _policy_set())
+    with pytest.raises(exception_type) as caught:
+        await learner.learn([collected], _policy_set())
 
-    assert result.apply_result.errors == []
-    learning = result.apply_result.metadata["experience_learning"]
-    assert learning["error"] == expected_error
-    assert learning["failed_count"] == 0
+    assert str(caught.value) == message
+    assert collected.apply_result.errors == []
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
     failure = next(event for event in events if event["event"] == "experience_learn_done")
     assert failure["error"] == expected_error
     assert failure["failed_count"] == 0
+    assert failure["incomplete"] is True
+    assert failure["task_id"] is None
     client.learn_experiences.assert_awaited_once_with(
         trajectory_uris=[trajectory_uri], max_cases=1000, wait=False
     )

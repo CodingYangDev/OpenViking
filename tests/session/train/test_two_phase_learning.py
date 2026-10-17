@@ -7,6 +7,7 @@ from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from test_external_case_learning import cases as cases
 from test_external_case_learning import noop_result
@@ -275,15 +276,23 @@ async def test_wait_cancellation_does_not_fake_a_complete_bar(monkeypatch):
     )
     batch = result()
     batch.apply_result.metadata["commit_results"] = [{"trajectory_uris": ["traj-a"]}]
-    learner = module.RemoteExperienceLearner(client, poll_interval_seconds=0.001)
+    events = SimpleNamespace(record=AsyncMock())
+    learner = module.RemoteExperienceLearner(
+        client, poll_interval_seconds=0.001, event_recorder=events
+    )
     with pytest.raises(asyncio.CancelledError):
         await learner.learn([batch], _policy_set())
     assert finished == [{"completed": 0, "failed": 0, "running": 1}, "finished"]
+    done = events.record.await_args
+    assert done.args == ("experience_learn_done",)
+    assert done.kwargs["task_id"] == "learn-1"
+    assert done.kwargs["incomplete"] is True
+    assert done.kwargs["error"].startswith("CancelledError:")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["failed", "cancelled", "timeout", "completed"])
-async def test_incomplete_remote_task_retains_identity_and_phase_one_results(
+async def test_incomplete_remote_task_aborts_epoch_and_retains_diagnostics(
     monkeypatch, status, capsys
 ):
     from openviking.session.train.components import experience_learner as module
@@ -299,16 +308,153 @@ async def test_incomplete_remote_task_retains_identity_and_phase_one_results(
     batch = result()
     commits = [{"trajectory_uris": ["traj-a"]}]
     batch.apply_result.metadata["commit_results"] = commits
-    learned = await module.RemoteExperienceLearner(client).learn([batch], _policy_set())
-    assert learned.apply_result.metadata["commit_results"] == commits
-    assert learned.apply_result.errors == []
-    learning = learned.metadata["experience_learning"]
+    events = SimpleNamespace(record=AsyncMock())
+    trainer = SimpleNamespace(train_rollouts=AsyncMock(return_value=batch))
+    runner = pipeline(trainer, module.RemoteExperienceLearner(client, event_recorder=events))
+    runner._rollout_batch = AsyncMock(return_value=([], "snapshot"))
+    runner._run_epoch_evaluation_pass = AsyncMock()
+    expected_type = ValueError if status == "completed" else RuntimeError
+    with pytest.raises(expected_type, match="learn-1"):
+        await runner.train(
+            ListCaseLoader([_case()]),
+            _policy_set(),
+            PipelineContext(max_epochs=2, lifecycle_hooks=[]),
+        )
+
+    trainer.train_rollouts.assert_awaited_once()  # Do not enter the next epoch either.
+    runner._run_epoch_evaluation_pass.assert_not_awaited()
+    assert batch.apply_result.metadata["commit_results"] == commits
+    assert batch.apply_result.errors == []
+    done = events.record.await_args
+    assert done.args == ("experience_learn_done",)
+    learning = done.kwargs
     assert learning["task_id"] == "learn-1"
     assert learning["incomplete"] is True
     assert learning["case_count"] == 3
     assert learning["applied_count"] == 1
     assert learning["failed_count"] == 0
+    assert learning["progress"] == progress
+    assert learning["error"].startswith(f"{expected_type.__name__}: learn-1:")
     assert "stopped" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("timeout", [None, 1.0])
+def test_learning_wait_accepts_no_deadline_or_a_positive_timeout(timeout):
+    from openviking.session.train.components.experience_learner import RemoteExperienceLearner
+
+    learner = RemoteExperienceLearner(SimpleNamespace(), timeout_seconds=timeout)
+    assert learner.timeout_seconds == timeout
+
+
+@pytest.mark.parametrize("field", ["timeout_seconds", "poll_interval_seconds"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_learning_wait_rejects_nonpositive_limits(field, value):
+    from openviking.session.train.components.experience_learner import RemoteExperienceLearner
+
+    with pytest.raises(ValueError, match=field):
+        RemoteExperienceLearner(SimpleNamespace(), **{field: value})
+
+
+@pytest.mark.asyncio
+async def test_default_learning_wait_passes_old_deadline_and_blocks_evaluation(monkeypatch):
+    from openviking.session.train.components import session_commit
+    from openviking.session.train.components.experience_learner import RemoteExperienceLearner
+
+    now = 0.0
+    polling, complete = asyncio.Event(), asyncio.Event()
+    outcome = {"case_count": 1, "trajectory_count": 1, "written_experience_uris": ["exp-a"]}
+
+    async def query(task_id):
+        nonlocal now
+        assert task_id == "learn-1"
+        now += 2000.0  # Virtual time: pass the old 1800s limit without real waiting.
+        if now == 2000.0:
+            return {"status": "running"}
+        polling.set()
+        await complete.wait()
+        return {"status": "completed", "result": outcome}
+
+    monkeypatch.setattr(
+        session_commit,
+        "asyncio",
+        SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: now), sleep=AsyncMock()
+        ),
+    )
+    client = SimpleNamespace(
+        learn_experiences=AsyncMock(return_value={"task_id": "learn-1"}),
+        get_task=AsyncMock(side_effect=query),
+    )
+    learner = RemoteExperienceLearner(client)
+    assert learner.timeout_seconds is None
+    batch = result()
+    batch.apply_result.metadata["commit_results"] = [{"trajectory_uris": ["traj-a"]}]
+    runner = pipeline(SimpleNamespace(train_rollouts=AsyncMock(return_value=batch)), learner)
+    runner._rollout_batch = AsyncMock(return_value=([], "snapshot"))
+    runner._run_epoch_evaluation_pass = AsyncMock(return_value=None)
+    task = asyncio.create_task(
+        runner.train(ListCaseLoader([_case()]), _policy_set(), PipelineContext(lifecycle_hooks=[]))
+    )
+    try:
+        await asyncio.wait_for(polling.wait(), timeout=1)
+        assert now > 1800
+        assert not task.done()
+        runner._run_epoch_evaluation_pass.assert_not_awaited()
+        complete.set()
+        learned = await asyncio.wait_for(task, timeout=1)
+    finally:
+        complete.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert learned.apply_result.written_uris == ["exp-a"]
+    runner._run_epoch_evaluation_pass.assert_awaited_once()
+    client.learn_experiences.assert_awaited_once()
+    assert client.get_task.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["epoch", "external_rollouts"])
+@pytest.mark.parametrize("stage", ["submission", "polling"])
+@pytest.mark.parametrize(
+    "exception_type", [httpx.ReadTimeout, httpx.ConnectError, asyncio.CancelledError]
+)
+async def test_learning_request_errors_and_cancellation_propagate(entry, stage, exception_type):
+    from openviking.session.train.components.experience_learner import RemoteExperienceLearner
+
+    error = exception_type("interrupted")
+    client = SimpleNamespace(
+        learn_experiences=AsyncMock(return_value={"task_id": "learn-1"}),
+        get_task=AsyncMock(),
+    )
+    failed_call = client.learn_experiences if stage == "submission" else client.get_task
+    failed_call.side_effect = error
+    events = SimpleNamespace(record=AsyncMock())
+    learner = RemoteExperienceLearner(client, event_recorder=events)
+    batch = result()
+    batch.apply_result.metadata["commit_results"] = [{"trajectory_uris": ["traj-a"]}]
+    trainer = SimpleNamespace(train_rollouts=AsyncMock(return_value=batch))
+    runner = pipeline(trainer, learner)
+    runner._rollout_batch = AsyncMock(return_value=([], "snapshot"))
+    runner._run_epoch_evaluation_pass = AsyncMock()
+    context = PipelineContext(max_epochs=2, lifecycle_hooks=[])
+
+    with pytest.raises(exception_type) as caught:
+        if entry == "epoch":
+            await runner.train(ListCaseLoader([_case()]), _policy_set(), context)
+        else:
+            await runner.train_from_rollouts([], _policy_set(), context)
+
+    assert caught.value is error
+    runner._run_epoch_evaluation_pass.assert_not_awaited()
+    trainer.train_rollouts.assert_awaited_once()
+    client.learn_experiences.assert_awaited_once()
+    assert client.get_task.await_count == (1 if stage == "polling" else 0)
+    done = events.record.await_args
+    assert done.args == ("experience_learn_done",)
+    assert done.kwargs["incomplete"] is True
+    assert done.kwargs["task_id"] == ("learn-1" if stage == "polling" else None)
+    assert done.kwargs["error"] == f"{exception_type.__name__}: interrupted"
 
 
 @pytest.mark.asyncio
