@@ -280,12 +280,13 @@ class JsonModel:
         self.metrics[f"{stage}_calls"] += 1
         number = self.metrics[f"{stage}_calls"]
         started = time.monotonic()
+        seconds = max(600, self.timeout)
         thinking = self.identity["thinking"].get(stage.split("_", 1)[0])
         report = {
             "stage": stage,
             "call": number,
             "max_tokens": max_tokens,
-            "timeout_seconds": self.timeout,
+            "timeout_seconds": seconds,
             "thinking": thinking
             if thinking is not None
             else self.identity["backend_settings"]["thinking"],
@@ -303,7 +304,7 @@ class JsonModel:
             json.dumps([messages, tools], ensure_ascii=False), text_type="mixed"
         )
         try:
-            async with asyncio.timeout(self.timeout):
+            async with asyncio.timeout(seconds):
                 response = await self.provider.chat(
                     messages=messages,
                     tools=tools,
@@ -335,7 +336,7 @@ class JsonModel:
         except TimeoutError as exc:
             report["error"] = "TimeoutError"
             raise ModelCallLimitError(
-                f"{stage}: model call wall-clock budget exhausted ({self.timeout:g}s)"
+                f"{stage}: model call wall-clock budget exhausted ({seconds:g}s)"
             ) from exc
         except Exception as exc:
             report["error"] = type(exc).__name__
@@ -359,8 +360,8 @@ class JsonModel:
         agent=False,
         readers=None,
     ) -> R:
-        """Bound planning/review to two model timeouts and execution assignments to one."""
-        seconds = self.timeout * (2 if stage in {"plan", "review"} else 1)
+        """Bound plan/review to 2x timeout (minimum 1200s), execution to 1x (minimum 600s)."""
+        seconds = max(600, self.timeout) * (2 if stage in {"plan", "review"} else 1)
         try:
             async with asyncio.timeout(seconds):
                 return await self._ask(
