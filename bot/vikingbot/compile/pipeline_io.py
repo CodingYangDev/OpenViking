@@ -519,10 +519,12 @@ class JsonModel:
                         except (ValueError, OSError, NotFoundError) as exc:
                             # Changing error details do not reset a reader's failure budget.
                             if not retry_allowed(retries, f"read:{call.name}"):
-                                raise ModelCallError(
+                                raise ModelCallLimitError(
                                     f"{stage}: reader {call.name} failed repeatedly"
                                 ) from exc
                             value = "Error: " + str(exc)[:800]
+                        else:
+                            retries.pop(f"read:{call.name}", None)
                         try:
                             content = json.loads(
                                 value, object_hook=lambda v: v.get("text", v.get("excerpts", v))

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 from vikingbot.compile import review
 from vikingbot.compile.models import CompileLimits
-from vikingbot.compile.pipeline_io import JsonModel, ModelCallError
+from vikingbot.compile.pipeline_io import JsonModel, ModelCallLimitError
 from vikingbot.compile.plan import Contract, Node, ReviewDecision
 from vikingbot.compile.service import BotCompileService
 from vikingbot.config.schema import Config
@@ -100,7 +100,7 @@ async def test_direct_reads_stop_repetition_but_allow_progress(case):
     if case == "progress":
         assert (await result).action == "continue"
     else:
-        with pytest.raises(ModelCallError, match="made no progress|failed repeatedly"):
+        with pytest.raises(ModelCallLimitError, match="made no progress|failed repeatedly"):
             await result
     assert provider.chat.await_count == (len(offsets) + 1 if case == "progress" else 4)
     assert provider.chat.await_args.kwargs["thinking"] is False
