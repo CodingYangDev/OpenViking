@@ -55,6 +55,11 @@ from openviking_cli.utils.logger import default_logger as logger
 # Use imported constants, no longer defined here
 AUTO_ID_KEY = SpecialFields.AUTO_ID.value
 
+# Bound the number of delta records replayed into one in-memory batch during
+# recovery. An all-PUT delta stream otherwise accumulates every record before
+# the first DELETE and can exhaust memory on a large backlog.
+_RECOVERY_REPLAY_BATCH_SIZE = 1024
+
 
 class _MutationMarker:
     def __init__(self):
@@ -1402,6 +1407,14 @@ class PersistCollection(LocalCollection):
                         )
                         delete_list = []
                     upsert_list.append(data)
+                    if len(upsert_list) >= _RECOVERY_REPLAY_BATCH_SIZE:
+                        _processed += self._replay_recovery_records(
+                            index_name=index_name,
+                            index=index,
+                            records=upsert_list,
+                            operation="upsert",
+                        )
+                        upsert_list = []
                 elif data.type == OpType.DEL.value:
                     if upsert_list:
                         _processed += self._replay_recovery_records(
@@ -1412,6 +1425,14 @@ class PersistCollection(LocalCollection):
                         )
                         upsert_list = []
                     delete_list.append(data)
+                    if len(delete_list) >= _RECOVERY_REPLAY_BATCH_SIZE:
+                        _processed += self._replay_recovery_records(
+                            index_name=index_name,
+                            index=index,
+                            records=delete_list,
+                            operation="delete",
+                        )
+                        delete_list = []
                 now = time.time()
                 if now - _last_log >= 5.0 and _seen > 0:
                     logger.info(
