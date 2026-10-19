@@ -33,6 +33,8 @@ class OIDCConfig(BaseModel):
     @classmethod
     def validate_issuer(cls, v: str) -> str:
         """Validate issuer URL."""
+        # Keep a single slash-free form for discovery URL construction. Token
+        # `iss` comparison tolerates the same trailing-slash difference.
         v = v.rstrip("/")
         if not v:
             raise ValueError("issuer cannot be empty")

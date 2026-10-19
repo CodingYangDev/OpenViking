@@ -199,7 +199,10 @@ class OIDCAuthPlugin(AuthPlugin):
         # application would be a cross-client trust violation.
         assert self._effective_audience is not None
 
-        # Validate token
+        # Validate token. Issuer comparison is done below instead of through
+        # python-jose's exact-match `verify_iss`: providers such as Authentik
+        # and Auth0 mint `iss` with a trailing slash, while OIDCConfig stores
+        # the configured issuer without one.
         try:
             claims = jwt.decode(
                 token,
@@ -208,11 +211,14 @@ class OIDCAuthPlugin(AuthPlugin):
                 options={
                     "verify_aud": True,
                     "verify_exp": True,
-                    "verify_iss": True,
+                    "verify_iss": False,
                 },
-                issuer=self._config.issuer,
                 audience=self._effective_audience,
             )
+            token_issuer = claims.get("iss")
+            expected_issuer = self._config.issuer.rstrip("/")
+            if not isinstance(token_issuer, str) or token_issuer.rstrip("/") != expected_issuer:
+                raise JWTClaimsError(f"Invalid issuer: {token_issuer!r}")
             return claims
         except ExpiredSignatureError:
             raise UnauthenticatedError("Token expired")
