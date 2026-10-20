@@ -199,10 +199,7 @@ class OIDCAuthPlugin(AuthPlugin):
         # application would be a cross-client trust violation.
         assert self._effective_audience is not None
 
-        # Validate token. Issuer comparison is done below instead of through
-        # python-jose's exact-match `verify_iss`: providers such as Authentik
-        # and Auth0 mint `iss` with a trailing slash, while OIDCConfig stores
-        # the configured issuer without one.
+        # Validate token
         try:
             claims = jwt.decode(
                 token,
@@ -211,14 +208,11 @@ class OIDCAuthPlugin(AuthPlugin):
                 options={
                     "verify_aud": True,
                     "verify_exp": True,
-                    "verify_iss": False,
+                    "verify_iss": True,
                 },
+                issuer=self._config.issuer,
                 audience=self._effective_audience,
             )
-            token_issuer = claims.get("iss")
-            expected_issuer = self._config.issuer.rstrip("/")
-            if not isinstance(token_issuer, str) or token_issuer.rstrip("/") != expected_issuer:
-                raise JWTClaimsError(f"Invalid issuer: {token_issuer!r}")
             return claims
         except ExpiredSignatureError:
             raise UnauthenticatedError("Token expired")
@@ -248,7 +242,7 @@ class OIDCAuthPlugin(AuthPlugin):
             if self._jwks_uri:
                 return self._jwks_uri
 
-            discovery_url = f"{self._config.issuer}{_DISCOVERY_PATH}"
+            discovery_url = f"{self._config.issuer.rstrip('/')}{_DISCOVERY_PATH}"
             logger.info("Performing OIDC discovery at %s", discovery_url)
             try:
                 async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT) as client:

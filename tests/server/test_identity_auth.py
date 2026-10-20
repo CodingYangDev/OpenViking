@@ -333,13 +333,55 @@ async def test_builtin_external_mapping_preserves_identity_and_user_role(
     assert ctx.role == Role.USER
 
 
-def _oidc_test_token(issuer: str, secret: str) -> str:
+@pytest.mark.parametrize(
+    "configured_issuer,token_issuer,accepted",
+    [
+        ("https://issuer.test/app/", "https://issuer.test/app/", True),
+        ("https://issuer.test/app", "https://issuer.test/app", True),
+        ("https://issuer.test/app/", "https://issuer.test/app", False),
+        ("https://issuer.test/app", "https://issuer.test/app/", False),
+        ("https://issuer.test/app", "https://issuer.test/app///", False),
+        ("https://issuer.test/app", "https://attacker.test/app", False),
+    ],
+)
+async def test_oidc_issuer_matches_exactly(configured_issuer, token_issuer, accepted, monkeypatch):
+    import base64
     import time
 
+    import httpx
+
     jwt = pytest.importorskip("jose.jwt")
-    return jwt.encode(
+
+    from openviking.server.auth.oidc_config import OIDCConfig
+    from openviking.server.auth.plugins import oidc as oidc_module
+
+    assert oidc_module._check_jwt_available()
+    plugin = oidc_module.OIDCAuthPlugin()
+    config = SimpleNamespace(oidc=OIDCConfig(issuer=configured_issuer, audience="openviking"))
+    plugin.validate_config(config)
+    await plugin.initialize(None, None, config)
+    secret = "test-secret"
+    encoded_key = base64.urlsafe_b64encode(secret.encode()).rstrip(b"=").decode()
+
+    def idp_response(request):
+        if str(request.url) == "https://issuer.test/app/.well-known/openid-configuration":
+            return httpx.Response(
+                200, json={"issuer": configured_issuer, "jwks_uri": "https://issuer.test/keys"}
+            )
+        assert str(request.url) == "https://issuer.test/keys"
+        return httpx.Response(
+            200, json={"keys": [{"kty": "oct", "k": encoded_key, "alg": "HS256", "kid": "test"}]}
+        )
+
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(
+        oidc_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: client_class(transport=httpx.MockTransport(idp_response), **kwargs),
+    )
+    token = jwt.encode(
         {
-            "iss": issuer,
+            "iss": token_issuer,
             "aud": "openviking",
             "sub": "user-1",
             "exp": int(time.time()) + 60,
@@ -348,63 +390,9 @@ def _oidc_test_token(issuer: str, secret: str) -> str:
         algorithm="HS256",
         headers={"kid": "test"},
     )
-
-
-def _oidc_test_plugin(configured_issuer: str, secret: str):
-    import base64
-
-    jwk = pytest.importorskip("jose.jwk")
-
-    from openviking.server.auth.oidc_config import OIDCConfig
-    from openviking.server.auth.plugins import oidc as oidc_module
-
-    assert oidc_module._check_jwt_available()
-    plugin = oidc_module.OIDCAuthPlugin()
-    plugin._config = OIDCConfig(issuer=configured_issuer)
-    plugin._effective_audience = "openviking"
-    encoded_key = base64.urlsafe_b64encode(secret.encode()).rstrip(b"=").decode()
-    key = jwk.construct({"kty": "oct", "k": encoded_key}, algorithm="HS256")
-
-    async def _get_key(_kid):
-        return key
-
-    plugin._get_key = _get_key
-    return plugin
-
-
-@pytest.mark.parametrize(
-    "configured_issuer,token_issuer",
-    [
-        (
-            "https://authentik.example/application/o/myapp/",
-            "https://authentik.example/application/o/myapp/",
-        ),
-        (
-            "https://authentik.example/application/o/myapp/",
-            "https://authentik.example/application/o/myapp",
-        ),
-        (
-            "https://authentik.example/application/o/myapp",
-            "https://authentik.example/application/o/myapp/",
-        ),
-        (
-            "https://authentik.example/application/o/myapp",
-            "https://authentik.example/application/o/myapp",
-        ),
-    ],
-)
-async def test_oidc_issuer_trailing_slash_is_tolerated(configured_issuer, token_issuer):
-    secret = "test-secret"
-    plugin = _oidc_test_plugin(configured_issuer, secret)
-
-    claims = await plugin._validate_token(_oidc_test_token(token_issuer, secret))
-
-    assert claims["sub"] == "user-1"
-
-
-async def test_oidc_rejects_a_different_issuer():
-    secret = "test-secret"
-    plugin = _oidc_test_plugin("https://issuer.test/application", secret)
-
-    with pytest.raises(UnauthenticatedError, match="Invalid claims"):
-        await plugin._validate_token(_oidc_test_token("https://attacker.test/application", secret))
+    if accepted:
+        claims = await plugin._validate_token(token)
+        assert claims["sub"] == "user-1"
+    else:
+        with pytest.raises(UnauthenticatedError, match="Invalid claims"):
+            await plugin._validate_token(token)
