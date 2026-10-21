@@ -341,12 +341,12 @@ class ServerConfig(BaseModel):
         ),
     )
     max_batch_messages: int = Field(
-        default=100,
+        default=10_000,
         gt=0,
         description=(
-            "Maximum number of messages accepted by "
-            "POST /api/v1/sessions/{session_id}/messages/batch. Raise it for large "
-            "session imports instead of chunking client-side."
+            "Safety cap for POST /api/v1/sessions/{session_id}/messages/batch. "
+            "Large session imports are accepted and appended atomically; raise or "
+            "lower this only when a deployment needs a different safety bound."
         ),
     )
     # Seconds an idle HTTP keep-alive connection is kept open before the server

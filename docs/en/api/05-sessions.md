@@ -1217,7 +1217,7 @@ Add multiple messages to a session in one request, for example when importing co
 
 **Difference from `add_message()`**:
 - `add_message()`: Add 1 message per request
-- `batch_add_messages()`: Add multiple messages per request (max `server.max_batch_messages`, default 100), reducing network round trips and file I/O
+- `batch_add_messages()`: Add multiple messages per request (safety cap `server.max_batch_messages`, default 10000), reducing network round trips and file I/O
 
 **Code Entry Points**:
 - `openviking/session/session.py:Session.add_messages()` - Core implementation
@@ -1232,10 +1232,10 @@ Add multiple messages to a session in one request, for example when importing co
 | Parameter | Type | Required | Default | Description |
 |------|------|------|--------|------|
 | session_id | str | Yes | - | Session ID |
-| messages | List[AddMessageRequest] | Yes | - | List of messages, each following the same format as `add_message()`, max `server.max_batch_messages` (default 100) |
+| messages | List[AddMessageRequest] | Yes | - | List of messages, each following the same format as `add_message()`, up to the `server.max_batch_messages` safety cap (default 10000) |
 | options | BatchAddMessagesOptions | No | None | Advanced batch options such as `telemetry`; pass `options={"telemetry": True}` to include operation telemetry data |
 
-> **Note**: Each message follows the exact same format as `add_message()`, supporting both `content` (simple mode) and `parts` (Parts mode). Raise `server.max_batch_messages` for larger imports, or split the request into batches of the configured limit.
+> **Note**: Each message follows the exact same format as `add_message()`, supporting both `content` (simple mode) and `parts` (Parts mode). Large batches are appended atomically; `server.max_batch_messages` is a safety cap, not a client-side chunking requirement.
 
 #### 3. Usage Examples
 

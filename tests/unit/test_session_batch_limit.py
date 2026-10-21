@@ -11,8 +11,12 @@ from openviking.server.routers.sessions import (
 )
 
 
-def test_server_config_keeps_the_historical_batch_limit_by_default():
-    assert ServerConfig().max_batch_messages == 100
+def test_server_config_sets_a_high_default_safety_cap():
+    assert ServerConfig().max_batch_messages == 10_000
+
+
+def test_default_config_accepts_a_120_message_batch():
+    _check_batch_message_limit(120, ServerConfig().max_batch_messages)
 
 
 def test_batch_request_model_no_longer_hard_caps_messages_at_100():

@@ -1216,7 +1216,7 @@ ov session add-message a1b2c3d4 --role user --content "How do I authenticate use
 
 **与 `add_message()` 的区别**：
 - `add_message()`：单次请求添加 1 条消息
-- `batch_add_messages()`：单次请求添加多条消息（上限 `server.max_batch_messages`，默认 100 条），减少网络往返和文件 I/O
+- `batch_add_messages()`：单次请求添加多条消息（安全上限 `server.max_batch_messages`，默认 10000 条），减少网络往返和文件 I/O
 
 **代码入口**：
 - `openviking/session/session.py:Session.add_messages()` - 核心实现
@@ -1231,10 +1231,10 @@ ov session add-message a1b2c3d4 --role user --content "How do I authenticate use
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | session_id | str | 是 | - | 会话 ID |
-| messages | List[AddMessageRequest] | 是 | - | 消息列表，每条消息格式与 `add_message()` 相同，最多 `server.max_batch_messages` 条（默认 100） |
+| messages | List[AddMessageRequest] | 是 | - | 消息列表，每条消息格式与 `add_message()` 相同，最多 `server.max_batch_messages` 条（默认 10000） |
 | options | BatchAddMessagesOptions | 否 | None | 进阶批量选项，例如 `telemetry`；传入 `options={"telemetry": True}` 可附加操作遥测数据 |
 
-> **注意**：每条消息的格式与 `add_message()` 完全一致，支持 `content`（简单模式）和 `parts`（Parts 模式）。大 session 导入可调大 `server.max_batch_messages`，或按配置的上限分批调用。
+> **注意**：每条消息的格式与 `add_message()` 完全一致，支持 `content`（简单模式）和 `parts`（Parts 模式）。大批量会被原子写入；`server.max_batch_messages` 是安全上限，不是要求客户端自行切片的限制。
 
 #### 3. 使用示例
 
