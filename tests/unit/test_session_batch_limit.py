@@ -38,3 +38,53 @@ def test_batch_limit_rejects_a_larger_batch_with_a_chunking_hint():
     assert exc_info.value.status_code == 400
     assert "at most 100" in exc_info.value.detail
     assert "server.max_batch_messages" in exc_info.value.detail
+
+
+class _FakeSession:
+    def __init__(self):
+        self.messages = []
+        self.specs = None
+        self.meta = None
+
+    async def add_messages_async(self, specs):
+        self.specs = specs
+        self.messages = [object() for _ in specs]
+        return self.messages
+
+
+class _FakeSessions:
+    def __init__(self, session):
+        self._session = session
+
+    async def open(self, session_id, ctx, auto_create=True):
+        return self._session
+
+    async def maybe_schedule_auto_commit(self, *args, **kwargs):
+        return None
+
+
+class _FakeService:
+    def __init__(self, session):
+        self.sessions = _FakeSessions(session)
+
+
+@pytest.mark.asyncio
+async def test_batch_endpoint_appends_120_messages_in_one_call(monkeypatch):
+    from openviking.server.routers import sessions as sessions_module
+
+    session = _FakeSession()
+    monkeypatch.setattr(
+        sessions_module,
+        "get_service",
+        lambda: _FakeService(session),
+    )
+    monkeypatch.setattr(sessions_module, "get_server_config", lambda: ServerConfig())
+    request = BatchAddMessageRequest.model_validate(
+        {"messages": [{"role": "user", "content": f"message-{index}"} for index in range(120)]}
+    )
+
+    response = await sessions_module.batch_add_messages(request, session_id="session-1", _ctx=None)
+
+    assert response.result["added"] == 120
+    assert response.result["message_count"] == 120
+    assert len(session.specs) == 120
