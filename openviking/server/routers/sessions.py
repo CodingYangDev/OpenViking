@@ -785,7 +785,7 @@ def _check_batch_message_limit(message_count: int, max_messages: int) -> None:
         status_code=400,
         detail=(
             f"messages must contain at most {max_messages} items; "
-            f"split the batch into chunks of {max_messages} or raise "
+            "split the request into smaller batches or raise "
             "server.max_batch_messages"
         ),
     )
