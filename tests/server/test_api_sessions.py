@@ -1103,6 +1103,53 @@ async def test_batch_add_message_ignores_removed_auto_commit_policy(client: http
     assert resp.json()["result"]["message_count"] == 1
 
 
+async def test_batch_add_message_accepts_configured_limit_above_100(
+    client: httpx.AsyncClient, monkeypatch
+):
+    monkeypatch.setattr(
+        sessions_router,
+        "get_server_config",
+        lambda: ServerConfig(max_batch_messages=200),
+    )
+    create_resp = await client.post(
+        "/api/v1/sessions",
+        json={"auto_commit_policy": {"message_count_threshold": 1000}},
+    )
+    session_id = create_resp.json()["result"]["session_id"]
+    messages = [_message_request("user", content=f"message-{index}") for index in range(120)]
+
+    resp = await client.post(
+        f"/api/v1/sessions/{session_id}/messages/batch",
+        json={"messages": messages},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["result"]["added"] == 120
+    assert resp.json()["result"]["message_count"] == 120
+
+
+async def test_batch_add_message_rejects_over_configured_limit(
+    client: httpx.AsyncClient, monkeypatch
+):
+    monkeypatch.setattr(
+        sessions_router,
+        "get_server_config",
+        lambda: ServerConfig(max_batch_messages=5),
+    )
+    create_resp = await client.post("/api/v1/sessions", json={})
+    session_id = create_resp.json()["result"]["session_id"]
+    messages = [_message_request("user", content=f"message-{index}") for index in range(6)]
+
+    resp = await client.post(
+        f"/api/v1/sessions/{session_id}/messages/batch",
+        json={"messages": messages},
+    )
+
+    assert resp.status_code == 400
+    assert "at most 5" in resp.text
+    assert "server.max_batch_messages" in resp.text
+
+
 async def test_add_message_splits_tool_result_aggregate(client: httpx.AsyncClient):
     create_resp = await client.post("/api/v1/sessions", json={})
     session_id = create_resp.json()["result"]["session_id"]

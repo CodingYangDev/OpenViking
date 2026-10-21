@@ -340,6 +340,15 @@ class ServerConfig(BaseModel):
             "executor. Zero keeps Python's default sizing policy."
         ),
     )
+    max_batch_messages: int = Field(
+        default=100,
+        gt=0,
+        description=(
+            "Maximum number of messages accepted by "
+            "POST /api/v1/sessions/{session_id}/messages/batch. Raise it for large "
+            "session imports instead of chunking client-side."
+        ),
+    )
     # Seconds an idle HTTP keep-alive connection is kept open before the server
     # closes it. Defaults to 5 to match uvicorn's built-in default and preserve
     # the existing service behavior. Raise it above the idle-connection lifetime

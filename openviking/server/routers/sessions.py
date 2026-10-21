@@ -12,7 +12,8 @@ from openviking.core.peer_id import normalize_peer_id
 from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.message.part import Part, TextPart, part_from_dict
 from openviking.server.auth import get_session_request_context
-from openviking.server.dependencies import get_service
+from openviking.server.config import ServerConfig
+from openviking.server.dependencies import get_server_config, get_service
 from openviking.server.identity import RequestContext
 from openviking.server.models import Response
 from openviking.server.responses import error_response
@@ -168,7 +169,10 @@ class AddMessageRequest(BaseModel):
 class BatchAddMessageRequest(BaseModel):
     """Request model for adding multiple messages in a single request."""
 
-    messages: List[AddMessageRequest] = Field(..., max_length=100)
+    messages: List[AddMessageRequest] = Field(
+        ...,
+        description="Messages to append, up to server.max_batch_messages",
+    )
     telemetry: TelemetryRequest = False
 
 
@@ -773,6 +777,20 @@ async def add_message(
     return Response(status="ok", result=execution.result, telemetry=execution.telemetry)
 
 
+def _check_batch_message_limit(message_count: int, max_messages: int) -> None:
+    """Reject batches above the configured limit and explain how to proceed."""
+    if message_count <= max_messages:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"messages must contain at most {max_messages} items; "
+            f"split the batch into chunks of {max_messages} or raise "
+            "server.max_batch_messages"
+        ),
+    )
+
+
 @router.post("/{session_id}/messages/batch")
 async def batch_add_messages(
     request: BatchAddMessageRequest,
@@ -784,6 +802,8 @@ async def batch_add_messages(
     Accepts a list of messages, each following the same format as AddMessageRequest.
     Missing sessions are auto-created on first add.
     """
+    max_batch_messages = (get_server_config() or ServerConfig()).max_batch_messages
+    _check_batch_message_limit(len(request.messages), max_batch_messages)
     service = get_service()
 
     async def _batch_add() -> dict[str, Any]:

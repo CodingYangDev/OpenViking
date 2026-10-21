@@ -316,6 +316,7 @@ When `base_url` is configured, OV sends the current user's OV API key in `X-API-
 | `port` | integer | `1933` | Listen port |
 | `workers` | integer | `1` | Worker process count |
 | `executor_threads` | non-negative integer | `0` | Maximum threads in each worker process's default asyncio executor; `0` uses Python's default sizing policy |
+| `max_batch_messages` | positive integer | `100` | Maximum messages accepted by `POST /api/v1/sessions/{session_id}/messages/batch`; raise it for large session imports |
 | `timeout_keep_alive` | integer (seconds) | `5` | Idle HTTP keep-alive timeout; raise it above the upstream's idle-connection lifetime |
 | `auth_mode` | `dev`, `api_key`, `trusted` / `null` | `null` | Auth mode; null is inferred from `root_api_key` |
 | `root_api_key` | string / `null` | `null` | Root key; setting it defaults auth to `api_key` |
